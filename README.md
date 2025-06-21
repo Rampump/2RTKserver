@@ -1,4 +1,4 @@
-# 2RTK NTRIP Server
+﻿# 2RTK NTRIP Server
 
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
