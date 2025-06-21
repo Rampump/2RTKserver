@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <!-- 原有头部内容保持不变 -->
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>2RTK NTRIP server </title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/lipis/flag-icons@7.0.0/css/flag-icons.min.css">
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700;900&family=Exo+2:wght@300;400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@v7.3.0/ol.css">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            primary: '#4DE7FF',
+            secondary: '#36CFC9',
+            success: '#00F9A6',
+            warning: '#FFB74D',
+            danger: '#FF5E7D',
+            info: '#A0AEC0',
+            dark: '#1D2129',
+            space: '#0A0F1F',
+            stardust: '#1A2138'
+          },
+          fontFamily: {
+            orbitron: ['Orbitron', 'sans-serif'],
+            exo: ['Exo 2', 'sans-serif'],
+          },
+        },
+      }
+    }
+  </script>
+  <style type="text/tailwindcss">
+    @layer utilities {
+      .content-auto {
+        content-visibility: auto;
+      }
+      .signal-bar {
+        transition: all 0.3s ease;
+        transform-origin: bottom;
+        display: inline-flex;
+        align-items: flex-end;
+        box-shadow: inset 0 -2px 10px rgba(77, 231, 255, 0.3);
+      }
+      .signal-bar:hover {
+        transform: scaleY(1.05);
+        box-shadow: 0 0 15px rgba(77, 231, 255, 0.5), inset 0 -2px 4px rgba(0,0,0,0.1);
+      }
+      .pulse-animation {
+        animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+      }
+      @keyframes pulse {
+        0%, 100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.7;
+        }
+      }
+      .fade-in {
+        animation: fadeIn 0.5s ease-in-out;
+      }
+      @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(10px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+      .fixed-height-signal-bars {
+        height: 140px;
+        display: flex;
+        align-items: flex-end;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+      }
+      .scrollbar-hide::-webkit-scrollbar {
+        height: 6px;
+      }
+      .scrollbar-hide::-webkit-scrollbar-track {
+        background: rgba(77, 231, 255, 0.1);
+        border-radius: 3px;
+      }
+      .scrollbar-hide::-webkit-scrollbar-thumb {
+        background: rgba(77, 231, 255, 0.5);
+        border-radius: 3px;
+      }
+      .scrollbar-hide::-webkit-scrollbar-thumb:hover {
+        background: rgba(77, 231, 255, 0.8);
+      }
+      @keyframes loading {
+        0% { transform: translateY(0); }
+        50% { transform: translateY(-10px); }
+        100% { transform: translateY(0); }
+      }
+      .loading-bar {
+        animation: loading 1.5s ease-in-out infinite;
+      }
+      .loading-bar:nth-child(2) { animation-delay: 0.1s; }
+      .loading-bar:nth-child(3) { animation-delay: 0.2s; }
+      .loading-bar:nth-child(4) { animation-delay: 0.3s; }
+      .loading-bar:nth-child(5) { animation-delay: 0.4s; }
+      body {
+        background: radial-gradient(ellipse at center, #0a0f1f 0%, #050813 70%);
+        color: white;
+        font-family: 'Exo 2', sans-serif;
+      }
+      .space-card {
+        background: rgba(10, 20, 40, 0.7);
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(77, 231, 255, 0.2);
+        box-shadow: 0 0 20px rgba(77, 231, 255, 0.1), 
+                    inset 0 0 10px rgba(77, 231, 255, 0.05);
+      }
+      .glow-border {
+        position: relative;
+      }
+      .glow-border::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 3px;
+        background: linear-gradient(90deg, #4DE7FF, #00F9A6);
+        box-shadow: 0 0 10px rgba(77, 231, 255, 0.7);
+        border-radius: 3px 3px 0 0;
+        z-index: 1;
+      }
+      .satellite-glow {
+        filter: drop-shadow(0 0 5px rgba(77, 231, 255, 0.7));
+      }
+      .star {
+        position: absolute;
+        background: white;
+        border-radius: 50%;
+        animation: twinkle 4s infinite;
+      }
+      @keyframes twinkle {
+        0%, 100% { opacity: 0.2; }
+        50% { opacity: 1; }
+      }
+      .fi {
+        background-size: contain;
+        background-position: 50%;
+        background-repeat: no-repeat;
+        position: relative;
+        display: inline-block;
+        height: 1.5em;
+        line-height: 1.5em;
+      }
+      .fi:before {
+        content: "\00a0";
+      }
+      .flex.items-center .fi {
+        vertical-align: middle;
+      }
+      #map-container {
+        position: relative;
+        height: 300px;
+        border-radius: 0.5rem;
+        overflow: hidden;
+        background: rgba(10, 20, 40, 0.5);
+        border: 1px solid rgba(77, 231, 255, 0.3);
+        margin-top: 1rem;
+      }
+      .map-placeholder {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(135deg, rgba(10, 20, 40, 0.8), rgba(5, 8, 19, 0.9));
+        z-index: 10;
+      }
+      .map-grid {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background-image: 
+          linear-gradient(rgba(77, 231, 255, 0.1) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(77, 231, 255, 0.1) 1px, transparent 1px);
+        background-size: 20px 20px;
+      }
+      
+      .rtcm-data {
+        white-space: normal;
+        word-wrap: break-word;
+      }
+      /* 新增导航栏样式 */
+      .nav-link {
+        font-size: 1.25rem; /* 字体变大 */
+        color: #FF9800; /* 显眼的橙色 */
+        margin-left: 2rem; /* 与前面内容留出距离 */
+      }
+      /* 使导航栏居中 */
+      .nav-container {
+        justify-content: center;
+      }
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col">
+  <div id="stars" class="fixed inset-0 z-0"></div>
+  <header class="space-card sticky top-0 z-50">
+    <div class="container mx-auto px-4 py-3 flex justify-between items-center">
+      <div class="flex items-center space-x-3">
+        <i class="fa fa-satellite text-primary text-2xl satellite-glow"></i>
+        <h1 class="text-xl md:text-2xl font-bold font-orbitron tracking-wider">2RTK NTRIP server<span class="text-primary"></span>基准站状态</h1>
+      </div>
+      <div class="flex justify-center items-center space-x-4 mt-2 sm:mt-0 nav-container">
+        <a href="/" class="text-primary hover:text-white nav-link">状态信息</a>
+        <a href="/config" class="text-primary hover:text-white nav-link">运行设置</a>
+        <a href="/login" class="text-primary hover:text-white nav-link">登录</a>
+      </div>
+      <div class="flex items-center space-x-4">
+        <div id="update-time" class="text-sm text-info">数据加载中...</div>
+        <div class="w-3 h-3 rounded-full bg-primary pulse-animation"></div>
+      </div>
+    </div>
+  </header>
+  <main class="flex-grow container mx-auto px-4 py-6 relative z-10">
+    
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+      
+      <div class="space-card rounded-xl p-4 glow-border fade-in">
+        <h3 class="font-semibold text-lg mb-3 font-orbitron text-white">
+          <i class="fa fa-cog text-secondary mr-2"></i>运行状态
+        </h3>
+        <div class="grid grid-cols-[max-content,1fr] gap-x-3 gap-y-2">
+          <span class="text-sm text-primary whitespace-nowrap">运行模式：</span>
+          <span id="run-mode" class="text-primary font-medium truncate">等待数据...</span>
+
+          <span class="text-sm text-primary whitespace-nowrap">数据源：</span>
+          <span id="data-source" class="text-primary font-medium truncate">--</span>
+
+          <span class="text-sm text-primary whitespace-nowrap">目标caster：</span>
+          <span id="target-caster" class="text-primary font-medium truncate">--</span>
+
+          <span class="text-sm text-primary whitespace-nowrap">发送数据量：</span>
+          <span id="data-sent" class="text-primary font-medium truncate">0B</span>
+
+          <span class="text-sm text-primary whitespace-nowrap">运行时间：</span>
+          <span id="run-time" class="text-primary font-medium truncate">0h 0m 0s</span>
+        </div>
+      </div>
+      
+      
+      <div class="space-card rounded-xl p-4 glow-border fade-in">
+        <h3 class="font-semibold text-lg mb-3 font-orbitron text-white">
+          <i class="fa fa-globe text-primary mr-2"></i>卫星星座信息
+        </h3>
+        <div class="grid grid-cols-[max-content,1fr] gap-x-3 gap-y-2">
+          <span class="text-sm text-primary whitespace-nowrap">观测星座数量：</span>
+          <span id="system-count" class="text-primary font-medium truncate">0</span>
+
+          <span class="text-sm text-primary whitespace-nowrap">观测到的星座：</span>
+          <span id="observed-systems" class="text-primary font-medium truncate">暂无数据</span>
+
+          <span class="text-sm text-primary whitespace-nowrap">观测到卫星数量：</span>
+          <span id="satellite-count" class="text-primary font-medium truncate">0</span>
+
+          <span class="text-sm text-primary whitespace-nowrap">优良信号卫星数：</span>
+          <span id="strong-signal-count" class="text-success font-medium truncate">0</span>
+        </div>
+      </div>
+      
+      
+      <div class="space-card rounded-xl p-4 glow-border fade-in">
+        <h3 class="font-semibold text-lg mb-2 font-orbitron">
+          <i class="fa fa-list text-warning mr-2"></i>基准站信息
+        </h3>
+        <div class="grid grid-cols-[max-content,1fr] gap-x-3 gap-y-2">
+          <span class="text-sm text-primary whitespace-nowrap">RTCM数据：</span>
+          
+          <span id="rtcm-type-list" class="text-primary font-medium truncate rtcm-data">等待数据加载...</span>
+
+          <span class="text-sm text-primary whitespace-nowrap">设备型号：</span>
+          <span id="device-model" class="text-primary font-medium truncate">--</span>
+
+          <span class="text-sm text-primary whitespace-nowrap">固件版本：</span>
+          <span id="firmware-version" class="text-primary font-medium truncate">--</span>
+
+          <span class="text-sm text-primary whitespace-nowrap">天线状态：</span>
+          <span id="antenna-model" class="text-primary font-medium truncate">--</span>
+        </div>
+      </div>
+    </div>
+    
+   
+    <div class="space-card rounded-xl p-4 glow-border fade-in mb-6 relative">
+      <h3 class="font-semibold text-lg mb-2 font-orbitron"><i class="fa fa-map-pin text-info mr-2"></i>基准站位置</h3>
+      
+      
+      <div class="absolute bottom-4 right-4 z-20 bg-stardust/50 backdrop-blur-sm rounded-lg p-3 shadow-lg">
+        <div class="flex flex-col space-y-2">
+          
+          <div>
+            <span class="text-sm text-primary whitespace-nowrap">基准站编号: </span>
+            <span id="station-id" class="text-primary font-medium">--</span>
+          </div>
+          
+          
+          <div class="flex space-x-4">
+            <div>
+              <span class="text-sm text-primary whitespace-nowrap">ECEF-X: </span>
+              <span id="ecef-x" class="text-primary font-medium">--</span>
+            </div>
+            <div>
+              <span class="text-sm text-primary whitespace-nowrap">ECEF-Y: </span>
+              <span id="ecef-y" class="text-primary font-medium">--</span>
+            </div>
+            <div>
+              <span class="text-sm text-primary whitespace-nowrap">ECEF-Z: </span>
+              <span id="ecef-z" class="text-primary font-medium">--</span>
+            </div>
+          </div>
+          
+          
+          <div class="flex space-x-4">
+            <div>
+              <span class="text-sm text-primary whitespace-nowrap">经度: </span>
+              <span id="lon" class="text-primary font-medium">-- °</span>
+            </div>
+            <div>
+              <span class="text-sm text-primary whitespace-nowrap">纬度: </span>
+              <span id="lat" class="text-primary font-medium">-- °</span>
+            </div>
+            <div>
+              <span class="text-sm text-primary whitespace-nowrap">海拔高度: </span>
+              <span id="height" class="text-primary font-medium">-- m</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      
+      <div id="map-container" class="mt-2 h-64 relative">
+        <div class="map-grid"></div>
+        <div class="map-placeholder">
+          <i class="fa fa-map-marker text-primary text-4xl mb-3 satellite-glow"></i>
+          <h4 class="font-orbitron text-primary mb-1">基准站位置地图</h4>
+          <p class="text-sm text-primary">正在加载地图数据...</p>
+        </div>
+        
+        <div id="map-switcher" class="absolute top-2 right-2 z-20 bg-white/50 backdrop-blur-sm rounded-md p-1 flex space-x-1">
+          <button id="amap-btn" class="px-2 py-1 text-sm bg-primary text-white rounded-md" disabled>高德地图</button>
+          <button id="osm-btn" class="px-2 py-1 text-sm bg-gray-300 text-gray-700 rounded-md">OpenStreetMap</button>
+        </div>
+      </div>
+    </div>
+    
+    
+    <div id="signal-container" class="space-y-6">
+      <div id="loading-indicator" class="space-card rounded-xl p-4 glow-border text-center py-4 text-primary">
+        <div class="inline-block relative">
+          <i class="fa fa-satellite text-primary text-3xl satellite-glow animate-spin" style="animation-duration: 8s"></i>
+        </div>
+        <p>RTCM数据已解码，观测到的频段信号强度如下：</p>
+      </div>
+    </div>
+  </main>
+  <footer class="space-card border-t border-gray-700 py-4 mt-8">
+    <div class="container mx-auto px-4 text-center text-sm text-info">
+      <p class="font-orbitron tracking-wider">2RTK NRTIP Server  &copy; <span id="year">2025</span></p>
+    </div>
+  </footer>
+  <script src="/static/script.js"></script>
+  <script>
+    function createStars() {
+      const starsContainer = document.getElementById('stars');
+      const starCount = 150;
+      for (let i = 0; i < starCount; i++) {
+        const star = document.createElement('div');
+        star.classList.add('star');
+        const size = Math.random() * 2;
+        const posX = Math.random() * 100;
+        const posY = Math.random() * 100;
+        star.style.width = `${size}px`;
+        star.style.height = `${size}px`;
+        star.style.left = `${posX}%`;
+        star.style.top = `${posY}%`;
+        star.style.animationDelay = `${Math.random() * 4}s`;
+        starsContainer.appendChild(star);
+      }
+    }
+    document.getElementById('year').textContent = new Date().getFullYear();
+    document.addEventListener('DOMContentLoaded', () => {
+      createStars();
+    });
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/ol@v7.3.0/dist/ol.js"></script>
+</body>
+</html>
