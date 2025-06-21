@@ -15,8 +15,16 @@
   web端在国内使用高德地图标记RTK基站位置，国际使用开源OpenStreetMap地图进行基准站标记.
 - 支持数据流转发和中继.
 - 支持Linux/Armbian系统自动安装和管理.
+- 自动重试：当遇到网络波动、服务器连接失败等情况时，程序会自动重连并认证，确保稳定运行。
+
 ![server1.png](https://raw.gitcode.com/user-images/assets/5308990/ad85831d-f013-46cb-b53f-ee34ca620104/server1.png 'server1.png')
 ![ser3.png](https://raw.gitcode.com/user-images/assets/5308990/bb228481-89e3-4336-a676-92befe6c7cba/ser3.png 'ser3.png')![ser2.png](https://raw.gitcode.com/user-images/assets/5308990/8b60b43d-1a24-4f56-9f5e-b7dd720fc8df/ser2.png 'ser2.png')![ser4.png](https://raw.gitcode.com/user-images/assets/5308990/3ed15432-0f89-47f8-af54-c1d489dd72fb/ser4.png 'ser4.png')
+
+## 工作模式
+
+- **串口模式**：可自动扫描USB串口，也可指定串口读取RTK模块的RTCM数据，然后转发到本地NTRIP Caster。
+- **中继模式**：作为NTRIP客户端，连接其他NTRIP服务器获取RTCM数据，然后转发到本地NTRIP Caster。
+
 ## 安装指南
 
 ### 自动安装（Linux/Armbian）
@@ -115,6 +123,14 @@ sudo ./uninstall.sh
 2. 端口：5757
 3. 挂载点：在Web界面中配置的挂载点名称
 4. 用户名/密码：在Web界面中创建的用户凭据
+
+## 技术特点
+
+本程序基于单基站RTK技术。基站观测卫星信号计算出校正数，发送给移动站，帮助移动站精确计算位置。其优点是结构简单、成本低。但有效范围有限，一般在基站周围20-50公里范围内。随着距离增加，误差会逐渐增大。与千寻CORS、移动CORS等多基站RTK技术相比，覆盖范围较小。但它可以在小范围内提供精确定位，适合预算有限的用户。
+
+## 部署与使用
+
+目前主要用于玩客云的Armbian系统上。只需将RTK基站模块插入玩客云的USB口，程序即可读取数据并转发到Caster。部署操作简单。此外，它可以适配RTK2GO.COM，为数据源和传输提供更多选择。
 
 ## 故障排除
 
