@@ -15,7 +15,8 @@
   web端在国内使用高德地图标记RTK基站位置，国际使用开源OpenStreetMap地图进行基准站标记.
 - 支持数据流转发和中继.
 - 支持Linux/Armbian系统自动安装和管理.
-
+![server1.png](https://raw.gitcode.com/user-images/assets/5308990/ad85831d-f013-46cb-b53f-ee34ca620104/server1.png 'server1.png')
+![ser3.png](https://raw.gitcode.com/user-images/assets/5308990/bb228481-89e3-4336-a676-92befe6c7cba/ser3.png 'ser3.png')![ser2.png](https://raw.gitcode.com/user-images/assets/5308990/8b60b43d-1a24-4f56-9f5e-b7dd720fc8df/ser2.png 'ser2.png')![ser4.png](https://raw.gitcode.com/user-images/assets/5308990/3ed15432-0f89-47f8-af54-c1d489dd72fb/ser4.png 'ser4.png')
 ## 安装指南
 
 ### 自动安装（Linux/Armbian）
