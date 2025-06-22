@@ -187,16 +187,16 @@
           linear-gradient(90deg, rgba(77, 231, 255, 0.1) 1px, transparent 1px);
         background-size: 20px 20px;
       }
-      /* 新增样式：允许 RTCM 数据自动换行 */
+     
       .rtcm-data {
         white-space: normal;
         word-wrap: break-word;
       }
-      /* 新增表单样式 */
+      
       .form-input {
         background-color: rgba(255, 255, 255, 0.1);
         border-color: rgba(77, 231, 255, 0.3);
-        color: #A0AEC0; /* 修改输入框文字颜色为信息色 */
+        color: #A0AEC0; 
         transition: all 0.3s ease;
       }
       .form-input:focus {
@@ -206,21 +206,21 @@
         outline: none;
       }
       .form-label {
-        color: #4DE7FF; /* 表单标签颜色保持主色调 */
+        color: #4DE7FF; 
         margin-bottom: 0.25rem;
         display: block;
       }
-      /* 新增表单提示文本样式 */
+     
       .form-placeholder {
-        color: rgba(160, 174, 192, 0.6); /* 半透明的信息色 */
+        color: rgba(160, 174, 192, 0.6); 
       }
-      /* 新增导航栏样式 */
+     
       .nav-link {
-        font-size: 1.25rem; /* 字体变大 */
-        color: #FF9800; /* 显眼的橙色 */
-        margin-left: 2rem; /* 与前面内容留出距离 */
+        font-size: 1.25rem; 
+        color: #FF9800; 
+        margin-left: 2rem; 
       }
-      /* 使导航栏居中 */
+      
       .nav-container {
         justify-content: center;
       }
@@ -263,7 +263,7 @@
           </select>
         </div>
 
-        <!-- 串口配置 -->
+        
         <div class="grid grid-cols-2 gap-4 field-serial">
           <div>
             <label class="form-label font-semibold">RTK串口名称:</label>
@@ -278,6 +278,7 @@
               <option value="460800">460800</option>
               <option value="921600">921600</option>
               <option value="9600">9600</option>
+              <option value="9600">57600</option>
             </datalist>
           </div>
         </div>
@@ -373,7 +374,7 @@
     document.getElementById('year').textContent = new Date().getFullYear();
     document.addEventListener('DOMContentLoaded', () => {
       createStars();
-      updateFormFields(); // 页面加载时更新表单字段
+      updateFormFields(); 
     });
 
     async function loadConfig() {
@@ -389,7 +390,7 @@
           }
         }
 
-        // 根据读取到的配置更新表单字段显示
+        
         const mode = cfg.mode;
         document.querySelector('select[name="mode"]').value = mode;
         updateFormFields(mode);
@@ -400,21 +401,21 @@
     }
 
     function updateFormFields(mode = document.querySelector('select[name="mode"]').value) {
-      // 显示或隐藏串口字段
+     
       const serialFields = document.querySelectorAll('.field-serial');
       serialFields.forEach(el => {
         el.style.display = (mode === 'serial') ? 'block' : 'none';
-        el.querySelector('input')?.toggleAttribute('required', false); // 移除串口名称的必填项判定
+        el.querySelector('input')?.toggleAttribute('required', false); 
       });
 
-      // 显示或隐藏中继字段
+      
       const relayFields = document.querySelectorAll('.field-relay');
       relayFields.forEach(el => {
         el.style.display = (mode === 'relay') ? 'block' : 'none';
         el.querySelector('input')?.toggleAttribute('required', mode === 'relay');
       });
 
-      // caster字段总是必须，除非mode为none
+      
       const casterFields = document.querySelectorAll('.field-caster');
       casterFields.forEach(el => {
         const required = (mode !== 'none');
