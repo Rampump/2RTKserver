@@ -1,4 +1,4 @@
-﻿# 2RTK NTRIP Server
+# 2RTK NTRIP Server
 
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
@@ -37,7 +37,7 @@
 
 1. 克隆仓库：
    ```bash
-   git clone https://gitcode.com/rampump/NTRIPserve.git
+   git clone https://gitcode.com/rampump/NTRIPserver.git 
    cd NTRIPserve
    ```
    备用地址：
