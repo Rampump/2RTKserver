@@ -1,6 +1,6 @@
-# 2RTK NTRIP Server 安装指南
+# 2RTK NTRIP server 安装指南
 
-本文档提供了在Linux/Armbian系统上安装、更新和卸载2RTK NTRIP Server的详细说明。
+本文档提供了在Linux/Armbian系统上安装、更新和卸载2RTK NTRIP server的详细说明。
 
 ## 安装步骤
 
@@ -25,10 +25,10 @@
 
 安装完成后，可以使用以下命令管理服务：
 
-- 启动服务：`2rtkserver start`
-- 停止服务：`2rtkserver stop`
-- 重启服务：`2rtkserver restart`
-- 查看状态：`2rtkserver status`
+- 启动服务：`ntripserver start`
+- 停止服务：`ntripserver stop`
+- 重启服务：`ntripserver restart`
+- 查看状态：`ntripserver status`
 
 ## 访问Web界面
 
@@ -61,7 +61,7 @@
 
 ## 卸载程序
 
-如需卸载2RTK NTRIP Server，请按照以下步骤操作：
+如需卸载2RTK NTRIP server，请按照以下步骤操作：
 
 1. 给卸载脚本添加执行权限：
    ```bash
@@ -91,14 +91,14 @@ PIP_BREAK_SYSTEM_PACKAGES=1 pip install -r requirements.txt
 
 如果服务无法启动，请检查日志：
 ```bash
-journalctl -u 2rtkserver -n 50
+journalctl -u ntripserver -n 50
 ```
 
 ### 无法访问Web界面
 
 1. 确认服务正在运行：
    ```bash
-   2rtkserver status
+   ntripserver status
    ```
 2. 检查防火墙设置，确保端口5757已开放：
    ```bash
