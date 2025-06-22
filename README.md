@@ -65,12 +65,14 @@
 
 1. 克隆仓库：
    ```bash
-   git clone https://gitcode.com/rampump/NTRIPserver.git
+   git clone https://gitcode.com/rampump/NTRIPserver.git 
+
    cd NTRIPserve
    ```
    备用地址：
    ```
    git clone https://github.com/Rampump/2RTKserver.git
+
    cd NTRIPserve
    ```
 2. 安装依赖：
