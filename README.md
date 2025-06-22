@@ -1,163 +1,93 @@
 ﻿# 2RTK NTRIP Server
 
-[![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+一个功能强大的NTRIP服务器应用程序，支持RTK基准站数据的接收和转发。
 
-2RTK NTRIP Server是一个用于RTK（Real-Time Kinematic）定位系统的NTRIP server。它允许用户通过网络分发RTCM校正数据，支持多种数据源，包括串口接收机和网络数据流。
-   它可以通过从串口上的RTK模块读取数据发送到NTRIPcaster服务器，也可以从其他NTRIPcaster服务器接收数据并转发到自有的NTRIPcaster。
-适用于Linux/Armbian环境，已在玩客云等armbian系统上测试通过.也可以用于树莓派等其他armbian系统.
+## 主要特性
 
-## 功能特点
+- **双模式支持**
+  - 串口模式：直接从RTK接收机读取数据
+  - 中继模式：从其他NTRIP Caster转发数据
 
-- 支持NTRIP协议，兼容大多数RTK模块
-- 支持多种数据源：串口、NTRIP客户端等
-- 内置Web管理界面，可以通过web前端实时修改程序运行模式和配置，方便配置和监控.
-  web端会实时监控模块或基准站的实时状态，收星数量、收星质量、RTK状态等.并以图片的形式在前端显示.
-  web端在国内使用高德地图标记RTK基站位置，国际使用开源OpenStreetMap地图进行基准站标记.
-- 支持数据流转发和中继.
-- 支持Linux/Armbian系统自动安装和管理.
-- 自动重试：当遇到网络波动、服务器连接失败等情况时，程序会自动重连并认证，确保稳定运行。
+- **Web管理界面**
+  - 实时监控系统运行状态
+  - 可视化显示卫星信息
+  - 基准站位置地图展示
+  - 支持高德地图和OpenStreetMap
 
-![server1.png](https://raw.gitcode.com/user-images/assets/5308990/ad85831d-f013-46cb-b53f-ee34ca620104/server1.png 'server1.png')
-![ser3.png](https://raw.gitcode.com/user-images/assets/5308990/bb228481-89e3-4336-a676-92befe6c7cba/ser3.png 'ser3.png')![ser2.png](https://raw.gitcode.com/user-images/assets/5308990/8b60b43d-1a24-4f56-9f5e-b7dd720fc8df/ser2.png 'ser2.png')![ser4.png](https://raw.gitcode.com/user-images/assets/5308990/3ed15432-0f89-47f8-af54-c1d489dd72fb/ser4.png 'ser4.png')
+- **RTCM数据处理**
+  - 实时解析RTCM消息
+  - 支持多种RTCM消息类型
+  - 卫星信号强度监控
+  - 自动重连机制
 
-## 工作模式
+- **安全特性**
+  - 用户认证系统
+  - 密码保护的配置界面
+  - 安全的数据传输
 
-- **串口模式**：可自动扫描USB串口，也可指定串口读取RTK模块的RTCM数据，然后转发到本地NTRIP Caster。
-- **中继模式**：作为NTRIP客户端，连接其他NTRIP服务器获取RTCM数据，然后转发到本地NTRIP Caster。
+## 技术栈
 
-## 安装指南
+- **后端**
+  - Python
+  - Flask Web框架
+  - WebSocket实时通信
+  - SQLite数据存储
 
-### 自动安装（Linux/Armbian）
+- **前端**
+  - HTML5 + TailwindCSS
+  - JavaScript
+  - OpenLayers地图库
+  - 响应式设计
 
-1. 克隆仓库：
-   ```bash
-   git clone https://gitcode.com/rampump/NTRIPserve.git
-   cd NTRIPserve
-   ```
+## 系统要求
 
-2. 运行安装脚本：
-   ```bash
-   chmod +x install.sh
-   sudo ./install.sh
-   ```
+- Python 3.6+
+- 支持的操作系统：Windows/Linux/macOS
+- 串口模式需要可用的串口设备
+- 网络连接（用于中继模式和Web界面）
 
-3. 安装完成后，可通过以下地址访问Web界面：
-   ```
-   http://[设备IP]:5757
-   ```
-4. 默认登录
-   ```
-   - 用户名：admin  
-   - 密码：admin
-   访问配置页面需使用管理员账户`admin`和默认密码`admin`登录.配置程序后请修改默认密码.
-  ```
-### 手动安装
+## 配置说明
 
-1. 克隆仓库：
-   ```bash
-   git clone https://gitcode.com/rampump/NTRIPserve.git
-   cd NTRIPserve
-   ```
+### 串口模式配置
+- 串口：自动检测或手动配置
+- 波特率：支持多种标准波特率
+- Caster设置：服务器地址、端口、挂载点
 
-2. 安装依赖：
-   ```bash
-   pip install -r requirements.txt
-   ```
-   
-   注意：在某些Armbian系统上，可能需要使用以下命令：
-   ```bash
-   sudo PIP_BREAK_SYSTEM_PACKAGES=1 pip install -r requirements.txt
-   ```
+### 中继模式配置
+- 源Caster：服务器地址、端口、挂载点、用户名、密码
+- 目标Caster：服务器地址、端口、挂载点、密码
 
-3. 运行服务器：
-   ```bash
-   python server.py
-   ```
+## 使用说明
 
-## 使用方法
+1. 启动服务器：运行`server.py`
+2. 访问Web界面：`http://localhost:5757`
+3. 登录系统（默认用户名/密码：admin/admin）
+4. 配置运行参数
+5. 启动数据转发服务
 
-### 管理命令
+## 主要功能
 
-安装完成后，可以使用以下命令管理服务：
+- 实时状态监控
+- RTCM数据解析和转发
+- 卫星信号质量分析
+- 基准站位置显示
+- 自动故障恢复
+- 数据流量统计
 
-- 启动服务：`2rtkserver start`
-- 停止服务：`2rtkserver stop`
-- 重启服务：`2rtkserver restart`
-- 查看状态：`2rtkserver status`
+## 开发说明
 
-### Web界面
-
-通过Web界面可以进行以下操作：
-
-1. 配置数据源（串口、网络等）
-2. 管理数据源
-3. 监控数据流状态和连接情况
-4. 查看统计信息
-
-
-### 更新程序
-
-当有新版本可用时：
-
-1. 克隆或下载最新代码
-2. 运行更新脚本：
-   ```bash
-   chmod +x update.sh
-   sudo ./update.sh
-   ```
-
-### 卸载程序
-
-如需卸载：
-
-```bash
-chmod +x uninstall.sh
-sudo ./uninstall.sh
+项目结构：
 ```
-
-## 配置RTK模块
-
- 如使用RTK模块从串口转发数据，请将RTK模块配置为基准站模式，并进入固定状态~ RTCM数据精准度由模块决定，精度越高，数据越准确。
-
-1. 服务器地址：ntrip caster地址
-2. 端口：5757
-3. 挂载点：在Web界面中配置的挂载点名称
-4. 用户名/密码：在Web界面中创建的用户凭据
-
-## 技术特点
-
-本程序基于单基站RTK技术。基站观测卫星信号计算出校正数，发送给移动站，帮助移动站精确计算位置。其优点是结构简单、成本低。但有效范围有限，一般在基站周围20-50公里范围内。随着距离增加，误差会逐渐增大。与千寻CORS、移动CORS等多基站RTK技术相比，覆盖范围较小。但它可以在小范围内提供精确定位，适合预算有限的用户。
-
-## 部署与使用
-
-目前主要用于玩客云的Armbian系统上。只需将RTK基站模块插入玩客云的USB口，程序即可读取数据并转发到Caster。部署操作简单。此外，它可以适配RTK2GO.COM，为数据源和传输提供更多选择。
-
-## 故障排除
-
-常见问题及解决方法请参考 [INSTALL.md](INSTALL.md) 文档中的故障排除部分。
-
-## 贡献指南
-
-欢迎提交问题报告、功能请求和代码贡献。请遵循以下步骤：
-
-1. Fork 仓库
-2. 创建功能分支 (`git checkout -b feature/amazing-feature`)
-3. 提交更改 (`git commit -m 'Add some amazing feature'`)
-4. 推送到分支 (`git push origin feature/amazing-feature`)
-5. 创建Pull Request
-
-## 许可证
-
-本项目采用 GNU通用公共许可证v3 (GPLv3) - 详情请参阅 [LICENSE](LICENSE) 文件
-
-GPL许可证要求任何分发此软件的修改版本也必须以相同的许可证开源。
-
-## 联系方式
-
-作者：文七  
-邮箱：i@jia.by  
-项目链接：[https://gitcode.com/rampump/NTRIPserve](https://gitcode.com/rampump/NTRIPserve)
-
-## 致谢
-
-感谢所有为本项目做出贡献的开发者和用户。
+2RTKserver/
+├── server.py          # 主程序
+├── static/            # 静态资源
+│   ├── favicon.ico
+│   ├── freq_map.json
+│   └── script.js
+├── templates/         # HTML模板
+│   ├── change_password.html
+│   ├── config.html
+│   ├── index.html
+│   └── login.html
+└── 2RTKserver.db     # 配置数据库
+```
