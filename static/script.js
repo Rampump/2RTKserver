@@ -51,14 +51,15 @@ const gnssColorMap = {
   'UNKNOWN': '#86909C'
 };
 const gnssIconMap = {
-  'GPS': 'fi fi-us',      // 美国国旗
-  'BDS': 'fi fi-cn',      // 中国国旗
-  'GLO': 'fi fi-ru',  // 俄罗斯国旗
-  'GAL': 'fi fi-eu',  // 欧盟旗帜
-  'QZS': 'fi fi-jp',     // 日本国旗
-  'IRN': 'fi fi-in',
-  'NAV': 'fi fi-in',    // 印度国旗
-  'UNKNOWN': 'fi fi-xx'   // 未知旗帜
+  'GPS': 'fi fi-us',              // 美国国旗
+  'BDS': 'fi fi-cn',             // 中国国旗
+  'GLO': 'fi fi-ru',            // 俄罗斯旗
+  'GAL': 'fi fi-eu',           // 欧盟旗帜
+  'QZS': 'fi fi-jp',          // 日本国旗
+  'IRN': 'fi fi-in',         // 印度国旗
+  'NAV': 'fi fi-in',        // 印度国旗
+  'SBAS': 'fi fi-globe',   // 全球旗帜
+  'UNKNOWN': 'fi fi-globe'// 未知旗帜
 };
 
 // RTCM标准名称映射 (添加北斗系统映射)
