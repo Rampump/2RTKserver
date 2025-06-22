@@ -2,17 +2,20 @@
 
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-2RTK NTRIP Server是一个用于RTK（Real-Time Kinematic）定位系统的NTRIP server。它允许用户通过网络分发RTCM校正数据，支持多种数据源，包括串口接收机和网络数据流。
-   它可以通过从串口上的RTK模块读取数据发送到NTRIPcaster服务器，也可以从其他NTRIPcaster服务器接收数据并转发到自有的NTRIPcaster。
-适用于Linux/Armbian环境，已在玩客云等armbian系统上测试通过.也可以用于树莓派等其他armbian系统.
+2RTK NTRIP Server是一个用于RTK（Real-Time Kinematic）定位系统的NTRIP server。
+它可以通过从串口上的RTK模块读取数据发送到NTRIPcaster服务器，也可以从其他NTRIPcaster服务器接收数据并转发到自有的NTRIPcaster。
+适用于Linux/Armbian环境，已在玩客云等armbian系统上测试通过.也可以用于树莓派等其他Linux/Armbian系统.
 
 ## 功能特点
 
-- 支持NTRIP协议，兼容大多数RTK模块
+- 支持NTRIP协议，兼容大多数RTK模块.
 - 支持多种数据源：串口、NTRIP客户端等
 - 内置Web管理界面，可以通过web前端实时修改程序运行模式和配置，方便配置和监控.
   web端会实时监控模块或基准站的实时状态，收星数量、收星质量、RTK状态等.并以图片的形式在前端显示.
-  web端在国内使用高德地图标记RTK基站位置，国际使用开源OpenStreetMap地图进行基准站标记.
+  web端在标记RTK基站时，会自动获取基站的经纬度信息，然后标记在地图上.
+  在中国可以使用高德地图标记RTK基站位置，其它地区可以使用开源OpenStreetMap地图进行基准站标记.
+-使用地图标记基准站时，会同时标记两个覆盖半径分别为20KM和50KM的圆形覆盖范围.
+  ps：单基准站的RTK系统中受（电离层误差；对流层误差；卫星轨道误差；多路径误差）影响，有效覆盖范围通常为20KM. 使用双频或者多频RTK接收机时，NTRIP 服务有  时可实现 50 公里的覆盖范围且精度良好，但是一般不推荐使用超过50KM的RTK单基准站.
 - 支持数据流转发和中继.
 - 支持Linux/Armbian系统自动安装和管理.
 - 自动重试：当遇到网络波动、服务器连接失败等情况时，程序会自动重连并认证，确保稳定运行。
@@ -23,12 +26,15 @@
 ## 工作模式
 
 - **串口模式**：可自动扫描USB串口，也可指定串口读取RTK模块的RTCM数据，然后转发到本地NTRIP Caster。
-- **中继模式**：作为NTRIP客户端，连接其他NTRIP服务器获取RTCM数据，然后转发到本地NTRIP Caster。
+               不知道串口名称时可以留空，程序会自动扫描串口.建议填写正确的波特率，程序会优先扫描RTK模块常用的波特率115200。
+- **网络模式**：指定IP地址和端口连接NTRIP caster，cros然后转发RTK模块的RTCM数据.
 
+- **中继模式**：作为NTRIP客户端，连接其他NTRIP服务器获取RTCM数据，然后转发到本地NTRIP Caster。
+- **Caster模式**：#####暂未添加该功能####  作为本地内NTRIP caster，读取串口RTK模块的RTCM数据，然后提供RTCM数据流给移动站等NTRIP客户端.
 ## 安装指南
 
 ### 自动安装（Linux/Armbian）
-
+ #### 部分Armbian系统因为精简等原因.会导致依赖安装失败，推荐使用手动安装依赖.
 1. 克隆仓库：
    ```bash
    git clone https://gitcode.com/rampump/NTRIPserve.git
@@ -123,7 +129,7 @@ chmod +x uninstall.sh
 sudo ./uninstall.sh
 ```
 
-## 配置RTK模块
+## 配置RTK基准站模块
 
  如使用RTK模块从串口转发数据，请将RTK模块配置为基准站模式，并进入固定状态~ RTCM数据精准度由模块决定，精度越高，数据越准确。
 
@@ -134,11 +140,11 @@ sudo ./uninstall.sh
 
 ## 技术特点
 
-本程序基于单基站RTK技术。基站观测卫星信号计算出校正数，发送给移动站，帮助移动站精确计算位置。其优点是结构简单、成本低。但有效范围有限，一般在基站周围20-50公里范围内。随着距离增加，误差会逐渐增大。与千寻CORS、移动CORS等多基站RTK技术相比，覆盖范围较小。但它可以在小范围内提供精确定位，适合预算有限的用户。
+本程序基于单基站RTK技术。基站观测卫星信号计算出校正数，发送给移动站，帮助移动站精确计算位置。其优点是结构简单、成本低。但有效范围有限，一般在基站周围20-50公里范围内。随着距离增加，误差会逐渐增大。与千寻CORS、移动CORS等多基站RTK技术相比，覆盖范围较小。但它可以在小范围内提供精确定位，适合预算有限的用户，或者自己搭建CORS使用无人机等设备。
 
 ## 部署与使用
 
-目前主要用于玩客云的Armbian系统上。只需将RTK基站模块插入玩客云的USB口，程序即可读取数据并转发到Caster。部署操作简单。此外，它可以适配RTK2GO.COM，为数据源和传输提供更多选择。
+目前主要用于玩客云的Armbian系统上。只需将RTK基站模块插入玩客云的USB口，程序即可读取数据并转发到Caster。部署操作简单。此外，它可以适配CORS，为数据源和传输提供更多选择。
 
 ## 故障排除
 
