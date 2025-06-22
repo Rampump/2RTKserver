@@ -193,15 +193,92 @@
         white-space: normal;
         word-wrap: break-word;
       }
-      /* 新增导航栏样式 */
+      
       .nav-link {
-        font-size: 1.25rem; /* 字体变大 */
-        color: #FF9800; /* 显眼的橙色 */
-        margin-left: 2rem; /* 与前面内容留出距离 */
+        font-size: 1.25rem; 
+        color: #FF9800; 
+        margin-left: 2rem; 
       }
-      /* 使导航栏居中 */
+      
       .nav-container {
         justify-content: center;
+      }
+
+      .donate-btn {
+        position: relative;
+      }
+      
+      .donate-qr-container {
+        display: none;
+        position: absolute;
+        top: 100%;
+        left: 0;
+        min-width: 320px;
+        background-color: rgba(10, 20, 40, 0.95);
+        backdrop-filter: blur(16px);
+        border: 2px solid rgba(77, 231, 255, 0.5);
+        border-radius: 0.75rem;
+        padding: 1.25rem;
+        box-shadow: 0 0 30px rgba(77, 231, 255, 0.4), 
+                    inset 0 0 15px rgba(77, 231, 255, 0.2);
+        z-index: 50;
+        transition: opacity 0.2s ease, transform 0.2s ease;
+      }
+      
+      .donate-btn:hover .donate-qr-container {
+        display: flex;
+        flex-direction: column;
+        gap: 1.5rem; /* 增加间距 */
+        opacity: 1;
+        transform: translateY(5px);
+      }
+      
+      .qr-item {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.75rem; /* 图片和文字之间的间距 */
+      }
+      
+      .qr-item img {
+        width: 320px;
+        height: 320px;
+        border-radius: 0.5rem;
+        box-shadow: 0 0 20px rgba(0, 0, 0, 0.4);
+        transition: transform 0.2s ease;
+      }
+      
+      .qr-item img:hover {
+        transform: scale(1.02);
+      }
+      
+      .qr-label {
+        font-family: 'Exo 2', sans-serif;
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: #4DE7FF;
+        text-shadow: 0 0 10px rgba(77, 231, 255, 0.5);
+      }
+      
+      @media (max-width: 640px) {
+        .donate-qr-container {
+          min-width: 280px;
+          padding: 1rem;
+        }
+        
+        .qr-item img {
+          width: 280px;
+          height: 280px;
+        }
+        
+        .qr-label {
+          font-size: 1rem;
+        }
+      }
+      
+      .donate-btn:hover .donate-qr-container {
+        left: 50%;
+        transform: translateX(-50%) translateY(5px);
       }
     }
   </style>
@@ -218,6 +295,19 @@
         <a href="/" class="text-primary hover:text-white nav-link">状态信息</a>
         <a href="/config" class="text-primary hover:text-white nav-link">运行设置</a>
         <a href="/login" class="text-primary hover:text-white nav-link">登录</a>
+        <div class="donate-btn nav-link">
+          <a href="#" class="text-primary hover:text-white">捐赠作者</a>
+          <div class="donate-qr-container">
+            <div class="qr-item">
+              <img src="https://2rtk.rampump.cn/alipay.jpg" alt="支付宝捐赠">
+              <div class="qr-label">支付宝赞助</div>
+            </div>
+            <div class="qr-item">
+              <img src="https://2rtk.rampump.cn/wechat.jpg" alt="微信捐赠">
+              <div class="qr-label">微信赞助</div>
+            </div>
+          </div>
+        </div>
       </div>
       <div class="flex items-center space-x-4">
         <div id="update-time" class="text-sm text-info">数据加载中...</div>
@@ -226,9 +316,7 @@
     </div>
   </header>
   <main class="flex-grow container mx-auto px-4 py-6 relative z-10">
-    
     <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-      
       <div class="space-card rounded-xl p-4 glow-border fade-in">
         <h3 class="font-semibold text-lg mb-3 font-orbitron text-white">
           <i class="fa fa-cog text-secondary mr-2"></i>运行状态
@@ -236,21 +324,16 @@
         <div class="grid grid-cols-[max-content,1fr] gap-x-3 gap-y-2">
           <span class="text-sm text-primary whitespace-nowrap">运行模式：</span>
           <span id="run-mode" class="text-primary font-medium truncate">等待数据...</span>
-
           <span class="text-sm text-primary whitespace-nowrap">数据源：</span>
           <span id="data-source" class="text-primary font-medium truncate">--</span>
-
           <span class="text-sm text-primary whitespace-nowrap">目标caster：</span>
           <span id="target-caster" class="text-primary font-medium truncate">--</span>
-
           <span class="text-sm text-primary whitespace-nowrap">发送数据量：</span>
           <span id="data-sent" class="text-primary font-medium truncate">0B</span>
-
           <span class="text-sm text-primary whitespace-nowrap">运行时间：</span>
           <span id="run-time" class="text-primary font-medium truncate">0h 0m 0s</span>
         </div>
       </div>
-      
       
       <div class="space-card rounded-xl p-4 glow-border fade-in">
         <h3 class="font-semibold text-lg mb-3 font-orbitron text-white">
@@ -259,18 +342,14 @@
         <div class="grid grid-cols-[max-content,1fr] gap-x-3 gap-y-2">
           <span class="text-sm text-primary whitespace-nowrap">观测星座数量：</span>
           <span id="system-count" class="text-primary font-medium truncate">0</span>
-
           <span class="text-sm text-primary whitespace-nowrap">观测到的星座：</span>
           <span id="observed-systems" class="text-primary font-medium truncate">暂无数据</span>
-
           <span class="text-sm text-primary whitespace-nowrap">观测到卫星数量：</span>
           <span id="satellite-count" class="text-primary font-medium truncate">0</span>
-
           <span class="text-sm text-primary whitespace-nowrap">优良信号卫星数：</span>
           <span id="strong-signal-count" class="text-success font-medium truncate">0</span>
         </div>
       </div>
-      
       
       <div class="space-card rounded-xl p-4 glow-border fade-in">
         <h3 class="font-semibold text-lg mb-2 font-orbitron">
@@ -278,34 +357,26 @@
         </h3>
         <div class="grid grid-cols-[max-content,1fr] gap-x-3 gap-y-2">
           <span class="text-sm text-primary whitespace-nowrap">RTCM数据：</span>
-          
           <span id="rtcm-type-list" class="text-primary font-medium truncate rtcm-data">等待数据加载...</span>
-
           <span class="text-sm text-primary whitespace-nowrap">设备型号：</span>
           <span id="device-model" class="text-primary font-medium truncate">--</span>
-
           <span class="text-sm text-primary whitespace-nowrap">固件版本：</span>
           <span id="firmware-version" class="text-primary font-medium truncate">--</span>
-
           <span class="text-sm text-primary whitespace-nowrap">天线状态：</span>
           <span id="antenna-model" class="text-primary font-medium truncate">--</span>
         </div>
       </div>
     </div>
     
-   
     <div class="space-card rounded-xl p-4 glow-border fade-in mb-6 relative">
       <h3 class="font-semibold text-lg mb-2 font-orbitron"><i class="fa fa-map-pin text-info mr-2"></i>基准站位置</h3>
       
-      
       <div class="absolute bottom-4 right-4 z-20 bg-stardust/50 backdrop-blur-sm rounded-lg p-3 shadow-lg">
         <div class="flex flex-col space-y-2">
-          
           <div>
             <span class="text-sm text-primary whitespace-nowrap">基准站编号: </span>
             <span id="station-id" class="text-primary font-medium">--</span>
           </div>
-          
           
           <div class="flex space-x-4">
             <div>
@@ -321,7 +392,6 @@
               <span id="ecef-z" class="text-primary font-medium">--</span>
             </div>
           </div>
-          
           
           <div class="flex space-x-4">
             <div>
@@ -340,7 +410,6 @@
         </div>
       </div>
       
-      
       <div id="map-container" class="mt-2 h-64 relative">
         <div class="map-grid"></div>
         <div class="map-placeholder">
@@ -355,7 +424,6 @@
         </div>
       </div>
     </div>
-    
     
     <div id="signal-container" class="space-y-6">
       <div id="loading-indicator" class="space-card rounded-xl p-4 glow-border text-center py-4 text-primary">
@@ -390,7 +458,9 @@
         starsContainer.appendChild(star);
       }
     }
+    
     document.getElementById('year').textContent = new Date().getFullYear();
+    
     document.addEventListener('DOMContentLoaded', () => {
       createStars();
     });

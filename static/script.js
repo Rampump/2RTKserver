@@ -69,7 +69,7 @@ const gnssAbbrMap = {
   'GALILEO': 'GAL',
   'QZSS': 'QZS',
   'IRNSS': 'IRN',
-  'SBAS': 'SBS',
+  'SBAS': 'SBAS',
   'NAVIC':'NAV',
   'UNKNOWN': 'UNKNOWN'
 };
