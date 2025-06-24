@@ -3,23 +3,24 @@
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 2RTK NTRIP Server是一个用于RTK（Real-Time Kinematic）定位系统的NTRIP server。
-它可以通过从串口上的RTK模块读取数据发送到NTRIPcaster服务器，也可以从其他NTRIPcaster服务器接收数据并转发到自有的NTRIPcaster。达到单基准站自建CORS的目的.
+它可以通过从USB等串口上的RTK模块或者GNSS接收机读取数据发送到NTRIPcaster服务器，也可以从其他NTRIPcaster服务器接收数据并转发到自有的NTRIPcaster。达到使用单基准站模式自建CORS的目的.
 
   适用于Linux/Armbian环境，已在玩客云等armbian系统上测试通过.也可以用于树莓派等其他Linux/Armbian系统.
 
 ## 功能特点
 
-- 支持NTRIP协议，兼容大多数RTK模块.
-- 支持多种数据源：串口、NTRIP客户端等
+- 支持NTRIP协议，兼容大多数RTK模块.和支持串口收发的RTK接收机.
+- 支持的数据源：串口、NTRIP客户端等
 - 内置Web管理界面，可以通过web前端实时修改程序运行模式和配置，方便配置和监控.
-- web端会实时监控模块或基准站的实时状态，收星数量、收星质量、RTK状态等.并以图片的形式在前端显示.
+- web端会实时监控模块或基准站的状态，收星数量、收星质量、RTK状态等.并以图表的形式在前端显示.
 - web端在标记RTK基站时，会自动获取基站的经纬度信息，然后标记在地图上.
-- 在中国可以使用高德地图标记RTK基站位置，其它地区可以使用开源OpenStreetMap地图进行基准站标记.
+- 在中国使用高德地图标记RTK基站位置，其它地区使用开源OpenStreetMap地图进行基准站标记.
 - 使用地图标记基准站时，会同时标记两个覆盖半径分别为20KM和50KM的圆形覆盖范围.
 - PS：在单基准站的RTK系统中，受（电离层误差；对流层误差；卫星轨道误差；多路径误差）影响，有效覆盖范围通常为20KM. 使用双频或者多频RTK接收机时，NTRIP服务有时可实现50公里的覆盖范围且精度良好，但是一般不推荐使用超过50KM的RTK单基准站.
-- 支持数据流转发和中继.
-- 支持Linux/Armbian系统自动安装和管理.
+
+- 支持Linux/Armbian系统安装和管理.
 - 自动重试：当遇到网络波动、服务器连接失败等情况时，程序会自动重连并认证，确保稳定运行。
+## web端示例
  
 ![server.png](https://raw.gitcode.com/user-images/assets/5308990/85709034-dba9-42f0-bc24-d2d1a95efe71/server.png 'server.png')
 
