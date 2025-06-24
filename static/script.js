@@ -51,15 +51,15 @@ const gnssColorMap = {
   'UNKNOWN': '#86909C'
 };
 const gnssIconMap = {
-  'GPS': 'fi fi-us',              // 美国国旗
-  'BDS': 'fi fi-cn',             // 中国国旗
-  'GLO': 'fi fi-ru',            // 俄罗斯旗
-  'GAL': 'fi fi-eu',           // 欧盟旗帜
-  'QZS': 'fi fi-jp',          // 日本国旗
-  'IRN': 'fi fi-in',         // 印度国旗
-  'NAV': 'fi fi-in',        // 印度国旗
-  'SBAS': 'fi fi-globe',   // 全球旗帜
-  'UNKNOWN': 'fi fi-globe'// 未知旗帜
+  'GPS': 'fi fi-us',                   // 美国国旗
+  'BDS': 'fi fi-cn',                  // 中国国旗
+  'GLO': 'fi fi-ru',                 // 俄罗斯旗
+  'GAL': 'fi fi-eu',                // 欧盟旗帜
+  'QZS': 'fi fi-jp',               // 日本国旗
+  'IRN': 'fi fi-in',              // 印度国旗
+  'NAV': 'fi fi-in',             // 印度国旗
+  'SBAS': 'fi fi-un',           // 联合国旗帜
+  'UNKNOWN': 'fi fi-un'        // 联合国旗帜
 };
 
 // RTCM标准名称映射 (添加北斗系统映射)
@@ -868,7 +868,7 @@ function createSignalBar(cell, gnssColor, gnss, freqMap) {
 信号类型: ${sig}
 频段: ${freqInfo.band}
 频率: ${freqInfo.freq} MHz
-信号强度: ${strength} 
+信号强度: ${strength}dBHz 
 所属系统: ${gnss}
 卫星PRN: ${prn}
   `.trim();

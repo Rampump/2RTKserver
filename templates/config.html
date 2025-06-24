@@ -255,22 +255,22 @@
 
       <form method="POST" action="/config" id="configForm" class="space-y-4">
         <div>
-          <label class="form-label font-semibold">运行模式:</label>
+          <label class="form-label font-semibold">Mode运行模式:</label>
           <select name="mode" class="form-input w-full rounded" required>
             <option value="none" {{ 'selected' if config.mode == 'none' }}>none (默认)</option>
-            <option value="serial" {{ 'selected' if config.mode == 'serial' }}>RTK模块串口模式</option>
-            <option value="relay" {{ 'selected' if config.mode == 'relay' }}>relay中继模式</option>
+            <option value="serial" {{ 'selected' if config.mode == 'serial' }}>Serial串口模式</option>
+            <option value="relay" {{ 'selected' if config.mode == 'relay' }}>Relay中继模式</option>
           </select>
         </div>
 
         
         <div class="grid grid-cols-2 gap-4 field-serial">
           <div>
-            <label class="form-label font-semibold">RTK串口名称:</label>
+            <label class="form-label font-semibold">Serial port串口名称:</label>
             <input type="text" name="serial_port" value="{{ config.serial_port or ''}}" class="form-input w-full rounded" placeholder="可选">
           </div>
           <div>
-            <label class="form-label font-semibold">串口波特率:</label>
+            <label class="form-label font-semibold">Baud Rate 串口波特率:</label>
             <input type="number" name="baud_rate" value="{{ config.baud_rate or '' }}" class="form-input w-full rounded" list="baud-rates">
             <datalist id="baud-rates">
               <option value="115200">115200</option>
@@ -284,22 +284,22 @@
         </div>
         <div class="grid grid-cols-2 gap-4 field-caster">
           <div>
-            <label class="form-label font-semibold">NTRIPcaster上传地址:</label>
+            <label class="form-label font-semibold">NTRIP   Caster Addr. 上传地址:</label>
             <input type="text" name="caster_host" value="{{ config.caster_host }}" class="form-input w-full rounded">
           </div>
           <div>
-            <label class="form-label font-semibold">NTRIPcaster上传端口:</label>
+            <label class="form-label font-semibold">NTRIP Caster Port 上传端口:</label>
             <input type="number" name="caster_port" value="{{ config.caster_port }}" class="form-input w-full rounded">
           </div>
         </div>
 
         <div class="grid grid-cols-2 gap-4 field-caster">
           <div>
-            <label class="form-label font-semibold">NTRIPcaster上传挂载点:</label>
+            <label class="form-label font-semibold">NTRIP Caster Mount Point上传挂载点:</label>
             <input type="text" name="caster_mountpoint" value="{{ config.caster_mountpoint }}" class="form-input w-full rounded">
           </div>
           <div>
-            <label class="form-label font-semibold">NTRIPcaster上传密码:</label>
+            <label class="form-label font-semibold">NTRIP Caster Upload Password 上传密码:</label>
             <input type="text" name="caster_password" value="{{ config.caster_password }}" class="form-input w-full rounded">
           </div>
         </div>
@@ -307,28 +307,28 @@
         
         <div class="grid grid-cols-2 gap-4 field-relay">
           <div>
-            <label class="form-label font-semibold">Relay caster中继地址:</label>
+            <label class="form-label font-semibold">Relay Caster Addr. 中继地址:</label>
             <input type="text" name="relay_host" value="{{ config.relay_host }}" class="form-input w-full rounded">
           </div>
           <div>
-            <label class="form-label font-semibold">Relay caster中继端口:</label>
+            <label class="form-label font-semibold">Relay Caster Port 中继端口:</label>
             <input type="number" name="relay_port" value="{{ config.relay_port }}" class="form-input w-full rounded">
           </div>
         </div>
 
         <div class="grid grid-cols-2 gap-4 field-relay">
           <div>
-            <label class="form-label font-semibold">Relay caster中继挂载点:</label>
+            <label class="form-label font-semibold">Relay Caster Mount Point 中继挂载点:</label>
             <input type="text" name="relay_mountpoint" value="{{ config.relay_mountpoint }}" class="form-input w-full rounded">
           </div>
           <div>
-            <label class="form-label font-semibold">Relay caster中继用户名:</label>
+            <label class="form-label font-semibold">Relay Caster Username 中继用户名:</label>
             <input type="text" name="relay_user" value="{{ config.relay_user }}" class="form-input w-full rounded">
           </div>
         </div>
 
         <div class="field-relay">
-          <label class="form-label font-semibold">NTRIPcaster中继密码:</label>
+          <label class="form-label font-semibold">relay Caster Password 中继密码:</label>
             <input type="text" name="relay_password" value="{{ config.relay_password }}" class="form-input w-full rounded">
         </div>
 
@@ -336,7 +336,7 @@
         <div class="flex justify-between mt-6">
           <button type="submit" name="restart_program"
                   class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded">
-            保存并重启
+            Apply & Restart 保存重启
           </button>
         </div>
       </form>
