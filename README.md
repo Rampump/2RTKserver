@@ -3,8 +3,9 @@
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 2RTK NTRIP Server是一个用于RTK（Real-Time Kinematic）定位系统的NTRIP server。
-它可以通过从串口上的RTK模块读取数据发送到NTRIPcaster服务器，也可以从其他NTRIPcaster服务器接收数据并转发到自有的NTRIPcaster。
-适用于Linux/Armbian环境，已在玩客云等armbian系统上测试通过.也可以用于树莓派等其他Linux/Armbian系统.
+它可以通过从串口上的RTK模块读取数据发送到NTRIPcaster服务器，也可以从其他NTRIPcaster服务器接收数据并转发到自有的NTRIPcaster。达到单基准站自建CORS的目的.
+
+  适用于Linux/Armbian环境，已在玩客云等armbian系统上测试通过.也可以用于树莓派等其他Linux/Armbian系统.
 
 ## 功能特点
 
@@ -19,17 +20,16 @@
 - 支持数据流转发和中继.
 - 支持Linux/Armbian系统自动安装和管理.
 - 自动重试：当遇到网络波动、服务器连接失败等情况时，程序会自动重连并认证，确保稳定运行。
-
-![server1.png](https://raw.gitcode.com/user-images/assets/5308990/ad85831d-f013-46cb-b53f-ee34ca620104/server1.png 'server1.png')
-![ser3.png](https://raw.gitcode.com/user-images/assets/5308990/bb228481-89e3-4336-a676-92befe6c7cba/ser3.png 'ser3.png')![ser2.png](https://raw.gitcode.com/user-images/assets/5308990/8b60b43d-1a24-4f56-9f5e-b7dd720fc8df/ser2.png 'ser2.png')![ser4.png](https://raw.gitcode.com/user-images/assets/5308990/3ed15432-0f89-47f8-af54-c1d489dd72fb/ser4.png 'ser4.png')
+ 
+![server.png](https://raw.gitcode.com/user-images/assets/5308990/85709034-dba9-42f0-bc24-d2d1a95efe71/server.png 'server.png')
 
 ## 工作模式
 
 - **串口模式**：可自动扫描USB串口，也可指定串口读取RTK模块的RTCM数据，然后转发到本地NTRIP Caster。
                不知道串口名称时可以留空，程序会自动扫描串口.建议填写正确的波特率，程序会优先扫描RTK模块常用的波特率115200。
-- **网络模式**：指定IP地址和端口连接NTRIP caster，cros然后转发RTK模块的RTCM数据.
-
+![serial.png](https://raw.gitcode.com/user-images/assets/5308990/a8620db8-799e-49b8-9269-0746e3f01b5e/serial.png 'serial.png')
 - **中继模式**：作为NTRIP客户端，连接其他NTRIP服务器获取RTCM数据，然后转发到本地NTRIP Caster。
+![relay.png](https://raw.gitcode.com/user-images/assets/5308990/c1fdff2d-4098-4e6c-a7e0-a62ba0dffc50/relay.png 'relay.png')
 - **Caster模式**：#####暂未添加该功能####  作为本地内NTRIP caster，读取串口RTK模块的RTCM数据，然后提供RTCM数据流给移动站等NTRIP客户端.
 ## 安装指南
  #### 部分Armbian系统因为精简等原因.会导致依赖安装失败，推荐使用手动安装依赖.
