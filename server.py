@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 2RTK NTRIP Server
 Copyright (C) 2024 文七 (i@jia.by)
@@ -62,7 +64,10 @@ def setup_logging():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[logging.StreamHandler()]
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('server.log', encoding='utf-8')
+        ]
     )
 
 def get_local_ip():
@@ -144,32 +149,45 @@ def get_config():
     return config
 
 def run_once():
-    cfg = get_config()
-    if not validate_config(cfg):
-        logging.error("监测到配置信息无效，将于5秒后重新读取")
-        time.sleep(5)
-        return
-    mode = cfg['mode']
-    ser = None
-    relay = None
-    caster = None
-    upload_thread = None
-    forward_thread = None
-
     try:
+        cfg = get_config()
+        if not validate_config(cfg):
+            logging.error("监测到配置信息无效，将于5秒后重新读取")
+            time.sleep(5)
+            return
+
+        mode = cfg['mode']
+        ser = None
+        relay = None
+        caster = None
+        upload_thread = None
+        forward_thread = None
+
         if mode == 'serial':
             logging.info("进入串口模式")
             port, baud = detect_serial(cfg)
             if port and baud:
                 cfg['serial_port'], cfg['baud_rate'] = port, baud
-                ser = serial.Serial(port=port, baudrate=baud, timeout=1)
-                caster = open_caster(cfg)
+                try:
+                    ser = serial.Serial(port=port, baudrate=baud, timeout=1)
+                except Exception as e:
+                    logging.error(f"打开串口失败: {e}")
+                    time.sleep(5)
+                    return
+                try:
+                    caster = open_caster(cfg)
+                except Exception as e:
+                    logging.error(f"打开Caster失败: {e}")
+                    time.sleep(5)
+                    return
+
                 upload_thread = threading.Thread(
                     target=upload_via_serial,
                     args=(ser, caster, cfg, thread_exit_event),
                     daemon=True
                 )
                 upload_thread.start()
+
                 while not restart_event.is_set() and not shutdown_event.is_set():
                     time.sleep(1)
             else:
@@ -178,40 +196,55 @@ def run_once():
 
         elif mode == 'relay':
             logging.info("进入中继模式")
-            relay = open_relay(cfg)
-            caster = open_caster(cfg)
+            try:
+                relay = open_relay(cfg)
+            except Exception as e:
+                logging.error(f"打开中继连接失败: {e}")
+                time.sleep(5)
+                return
+            try:
+                caster = open_caster(cfg)
+            except Exception as e:
+                logging.error(f"打开上传Caster失败: {e}")
+                time.sleep(5)
+                return
+
             forward_thread = threading.Thread(
                 target=forward_relay,
                 args=(relay, caster, cfg, thread_exit_event),
                 daemon=True
             )
             forward_thread.start()
+
             while not restart_event.is_set() and not shutdown_event.is_set():
                 time.sleep(1)
 
         else:
             logging.error(f"未知模式: {mode}")
             time.sleep(5)
+
+    except Exception as e:
+        logging.exception(f"运行主循环run_once时发生未捕获异常: {e}")
+        time.sleep(5)
+
     finally:
-        
         thread_exit_event.set()
-        
         threads_to_join = []
         if upload_thread and upload_thread.is_alive():
             threads_to_join.append((upload_thread, "串口上传"))
         if forward_thread and forward_thread.is_alive():
             threads_to_join.append((forward_thread, "中继转发"))
-        
-        timeout = 5  
+
+        timeout = 5
         start_time = time.time()
-        
+
         for thread, name in threads_to_join:
             remaining = max(0, timeout - (time.time() - start_time))
             if remaining > 0:
                 thread.join(remaining)
                 if thread.is_alive():
                     logging.warning(f"{name}线程未在超时时间内退出，强制终止")
-        
+
         thread_exit_event.clear()
 
         if ser:
@@ -223,12 +256,12 @@ def run_once():
             try:
                 relay.close()
             except Exception as e:
-                logging.error(f"关闭网络连接时出错: {e}")
+                logging.error(f"关闭中继连接时出错: {e}")
         if caster:
             try:
                 caster.close()
             except Exception as e:
-                logging.error(f"关闭Caster套接字时出错: {e}")
+                logging.error(f"关闭Caster连接时出错: {e}")
 
         if restart_event.is_set():
             logging.info("接收到重启指令，等待所有资源关闭后重新加载配置")
