@@ -823,8 +823,8 @@ function updateStatistics(gnss, cellData, identity, sats) {
       // 获取信号强度（优先使用DF408，否则使用其他字段）
       const strength = sat.DF408 ?? sat.DF403 ?? sat.DF409 ?? sat.DF405 ?? 0;
       
-      // 信号强度超过45视为强信号
-      if (strength > 45) {
+      // 信号强度超过35视为强信号
+      if (strength > 35) {
         const satId = `${system}_${sat.CELLPRN}`;
         strongSatelliteIds.add(satId);
       }
