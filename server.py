@@ -893,7 +893,7 @@ def reconnect_caster(cfg):
             retries += 1
             logging.error(f"Caster重连尝试 {retries}/{max_retries} 失败: {e}")
             if retries < max_retries:
-                time.sleep(5)  # 每次重试前等待5秒
+                time.sleep(15)  # 每次重试前等待15秒
     
     # 如果达到最大重试次数仍失败，抛出异常
     raise RuntimeError(f"达到最大重试次数({max_retries})，Caster重连失败")
@@ -959,7 +959,7 @@ def upload_via_serial(ser, caster, cfg, thread_exit_event):
                         logging.info("caster重连成功")
                     except Exception as reconnect_err:
                         logging.error(f"caster重连失败: {reconnect_err}")
-                        time.sleep(5)  # 等待5秒后重试
+                        time.sleep(15)  # 等待15秒后重试
                 
                 # 如果重连成功，继续处理数据
                 if caster:
@@ -1038,7 +1038,7 @@ def forward_relay(relay, caster, cfg, thread_exit_event):
                             logging.info("Caster重新连接成功")
                         except Exception as e:
                             logging.error(f"Caster重新连接失败: {e}")
-                            time.sleep(5)
+                            time.sleep(15)
                 
                 upload_data(data)
             else:
@@ -1078,7 +1078,7 @@ def forward_relay(relay, caster, cfg, thread_exit_event):
                     logging.info("Relay重新连接成功")
                 except Exception as e2:
                     logging.error(f"Relay重新连接失败: {e2}")
-                    time.sleep(5)
+                    time.sleep(15)
             
             # 再重新连接caster
             while caster is None and not thread_exit_event.is_set() and relay is not None:
@@ -1087,7 +1087,7 @@ def forward_relay(relay, caster, cfg, thread_exit_event):
                     logging.info("Caster重新连接成功")
                 except Exception as e2:
                     logging.error(f"Caster重新连接失败: {e2}")
-                    time.sleep(5)
+                    time.sleep(15)
 
 def main():
     setup_logging()
