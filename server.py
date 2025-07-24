@@ -882,11 +882,22 @@ def open_relay(cfg):
     return sock
 
 def reconnect_caster(cfg):
-    try:
-        return open_caster(cfg)
-    except Exception:
-        time.sleep(5)
-        return open_caster(cfg)
+    """彻底重新连接Caster，而不仅仅是尝试连接"""
+    retries = 0
+    max_retries = 5  # 增加最大重试次数
+    while retries < max_retries:
+        try:
+            # 完全重新建立连接，包括认证过程
+            return open_caster(cfg)
+        except Exception as e:
+            retries += 1
+            logging.error(f"Caster重连尝试 {retries}/{max_retries} 失败: {e}")
+            if retries < max_retries:
+                time.sleep(5)  # 每次重试前等待5秒
+    
+    # 如果达到最大重试次数仍失败，抛出异常
+    raise RuntimeError(f"达到最大重试次数({max_retries})，Caster重连失败")
+    
 
 # 通过串口上传数据
 def upload_via_serial(ser, caster, cfg, thread_exit_event):
@@ -894,75 +905,96 @@ def upload_via_serial(ser, caster, cfg, thread_exit_event):
     last_clear = program_start
     last_status_update = program_start
     total_bytes = 0
-
     global run_status
+
+    run_status = {
+        "mode": "串口模式",
+        "data_source": f"{cfg['serial_port']} @ {cfg['baud_rate']}bps",
+        "target_caster": f"{cfg['caster_host']}:{cfg['caster_port']}/{cfg['caster_mountpoint']}",
+        "data_sent": "0B",
+        "run_time": "0h 0m 0s"
+    }
+
+    send_to_clients({"run_status": run_status})
 
     while not thread_exit_event.is_set():
         try:
-            data = ser.read(ser.in_waiting or 1024)
-        except Exception as e:
-            logging.error(f"串口读取失败: {e}")
-            ser.close()
-            ser = None
-
-        if not data:
-            time.sleep(0.5)
-            ser.close()
-            logging.warning("串口无数据，尝试重新识别串口...")
-            port, baud = detect_serial(cfg)
-            if port and baud:
-                try:
-                    ser = serial.Serial(port, baud, timeout=1)
-                    cfg['serial_port'], cfg['baud_rate'] = port, baud
-                    logging.info(f"串口重连成功: {port} @ {baud}")
-                except Exception as e:
-                    logging.error(f"串口重建失败: {e}")
+            if ser is None:
+                logging.warning("串口对象为 None，尝试重新识别串口...")
+                port, baud = detect_serial(cfg)
+                if port and baud:
+                    try:
+                        ser = serial.Serial(port, baud, timeout=1)
+                        cfg['serial_port'], cfg['baud_rate'] = port, baud
+                        logging.info(f"串口重连成功: {port} @ {baud}")
+                    except Exception as e:
+                        logging.error(f"串口重建失败: {e}")
+                        time.sleep(5)
+                        continue
+                else:
                     time.sleep(5)
                     continue
-            continue
 
-        # 尝试发送到Caster
-        try:
-            caster.sendall(data)
-        except Exception as e:
-            logging.error(f"caster发送失败，尝试重连: {e}")
-            try:
-                caster.close()
-            except:
-                pass
-            try:
-                caster = reconnect_caster(cfg)
-                logging.info("caster重连成功")
-            except Exception as e2:
-                logging.error(f"caster重连失败: {e2}")
-                time.sleep(5)
+            data = ser.read(ser.in_waiting or 1024)
+
+            if not data:
+                time.sleep(0.2)
                 continue
 
-        upload_data(data)
-        total_bytes += len(data)
+            try:
+                caster.sendall(data)
+            except Exception as send_err:
+                logging.error(f"caster发送失败: {send_err}")
+                # 关闭旧连接
+                try:
+                    caster.close()
+                except:
+                    pass
+                
+                # 循环重试直到重连成功
+                caster = None
+                while caster is None and not thread_exit_event.is_set():
+                    try:
+                        caster = reconnect_caster(cfg)
+                        logging.info("caster重连成功")
+                    except Exception as reconnect_err:
+                        logging.error(f"caster重连失败: {reconnect_err}")
+                        time.sleep(5)  # 等待5秒后重试
+                
+                # 如果重连成功，继续处理数据
+                if caster:
+                    continue
+                else:  # 如果重连失败且收到退出信号
+                    break
 
-        now = time.time()
-        if now - last_clear > 100:
-            clear_screen()
-            print(ART_LOGO)
-            print(f"串口模式: {cfg['serial_port']} @ {cfg['baud_rate']}bps")
-            print(f"上传到: {cfg['caster_host']}:{cfg['caster_port']}/{cfg['caster_mountpoint']}")
-            print(f"运行时间: {format_duration(now - program_start)}")
-            print(f"发送数据量: {format_bytes(total_bytes)}")
-            last_clear = now
+            upload_data(data)
+            total_bytes += len(data)
 
-        if now - last_status_update > 2:
-            run_status = {
-                "mode": "串口模式",
-                "data_source": f"{cfg['serial_port']} @ {cfg['baud_rate']}bps",
-                "target_caster": f"{cfg['caster_host']}:{cfg['caster_port']}/{cfg['caster_mountpoint']}",
-                "data_sent": format_bytes(total_bytes),
-                "run_time": format_duration(now - program_start)
-            }
-            send_to_clients({"run_status": run_status})
-            last_status_update = now
+            now = time.time()
+            if now - last_clear > 100:
+                clear_screen()
+                print(ART_LOGO)
+                print(f"串口模式: {cfg['serial_port']} @ {cfg['baud_rate']}bps")
+                print(f"上传到: {cfg['caster_host']}:{cfg['caster_port']}/{cfg['caster_mountpoint']}")
+                print(f"运行时间: {format_duration(now - program_start)}")
+                print(f"发送数据量: {format_bytes(total_bytes)}")
+                last_clear = now
 
-        time.sleep(0.05)
+            if now - last_status_update > 2:
+                run_status["data_sent"] = format_bytes(total_bytes)
+                run_status["run_time"] = format_duration(now - program_start)
+                send_to_clients({"run_status": run_status})
+                last_status_update = now
+
+        except Exception as e:
+            logging.error(f"串口读取失败: {e}")
+            try:
+                if ser:
+                    ser.close()
+            except:
+                pass
+            ser = None
+            time.sleep(3)
 
 
 def forward_relay(relay, caster, cfg, thread_exit_event):
@@ -992,7 +1024,22 @@ def forward_relay(relay, caster, cfg, thread_exit_event):
                     caster.sendall(data)
                 except Exception as send_err:
                     logging.error(f"发送数据到 Caster 失败: {send_err}")
-                    raise
+                    # 关闭旧的caster连接
+                    try:
+                        caster.close()
+                    except:
+                        pass
+                    
+                    # 重新连接caster
+                    caster = None
+                    while caster is None and not thread_exit_event.is_set():
+                        try:
+                            caster = open_caster(cfg)
+                            logging.info("Caster重新连接成功")
+                        except Exception as e:
+                            logging.error(f"Caster重新连接失败: {e}")
+                            time.sleep(5)
+                
                 upload_data(data)
             else:
                 if time.time() - last_recv > 120:
@@ -1020,22 +1067,27 @@ def forward_relay(relay, caster, cfg, thread_exit_event):
             time.sleep(0.1)
         except Exception as e:
             logging.error(f"中继模式错误: {str(e)}")
-            if "10054" in str(e) or "10053" in str(e):
-                logging.warning("远程主机断开连接，尝试重新连接中继...")
-                try:
-                    relay.close()
-                except:
-                    pass
+            # 同时重新连接relay和caster
+            relay = None
+            caster = None
+            
+            # 先重新连接relay
+            while relay is None and not thread_exit_event.is_set():
                 try:
                     relay = open_relay(cfg)
-                    last_recv = time.time()
-                    logging.info("重新连接成功")
+                    logging.info("Relay重新连接成功")
                 except Exception as e2:
-                    logging.error(f"重新连接失败: {e2}")
+                    logging.error(f"Relay重新连接失败: {e2}")
                     time.sleep(5)
-            else:
-                logging.error("未知错误，5秒后重试...")
-                time.sleep(5)
+            
+            # 再重新连接caster
+            while caster is None and not thread_exit_event.is_set() and relay is not None:
+                try:
+                    caster = open_caster(cfg)
+                    logging.info("Caster重新连接成功")
+                except Exception as e2:
+                    logging.error(f"Caster重新连接失败: {e2}")
+                    time.sleep(5)
 
 def main():
     setup_logging()
