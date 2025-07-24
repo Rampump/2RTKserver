@@ -157,11 +157,12 @@ def run_once():
             return
 
         mode = cfg['mode']
+        # 初始化所有可能在finally中用到的变量
         ser = None
         relay = None
         caster = None
         upload_thread = None
-        forward_thread = None
+        forward_thread = None  # 确保在所有代码路径中都有定义
 
         if mode == 'serial':
             logging.info("进入串口模式")
@@ -230,6 +231,7 @@ def run_once():
     finally:
         thread_exit_event.set()
         threads_to_join = []
+        # 现在这些变量都已初始化，不会出现未定义错误
         if upload_thread and upload_thread.is_alive():
             threads_to_join.append((upload_thread, "串口上传"))
         if forward_thread and forward_thread.is_alive():
@@ -266,6 +268,7 @@ def run_once():
         if restart_event.is_set():
             logging.info("接收到重启指令，等待所有资源关闭后重新加载配置")
             restart_event.clear()
+
 
 def save_config(config: dict):
     """保存配置到数据库"""
