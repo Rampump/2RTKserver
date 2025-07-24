@@ -60,15 +60,68 @@ restart_event = Event()
 thread_exit_event = Event()
 MAX_BUFFER_SIZE = 10 * 1024 * 1024 
 
+
+class WebSocketLogHandler(logging.Handler):
+    """WebSocket日志处理器，不影响原有日志处理"""
+    def __init__(self):
+        super().__init__()
+        self.formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        self.history = deque(maxlen=100)  # 保留最近100条日志
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.history.append(msg)
+            # 通过现有send_to_clients函数推送，不干扰原有逻辑
+            send_to_clients({"type": "log", "message": msg})
+        except Exception:
+            self.handleError(record)
+
+class PrintCapture:
+    """捕获print输出，同时保留原有控制台输出"""
+    def __init__(self, original_print):
+        self.original_print = original_print
+        self.history = deque(maxlen=100)
+
+    def __call__(self, *args, **kwargs):
+        # 保留原有控制台输出
+        self.original_print(*args, **kwargs)
+        # 同时捕获输出并推送到WebSocket
+        try:
+            msg = " ".join(map(str, args))
+            self.history.append(msg)
+            send_to_clients({"type": "print", "message": msg})
+        except Exception:
+            pass
+
+
 def setup_logging():
+    
+    handlers = [
+        logging.StreamHandler(),
+        logging.FileHandler('server.log', encoding='utf-8')
+    ]
+    
+    # 添加WebSocket日志处理器
+    ws_handler = WebSocketLogHandler()
+    handlers.append(ws_handler)
+    
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler('server.log', encoding='utf-8')
-        ]
+        handlers=handlers
     )
+    
+    
+    global log_history
+    log_history = {
+        'log': ws_handler.history,
+        'print': PrintCapture(print).history
+    }
+    
+    import builtins
+    builtins.print = PrintCapture(builtins.print)
+
 
 def get_local_ip():
     try:
@@ -381,22 +434,65 @@ def extract_rtcm_frames(data: bytes):
 
 # 配置处理，包括日志设置、读取配置、验证配置等
 def validate_config(cfg):
+    # 1. 首先检查运行模式是否有效
     mode = cfg.get('mode', 'none')
     if mode == 'none':
-        logging.error("请在Web页面配置程序运行模式为（串口/中继）及其他必要参数")
+        logging.error("请在Web页面配置程序运行模式为（串口/中继）")
         return False
-    if not cfg.get('caster_host') or not cfg.get('caster_mountpoint'):
-        logging.error('NTRIP Caster HOST未配置,请在Web页面配置上传NTRIP Caster服务器信息')
+    if mode not in ['serial', 'relay']:
+        logging.error(f"无效的运行模式: {mode}，请选择串口或中继模式")
         return False
-    if mode == 'serial':
-        return True
-    if mode == 'relay':
-        if not cfg.get('relay_host') or not cfg.get('relay_mountpoint'):
-            logging.error('relay Caster服务器未配置，请在Web页面配置中继caster服务器信息')
+
+    # 2. 检查两种模式的公共必填参数（Caster相关配置）
+    if not cfg.get('caster_host'):
+        logging.error("NTRIP Caster服务器地址未配置，请补充")
+        return False
+    if not cfg.get('caster_mountpoint'):
+        logging.error("NTRIP Caster挂载点未配置，请补充")
+        return False
+    try:
+        if int(cfg.get('caster_port', 0)) <= 0 or int(cfg.get('caster_port', 0)) > 65535:
+            logging.error("NTRIP Caster端口号无效，必须是1-65535之间的整数")
             return False
-        return True
-    logging.error(f"未知运行模式: {mode}")
-    return False
+    except (ValueError, TypeError):
+        logging.error("NTRIP Caster端口号必须是有效的整数")
+        return False
+
+    # 3. 根据不同模式检查专属必填参数
+    if mode == 'serial':
+        # 串口模式：波特率可以自动检测，因此不强制检查，但建议提示
+        if not cfg.get('serial_port'):
+            logging.warning("串口端口未配置，程序将尝试自动检测")
+        # 波特率若配置则验证有效性
+        if cfg.get('baud_rate'):
+            try:
+                baud = int(cfg.get('baud_rate'))
+                valid_bauds = [115200, 460800, 230400, 57600, 38400, 19200, 9600]
+                if baud not in valid_bauds:
+                    logging.warning(f"波特率{baud}不常见，可能导致连接问题")
+            except (ValueError, TypeError):
+                logging.error("波特率必须是有效的整数")
+                return False
+
+    elif mode == 'relay':
+        # 中继模式：必须检查中继服务器的配置
+        if not cfg.get('relay_host'):
+            logging.error("中继服务器地址未配置，请补充")
+            return False
+        if not cfg.get('relay_mountpoint'):
+            logging.error("中继服务器挂载点未配置，请补充")
+            return False
+        try:
+            if int(cfg.get('relay_port', 0)) <= 0 or int(cfg.get('relay_port', 0)) > 65535:
+                logging.error("中继服务器端口号无效，必须是1-65535之间的整数")
+                return False
+        except (ValueError, TypeError):
+            logging.error("中继服务器端口号必须是有效的整数")
+            return False
+
+    # 所有检查通过
+    return True
+
 
 def detect_serial(cfg: dict) -> Tuple[Optional[str], Optional[int]]:
     """检测可用的RTK串口设备，优先使用配置文件中的设置"""
@@ -702,6 +798,14 @@ def send_static(path):
 def websocket(ws):
     clients.add(ws)
     try:
+        
+        all_history = list(log_history['log']) + list(log_history['print'])
+        ws.send(json.dumps({
+            "type": "history",
+            "messages": all_history
+        }))
+        
+        
         while True:
             ws.receive(timeout=60)
     except Exception:
@@ -1099,6 +1203,7 @@ def main():
     
     init_db()
     
+    # 启动辅助线程（保持不变）
     rtcm_processor = threading.Thread(target=process_rtcm_buffer, daemon=True)
     rtcm_processor.start()
     logging.info("RTCM数据处理线程已启动")
@@ -1111,14 +1216,31 @@ def main():
     
     host_ip = get_local_ip()  
     logging.info(f"Web服务已启动，访问地址: http://{host_ip}:5757")
-    logging.info("Web配置页面: http://{host_ip}:5757/config")
+    logging.info(f"请先在Web配置页面完成设置：http://{host_ip}:5757/config")
 
+    # 重构：前置配置检查，仅在配置有效时执行主流程
     while not shutdown_event.is_set():
+        # 1. 先检查配置是否有效
+        cfg = get_config()
+        if not validate_config(cfg):
+            # 配置无效时，低频率等待（10秒一次），不进入主流程
+            logging.info("配置信息无效，等待用户在Web页面完成配置...（每10秒检查一次）")
+            time.sleep(10)
+            continue  # 跳过后续逻辑，直接进入下一次循环
+        
+        # 2. 配置有效，执行主流程（run_once不变）
+        logging.info("配置信息有效，启动主程序...")
         run_once()
+        
+        # 3. 处理重启指令（保持不变）
         if restart_event.is_set():
-            logging.info("接收到重启指令，正在重新加载配置")
+            logging.info("接收到重启指令，重新检查配置...")
             restart_event.clear()
+            continue
+        
+        # 4. 主流程正常结束后短暂等待（保持不变）
         time.sleep(1)
+
 
 if __name__ == "__main__":
 
