@@ -892,75 +892,78 @@ def reconnect_caster(cfg):
 def upload_via_serial(ser, caster, cfg, thread_exit_event):
     program_start = time.time()
     last_clear = program_start
-    last_recv = program_start
     last_status_update = program_start
     total_bytes = 0
-    port = cfg.get('serial_port', "自动检测")
-    baud = cfg.get('baud_rate', "自动检测")
 
     global run_status
-    run_status = {
-        "mode": "串口模式",
-        "data_source": f"{port} @ {baud}bps",
-        "target_caster": f"{cfg.get('caster_host', '')}:{cfg.get('caster_port', '2101')}/{cfg.get('caster_mountpoint', '')}",
-        "data_sent": "0B",
-        "run_time": "0h 0m 0s"
-    }
-
-    send_to_clients({"run_status": run_status})
 
     while not thread_exit_event.is_set():
         try:
             data = ser.read(ser.in_waiting or 1024)
+        except Exception as e:
+            logging.error(f"串口读取失败: {e}")
+            ser.close()
+            ser = None
 
-            if data:
-                last_recv = time.time()
-                total_bytes += len(data)
-
-                caster.sendall(data)
-
-                upload_data(data)
-            else:
-                if time.time() - last_recv > 30:  
-                    logging.warning("串口数据超时，重新检测设备...")
-                    port, baud = detect_serial(cfg)
-                    if port and baud:
-                        ser.close()
-                        ser = serial.Serial(port, baud, timeout=1)
-                        cfg['serial_port'] = port
-                        cfg['baud_rate'] = baud
-                        last_recv = time.time()
-                        logging.info(f"已重新连接到串口: {port} @ {baud}bps")
-
-            current_time = time.time()
-            if current_time - last_clear > 100:
-                clear_screen()
-                print(ART_LOGO)
-                print(f"模式: 串口模式 串口名称:{port}波特率@{baud}")
-                print(f"目的地: {cfg['caster_host']}:{cfg['caster_port']}/{cfg['caster_mountpoint']}")
-                print(f"已发送时间: {format_duration(current_time - program_start)}")
-                print(f"转发数据量: {format_bytes(total_bytes)}")
-                last_clear = current_time
-
-            if current_time - last_status_update > 2:
-                run_status["data_sent"] = format_bytes(total_bytes)
-                run_status["run_time"] = format_duration(current_time - program_start)
-                send_to_clients({"run_status": run_status})
-                last_status_update = current_time
-
-            time.sleep(0.1)
-        except serial.SerialException as e:
-            logging.error(f"串口错误: {str(e)}")
-            time.sleep(3)
+        if not data:
+            time.sleep(0.5)
+            ser.close()
+            logging.warning("串口无数据，尝试重新识别串口...")
             port, baud = detect_serial(cfg)
             if port and baud:
                 try:
                     ser = serial.Serial(port, baud, timeout=1)
-                    cfg['serial_port'] = port
-                    cfg['baud_rate'] = baud
-                    last_recv = time.time()
-                except serial.SerialException:
-                    pass
+                    cfg['serial_port'], cfg['baud_rate'] = port, baud
+                    logging.info(f"串口重连成功: {port} @ {baud}")
+                except Exception as e:
+                    logging.error(f"串口重建失败: {e}")
+                    time.sleep(5)
+                    continue
+            continue
+
+        # 尝试发送到Caster
+        try:
+            caster.sendall(data)
+        except Exception as e:
+            logging.error(f"caster发送失败，尝试重连: {e}")
+            try:
+                caster.close()
+            except:
+                pass
+            try:
+                caster = reconnect_caster(cfg)
+                logging.info("caster重连成功")
+            except Exception as e2:
+                logging.error(f"caster重连失败: {e2}")
+                time.sleep(5)
+                continue
+
+        upload_data(data)
+        total_bytes += len(data)
+
+        now = time.time()
+        if now - last_clear > 100:
+            clear_screen()
+            print(ART_LOGO)
+            print(f"串口模式: {cfg['serial_port']} @ {cfg['baud_rate']}bps")
+            print(f"上传到: {cfg['caster_host']}:{cfg['caster_port']}/{cfg['caster_mountpoint']}")
+            print(f"运行时间: {format_duration(now - program_start)}")
+            print(f"发送数据量: {format_bytes(total_bytes)}")
+            last_clear = now
+
+        if now - last_status_update > 2:
+            run_status = {
+                "mode": "串口模式",
+                "data_source": f"{cfg['serial_port']} @ {cfg['baud_rate']}bps",
+                "target_caster": f"{cfg['caster_host']}:{cfg['caster_port']}/{cfg['caster_mountpoint']}",
+                "data_sent": format_bytes(total_bytes),
+                "run_time": format_duration(now - program_start)
+            }
+            send_to_clients({"run_status": run_status})
+            last_status_update = now
+
+        time.sleep(0.05)
+
 
 def forward_relay(relay, caster, cfg, thread_exit_event):
     program_start = time.time()
