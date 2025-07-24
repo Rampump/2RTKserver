@@ -147,6 +147,42 @@ function cachedWgs84ToGcj02(lon, lat) {
   return result;
 }
 
+// 添加日志显示函数
+function addLog(message, type = 'info') {
+  const logContainer = document.getElementById('log-container');
+  if (!logContainer) return;
+  
+  // 创建日志条目
+  const logEntry = document.createElement('div');
+  
+  // 设置日志类型样式
+  const typeClasses = {
+    'info': 'text-gray-300',
+    'success': 'text-success',
+    'warning': 'text-warning',
+    'error': 'text-danger',
+    'system': 'text-primary'
+  };
+  
+  // 获取当前时间
+  const now = new Date();
+  const timeString = now.toLocaleTimeString();
+  
+  // 设置日志内容
+  logEntry.className = `${typeClasses[type] || 'text-gray-300'} mb-1`;
+  logEntry.innerHTML = `[${timeString}] ${message}`;
+  
+  // 添加到容器并滚动到底部
+  logContainer.appendChild(logEntry);
+  logContainer.scrollTop = logContainer.scrollHeight;
+  
+  // 限制日志数量，超过500条自动清理
+  const entries = logContainer.querySelectorAll('div');
+  if (entries.length > 500) {
+    logContainer.removeChild(entries[0]);
+  }
+}
+
 // ================== 地图相关函数封装 ==================
 
 // 创建标记层
@@ -316,10 +352,12 @@ function initAmapMap(mapConfig) {
     finalizeMapSetup();
     
     console.log("使用高德地图初始化成功");
+    addLog("使用高德地图初始化成功", 'success');
     
     // 监听瓦片错误事件
     map.on('tileerror', (event) => {
       console.error("地图瓦片加载错误:", event);
+      addLog("高德地图瓦片加载错误，尝试切换到OpenStreetMap", 'warning');
       // 如果错误超过5次，切换到OpenStreetMap
       if (mapSourceType === 'amap') {
         console.log("切换到OpenStreetMap");
@@ -329,6 +367,7 @@ function initAmapMap(mapConfig) {
     
   } catch (error) {
     console.error("高德地图初始化失败:", error);
+    addLog(`高德地图初始化失败: ${error.message}`, 'error'); 
     throw error; // 抛出异常以便上层处理
   }
 }
@@ -338,7 +377,7 @@ function initOsmMap(mapConfig) {
   const mapContainer = document.getElementById('map-container');
   
   try {
-    // 移除现有地图（如果存在）
+    
     if (map) {
       map.setTarget(null);
     }
@@ -370,9 +409,11 @@ function initOsmMap(mapConfig) {
     finalizeMapSetup();
     
     console.log("使用OpenStreetMap初始化成功");
+    addLog("使用OpenStreetMap初始化成功", 'success');
     
   } catch (error) {
     console.error("OpenStreetMap初始化失败:", error);
+    addLog(`OpenStreetMap初始化失败: ${error.message}`, 'error');
     // 显示错误信息
     mapContainer.innerHTML = `
       <div class="map-placeholder flex flex-col items-center justify-center h-full">
@@ -524,6 +565,7 @@ function initWebSocket() {
     reconnectAttempts = 0; // 重置重连计数
     clearInterval(reconnectInterval);
     
+    addLog('WebSocket连接成功，开始接收数据', 'system');
     // 更新加载指示器
     loadingIndicator.innerHTML = `
       <div class="inline-block relative">
@@ -569,6 +611,8 @@ function initWebSocket() {
     try {
       const data = JSON.parse(event.data);
       console.log("收到WebSocket数据：", data);
+
+      addLog(`收到数据: ${JSON.stringify(data, null, 2).substring(0, 100)}...`, 'info');
 
       // 隐藏加载指示器
       if (loadingIndicator && !loadingIndicator.classList.contains('hidden')) {
@@ -693,16 +737,19 @@ function initWebSocket() {
       signalBarsEl.innerHTML = sortedCellData.map(cell => createSignalBar(cell, gnssColor, gnss, gnssSignalFreqMap)).join("");
     } catch (error) {
       console.error("处理WebSocket数据出错:", error);
+      addLog(`数据处理错误: ${error.message}`, 'error');
     }
   };
 
   ws.onerror = (error) => {
     console.error("WebSocket错误:", error);
+    addLog(`连接错误: ${error.message}`, 'error');
     handleDisconnection();
   };
 
   ws.onclose = (event) => {
     console.log("WebSocket连接关闭，代码:", event.code, "原因:", event.reason);
+    addLog(`连接关闭 (代码: ${event.code}): ${event.reason}`, 'warning');
     handleDisconnection();
   };
 }
@@ -745,7 +792,7 @@ function handleDisconnection() {
   if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
     reconnectAttempts++;
     const delay = RECONNECT_DELAY * reconnectAttempts;
-    
+    addLog(`连接断开，${Math.round(delay/1000)}秒后尝试重连 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`, 'warning');
     loadingIndicator.classList.remove('hidden');
     loadingIndicator.innerHTML = `
       <div class="text-center py-4 text-warning">
@@ -757,6 +804,7 @@ function handleDisconnection() {
     setTimeout(initWebSocket, delay);
   } else {
     loadingIndicator.classList.remove('hidden');
+    addLog('无法重新连接，请刷新页面', 'error');
     loadingIndicator.innerHTML = `
       <div class="text-center py-4 text-danger">
         <i class="fa fa-exclamation-triangle text-3xl mb-3"></i>
