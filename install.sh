@@ -40,22 +40,35 @@ echo -e "${YELLOW}安装系统依赖...${NC}"
 apt update
 apt install -y python3 python3-pip python3-venv git systemd
 
+# 记录脚本所在目录（也就是源码目录）。
+# 原先是先 cd "$INSTALL_DIR" 再检查 ./server.py，导致全新安装时
+# 检查的是空的目标目录，必然报"未找到程序文件"退出。
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # 创建安装目录
 echo -e "${YELLOW}创建安装目录...${NC}"
 mkdir -p $INSTALL_DIR
-cd $INSTALL_DIR
 
 # 下载或复制程序文件
 echo -e "${YELLOW}复制程序文件...${NC}"
-# 如果当前目录已包含程序文件，则复制
-if [ -f "./server.py" ]; then
-    cp -r ./* $INSTALL_DIR/
+# 检查源码目录中是否存在程序文件
+if [ -f "$SRC_DIR/server.py" ]; then
+    # 只复制运行所需的文件，排除 .git / .secret_key / 数据库 / 日志 / __pycache__ 等
+    # 开发机或本机运行产生的数据，不应带入干净的目标安装目录。
+    for item in server.py reset_config.py requirements.txt install.sh uninstall.sh update.sh \
+                README.md INSTALL.md INSTALL.en.md LICENSE templates static; do
+        if [ -e "$SRC_DIR/$item" ]; then
+            cp -r "$SRC_DIR/$item" "$INSTALL_DIR/"
+        fi
+    done
 else
-    # 否则从git仓库克隆（假设有git仓库）
-    echo -e "${RED}未找到程序文件${NC}"
-    echo "请确保在包含程序文件的目录中运行此脚本"
+    echo -e "${RED}未找到程序文件: $SRC_DIR/server.py${NC}"
+    echo "请确保在包含 server.py 的目录中运行此脚本"
     exit 1
 fi
+
+# 切换到安装目录，后续操作都在这里进行
+cd $INSTALL_DIR
 
 # 创建Python虚拟环境
 echo -e "${YELLOW}创建Python虚拟环境...${NC}"
@@ -100,6 +113,8 @@ EOF
 # 设置权限
 echo -e "${YELLOW}设置权限...${NC}"
 chmod +x $INSTALL_DIR/server.py
+# 命令行恢复默认配置脚本（网页不再提供重置入口，忘记密码时用它）
+[ -f "$INSTALL_DIR/reset_config.py" ] && chmod +x $INSTALL_DIR/reset_config.py
 chmod 644 /etc/systemd/system/$SERVICE_NAME.service
 
 # 启用并启动服务

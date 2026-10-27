@@ -22,8 +22,41 @@ const runTimeEl = document.getElementById("run-time");
 const deviceModelEl = document.getElementById('device-model');
 const firmwareVersionEl = document.getElementById('firmware-version');
 const antennaModelEl = document.getElementById('antenna-model');
+const lcStatusEl = document.getElementById('lc-status');
+const lcAddressEl = document.getElementById('lc-address');
+const lcMountEl = document.getElementById('lc-mount');
+const lcClientsEl = document.getElementById('lc-clients');
+const lcHintEl = document.getElementById('lc-hint');
+const upStatusEl = document.getElementById('up-status');
+const upTargetEl = document.getElementById('up-target');
+const upMountpointEl = document.getElementById('up-mountpoint');
+const upSentEl = document.getElementById('up-sent');
+const upRateEl = document.getElementById('up-rate');
+const upReconnectsEl = document.getElementById('up-reconnects');
+const upSessionEl = document.getElementById('up-session');
+const upHintEl = document.getElementById('up-hint');
 const amapBtn = document.getElementById('amap-btn');
 const osmBtn = document.getElementById('osm-btn');
+
+// 缓存最近一次后端状态，供"切换语言"时立即按新语言重渲染（无需等下一次 ws 推送）。
+let _lastRunStatus = null;
+let _lastUpload = null;
+let _lastLocalCaster = null;
+let _lastConfig = null;
+
+// 字节数转可读字符串（与后端 format_bytes 一致）
+function formatBytes(num) {
+  if (num === null || num === undefined || isNaN(num)) return '0 B';
+  let n = Number(num);
+  if (n < 1024) return n + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let i = -1;
+  do {
+    n /= 1024;
+    i++;
+  } while (n >= 1024 && i < units.length - 1);
+  return n.toFixed(n >= 100 ? 0 : n >= 10 ? 1 : 2) + ' ' + units[i];
+}
 
 // === 加载频率映射表 JSON ===
 let gnssSignalFreqMap = {};
@@ -50,6 +83,15 @@ const gnssColorMap = {
   'IRNSS': '#F53F3F',
   'UNKNOWN': '#86909C'
 };
+
+// 把 #RRGGBB 转成 rgba()：星座徽标需要"主色 10% 透明度"的浅色底。
+// 原来是用模板字符串拼 Tailwind 类名（bg-#165DFF/10），这种类名不合法、不会被生成。
+function hexToRgba(hex, alpha) {
+  const match = /^#?([0-9a-f]{6})$/i.exec(String(hex || ''));
+  if (!match) return `rgba(100, 116, 139, ${alpha})`; // 兜底：slate-500
+  const value = parseInt(match[1], 16);
+  return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, ${alpha})`;
+}
 const gnssIconMap = {
   'GPS': 'fi fi-us',                   // 美国国旗
   'BDS': 'fi fi-cn',                  // 中国国旗
@@ -75,6 +117,12 @@ const gnssAbbrMap = {
   'UNKNOWN': 'UNKNOWN'
 };
 
+// 信号强度阈值：统一在这里定义，避免"统计口径"和"柱状图配色"两套标准
+const STRONG_SIGNAL_DB_HZ = 35;   // 判定为优良信号的门槛
+const BAR_GREEN_DB_HZ = 35;
+const BAR_AMBER_DB_HZ = 30;
+const BAR_RED_DB_HZ = 15;
+
 // WebSocket 连接管理
 let ws;
 let reconnectInterval;
@@ -87,7 +135,6 @@ let systemCount = 0;
 let satelliteCount = 0;
 let strongSignalCount = 0;
 const allSatellites = {}; // 按系统存储所有卫星数据
-const msmSatsMap = {}; // 记录每个 MSM 消息类型对应的 sats 值
 const observedSystems = new Set(); // 存储观测到的星座系统
 
 // 地图相关变量
@@ -151,17 +198,21 @@ function cachedWgs84ToGcj02(lon, lat) {
 function addLog(message, type = 'info') {
   const logContainer = document.getElementById('log-container');
   if (!logContainer) return;
+
+  // 第一条真实日志到达时清掉模板里的"加载中"占位，否则它会一直挂在最上面
+  const placeholder = logContainer.querySelector('[data-placeholder]');
+  if (placeholder) placeholder.remove();
   
   // 创建日志条目
   const logEntry = document.createElement('div');
   
-  // 设置日志类型样式
+  // 设置日志类型样式（对应 theme.css 里的 .log-* ，原先是 Tailwind 工具类）
   const typeClasses = {
-    'info': 'text-gray-300',
-    'success': 'text-success',
-    'warning': 'text-warning',
-    'error': 'text-danger',
-    'system': 'text-primary'
+    'info': 'log-info',
+    'success': 'log-success',
+    'warning': 'log-warning',
+    'error': 'log-error',
+    'system': 'log-system'
   };
   
   // 获取当前时间
@@ -169,8 +220,10 @@ function addLog(message, type = 'info') {
   const timeString = now.toLocaleTimeString();
   
   // 设置日志内容
-  logEntry.className = `${typeClasses[type] || 'text-gray-300'} mb-1`;
-  logEntry.innerHTML = `[${timeString}] ${message}`;
+  logEntry.className = typeClasses[type] || 'log-info';
+  // 用 textContent 而不是 innerHTML：日志里可能带有配置值等外部字符串，
+  // 走 innerHTML 会把其中的 HTML 当标签解析（自伤型 XSS）
+  logEntry.textContent = `[${timeString}] ${message}`;
   
   // 添加到容器并滚动到底部
   logContainer.appendChild(logEntry);
@@ -233,12 +286,10 @@ function addCircleLayersToMap() {
 // 设置活动地图按钮
 function setActiveMapButton(activeBtn, inactiveBtn) {
   activeBtn.disabled = true;
-  activeBtn.classList.add('bg-primary', 'text-white');
-  activeBtn.classList.remove('bg-gray-300', 'text-gray-700');
+  activeBtn.classList.add('is-active');
 
   inactiveBtn.disabled = false;
-  inactiveBtn.classList.add('bg-gray-300', 'text-gray-700');
-  inactiveBtn.classList.remove('bg-primary', 'text-white');
+  inactiveBtn.classList.remove('is-active');
 }
 
 // 地图初始化完成后的统一处理
@@ -258,7 +309,7 @@ function tryInitMap(type, config) {
     initFunc(config);
     mapSourceType = type;
         if (stationPosition) {
-      updateMarker(stationPosition.lat, stationPosition.lon, dataSourceEl.textContent || "基准站");
+      updateMarker(stationPosition.lat, stationPosition.lon, dataSourceEl.textContent || I18N.t('map.marker'));
       updateCircles(stationPosition.lat, stationPosition.lon);
     }
 
@@ -289,7 +340,7 @@ function initMap(mapConfig) {
   
   const fallbackTimer = setTimeout(() => {
     if (!mapInitialized) {
-      console.log("地图加载超时，尝试OpenStreetMap");
+      console.log(I18N.t('ws.map_timeout'));
       tryInitMap('osm', {
         default_lat: defaultLat,
         default_lon: defaultLon,
@@ -306,6 +357,11 @@ function initMap(mapConfig) {
   });
 
   osmBtn.addEventListener('click', () => {
+    // 手动再点一次＝用户主动重试：如果之前整条瓦片源都失败了，从头再来一遍
+    if (osmProvidersExhausted) {
+      osmProviderIndex = 0;
+      osmProvidersExhausted = false;
+    }
     if (tryInitMap('osm', mapConfig)) {
       setActiveMapButton(osmBtn, amapBtn);
     }
@@ -352,14 +408,17 @@ function initAmapMap(mapConfig) {
     finalizeMapSetup();
     
     console.log("使用高德地图初始化成功");
-    addLog("使用高德地图初始化成功", 'success');
+    addLog(I18N.t('ws.map_amap_ok'), 'success');
     
     // 监听瓦片错误事件
     map.on('tileerror', (event) => {
-      console.error("地图瓦片加载错误:", event);
-      addLog("高德地图瓦片加载错误，尝试切换到OpenStreetMap", 'warning');
-      // 如果错误超过5次，切换到OpenStreetMap
+      // 单块瓦片偶发失败不该整图切换，累计到一定次数再降级，否则地图会来回抖
+      amapTileErrors++;
+      console.error("高德地图瓦片加载错误:", event, `(${amapTileErrors})`);
+      if (amapTileErrors < 5) return;
+      amapTileErrors = 0;
       if (mapSourceType === 'amap') {
+        addLog(I18N.t('ws.amap_fallback'), 'warning');
         console.log("切换到OpenStreetMap");
         tryInitMap('osm', mapConfig);
       }
@@ -367,10 +426,32 @@ function initAmapMap(mapConfig) {
     
   } catch (error) {
     console.error("高德地图初始化失败:", error);
-    addLog(`高德地图初始化失败: ${error.message}`, 'error'); 
+    addLog(`${I18N.t('ws.map_amap_fail')}: ${error.message}`, 'error'); 
     throw error; // 抛出异常以便上层处理
   }
 }
+
+// OpenStreetMap 瓦片源清单
+// ---------------------------------------------------------------------------
+// 原先直接用 new ol.source.OSM()，写死 https://tile.openstreetmap.org/{z}/{x}/{y}.png。
+// 两个坑：
+//   1. 官方瓦片服务器按"使用政策"强制要求请求带 Referer。一旦本站在响应头里声明
+//      Referrer-Policy: no-referrer，浏览器就不发 Referer，瓦片会被直接拒绝（403）。
+//      现在服务端改成了 strict-origin-when-cross-origin，这个坑已消除。
+//   2. 国内网络直连 tile.openstreetmap.org 时常不可达/超时。这里准备几个同样免 key
+//      的镜像，当前源连续报错就自动往下切，不用改代码。
+// 注意：镜像只换了渲染图，地图数据仍是 OSM（ODbL），署名统一保留。
+const OSM_PROVIDERS = [
+  // 官方在国内网络中经常直接连不通（实测超时），所以把实测可用的社区镜像放前面，
+  // 官方放第三位作为海外网络的首选回退。
+  { name: 'OSM 德国镜像', url: 'https://tile.openstreetmap.de/{z}/{x}/{y}.png' },
+  { name: 'OSM 法国镜像', url: 'https://a.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png' },
+  { name: 'OSM 官方', url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png' },
+  { name: 'Carto 底图', url: 'https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png' }
+];
+let osmProviderIndex = 0;
+let amapTileErrors = 0;
+let osmProvidersExhausted = false;
 
 // 初始化OpenStreetMap（修改）
 function initOsmMap(mapConfig) {
@@ -381,12 +462,19 @@ function initOsmMap(mapConfig) {
     if (map) {
       map.setTarget(null);
     }
+
+    const provider = OSM_PROVIDERS[osmProviderIndex] || OSM_PROVIDERS[0];
     
     map = new ol.Map({
       target: 'map-container',
       layers: [
         new ol.layer.Tile({
-          source: new ol.source.OSM()
+          source: new ol.source.XYZ({
+            url: provider.url,
+            // 必须显示署名，OSM 使用政策的要求
+            attributions: '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors',
+            maxZoom: 19
+          })
         })
       ],
       view: new ol.View({
@@ -408,19 +496,40 @@ function initOsmMap(mapConfig) {
     // 调用统一的地图初始化完成处理
     finalizeMapSetup();
     
-    console.log("使用OpenStreetMap初始化成功");
-    addLog("使用OpenStreetMap初始化成功", 'success');
+    console.log(`使用OpenStreetMap初始化成功（瓦片源：${provider.name}）`);
+    addLog(I18N.t('ws.map_osm_ok', { provider: provider.name }), 'success');
+
+    // 当前瓦片源连续报错就切到下一个镜像。403（缺 Referer）和超时都会走到这里。
+    const myMap = map;
+    let tileErrors = 0;
+    map.on('tileerror', () => {
+      if (map !== myMap) return;          // 已经切换到别的地图实例，忽略旧事件
+      if (osmProvidersExhausted) return;  // 全部失败后不再重复告警
+      tileErrors++;
+      if (tileErrors < 3) return;
+      tileErrors = 0;
+
+      if (osmProviderIndex < OSM_PROVIDERS.length - 1) {
+        osmProviderIndex++;
+        const next = OSM_PROVIDERS[osmProviderIndex];
+        addLog(I18N.t('ws.map_tile_fail', { from: provider.name, to: next.name }), 'warning');
+        tryInitMap('osm', mapConfig);
+      } else {
+        osmProvidersExhausted = true;
+        addLog(I18N.t('ws.map_all_fail'), 'error');
+      }
+    });
     
   } catch (error) {
     console.error("OpenStreetMap初始化失败:", error);
-    addLog(`OpenStreetMap初始化失败: ${error.message}`, 'error');
+    addLog(`${I18N.t('ws.map_amap_fail')}: ${error.message}`, 'error');
     // 显示错误信息
     mapContainer.innerHTML = `
-      <div class="map-placeholder flex flex-col items-center justify-center h-full">
-        <i class="fa fa-exclamation-triangle text-danger text-4xl mb-3"></i>
-        <h4 class="font-orbitron text-danger mb-1">地图初始化失败</h4>
-        <p class="text-sm text-primary">${error.message}</p>
-        <p class="text-xs mt-2">无法加载地图服务</p>
+      <div class="map-placeholder">
+        <i class="fa fa-exclamation-triangle" style="color: var(--danger); opacity: 1" aria-hidden="true"></i>
+        <span class="ph-title" style="color: var(--danger)">${I18N.t('ws.map_error')}</span>
+        <span class="ph-desc">${error.message}</span>
+        <span class="ph-desc">${I18N.t('ws.map_unavailable')}</span>
       </div>
     `;
     throw error; // 抛出异常以便上层处理
@@ -454,7 +563,7 @@ function updateMarker(lat, lon, name) {
   
   const feature = new ol.Feature({
     geometry: new ol.geom.Point(ol.proj.fromLonLat([displayLon, displayLat])),
-    name: "基准站"
+    name: I18N.t('map.marker')
   });
 
   // 设置标记样式，包括图标和文字标注
@@ -465,7 +574,7 @@ function updateMarker(lat, lon, name) {
       anchor: [0.5, 1]
     }),
     text: new ol.style.Text({
-      text: "基准站",
+      text: I18N.t('map.marker'),
       font: '12px Arial',
       fill: new ol.style.Fill({ color: '#000' }),
       stroke: new ol.style.Stroke({ color: '#fff', width: 3 }),
@@ -558,20 +667,22 @@ circle50kmFeature.setStyle(new ol.style.Style({
 
 // 初始化WebSocket连接
 function initWebSocket() {
-  ws = new WebSocket("ws://" + location.host + "/ws");
+  // 按当前页面协议自动选择 ws/wss，否则经由 HTTPS 反向代理访问时会被浏览器拦截
+  const wsProtocol = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  ws = new WebSocket(wsProtocol + location.host + "/ws");
   
   ws.onopen = () => {
     console.log("WebSocket连接成功");
     reconnectAttempts = 0; // 重置重连计数
     clearInterval(reconnectInterval);
     
-    addLog('WebSocket连接成功，开始接收数据', 'system');
+    addLog(I18N.t('ws.connected'), 'system');
     // 更新加载指示器
     loadingIndicator.innerHTML = `
-      <div class="inline-block relative">
-        <i class="fa fa-satellite text-primary text-3xl satellite-glow animate-spin" style="animation-duration: 8s"></i>
+      <div class="card-pad empty-state">
+        <i class="fa fa-satellite spin" style="animation-duration: 8s" aria-hidden="true"></i>
+        <span>${I18N.t('sig.receiving')}</span>
       </div>
-      <p>正在接收RTCM数据...</p>
     `;
     
     // 重置观测系统集合
@@ -582,27 +693,28 @@ function initWebSocket() {
     systemCount = 0;
     systemCountEl.textContent = systemCount;
     
-    // 请求配置信息
-    fetch('/config')
-      .then(response => response.json())
+    // 请求运行配置（/api/load_config 返回 JSON；/config 返回的是 HTML 页面）
+    fetch('/api/load_config', { headers: { 'Accept': 'application/json' } })
+      .then(response => {
+        const contentType = response.headers.get('content-type') || '';
+        if (!response.ok || !contentType.includes('application/json')) {
+          // 未登录时后端会跳转登录页，拿到的是 HTML，这里按"无配置"处理
+          throw new Error('未登录或接口不可用');
+        }
+        return response.json();
+      })
       .then(config => {
-        // 更新静态运行状态
         updateStaticRunStatus(config);
-        
-        // 使用默认配置初始化地图
+      })
+      .catch(error => {
+        console.warn("获取运行配置失败（未登录时属正常）:", error.message);
+      })
+      .finally(() => {
+        // 无论配置是否拿到，都按默认中心初始化地图
         initMap({
           default_lat: 31.643763,  // 默认纬度
           default_lon: 105.466293, // 默认经度
-          default_zoom: 10        // 默认缩放级别
-        });
-      })
-      .catch(error => {
-        console.error("获取配置失败:", error);
-        // 使用默认配置初始化地图
-        initMap({
-          default_lat: 31.643763,
-          default_lon: 105.466293,
-          default_zoom: 10
+          default_zoom: 10         // 默认缩放级别
         });
       });
   };
@@ -612,7 +724,7 @@ function initWebSocket() {
       const data = JSON.parse(event.data);
       console.log("收到WebSocket数据：", data);
 
-      addLog(`收到数据: ${JSON.stringify(data, null, 2).substring(0, 100)}...`, 'info');
+      addLog(`${I18N.t('ws.received')}: ${JSON.stringify(data, null, 2).substring(0, 100)}...`, 'info');
 
       // 隐藏加载指示器
       if (loadingIndicator && !loadingIndicator.classList.contains('hidden')) {
@@ -663,12 +775,19 @@ function initWebSocket() {
         const frequencyList = Object.entries(data.msg_type_frequency)
           .map(([type, frequency]) => `${type}(${frequency})`)
           .join(', ');
-        rtcmTypeListEl.innerHTML = `${frequencyList}`;
+        // 用 textContent：MSM 每秒多条，重建 innerHTML 会反复触发重排；
+        // 同时也省掉一个不必要的 HTML 解析入口
+        rtcmTypeListEl.textContent = frequencyList;
       }
 
       // 更新运行状态
       if (data.run_status) {
         updateRunStatus(data.run_status);
+      }
+
+      // 连接首帧的本地 Caster 状态（mode=none 时没有 run_status 在推，靠这条兜底）
+      if (data.local_caster) {
+        updateLocalCaster(data.local_caster);
       }
 
       // 更新设备信息
@@ -696,9 +815,8 @@ function initWebSocket() {
       const blockId = "block_" + gnss;
       const gnssColor = gnssColorMap[gnss] || gnssColorMap['UNKNOWN'];
       const gnssIcon = gnssIconMap[gnss] || gnssIconMap['UNKNOWN'];
-
       updateTimeDisplay();
-      updateStatistics(gnss, data.cell_data, data.identity, data.sats);
+      updateStatistics(gnss, data.cell_data);
 
       let block = document.getElementById(blockId);
       const isNewCard = !block;
@@ -706,85 +824,206 @@ function initWebSocket() {
       if (isNewCard) {
         block = document.createElement("div");
         block.id = blockId;
-        block.className = "space-card rounded-xl p-4 glow-border fade-in";
-        
-        // 卡片背景使用透明深色
+        block.className = "card card-pad fade-in";
+
         block.innerHTML = `
-          <div class="flex justify-between items-center mb-4">
-            <div class="flex items-center">
-              <span class="${gnssIcon} rounded mr-3" style="width: 1.5em; display: inline-block"></span>
-              <h3 class="text-lg font-semibold text-white">${gnss} </h3>
+          <div class="gnss-hd">
+            <div class="gnss-name">
+              <span class="${gnssIcon}" aria-hidden="true"></span>
+              <span>${gnss}</span>
             </div>
-            <span class="signal-count text-sm px-2 py-1 bg-${gnssColor}/10 text-${gnssColor} rounded-full">
-             观测频段信号数量：${data.cell_data.length}
-            </span>
+            <span class="badge signal-count"></span>
           </div>
-          <div class="fixed-height-signal-bars signal-bars space-x-1 pb-2 pt-8 scrollbar-hide" style="background-color: rgba(10, 20, 40, 0.5);"></div>
+          <div class="signal-bars"></div>
         `;
-        
+
         // 确保卡片被添加到容器中
         container.appendChild(block);
-      } else {
-        // 更新现有卡片的卫星数量显示
-        const countSpan = block.querySelector('.signal-count');
-        if (countSpan) {
-          countSpan.textContent = `观测频段信号数量：${data.cell_data.length}`;
-        }
+      }
+
+      // 更新（或初始化）卫星数量徽标。徽标底色用星座主色的 10% 透明度，
+      // 原先拼的是 bg-#165DFF/10 这种非法类名，Tailwind 根本不会生成，等于没样式。
+      const countSpan = block.querySelector('.signal-count');
+      if (countSpan) {
+        countSpan.textContent = `${I18N.t('sig.count')} ${data.cell_data.length}`;
+        countSpan.style.color = gnssColor;
+        countSpan.style.backgroundColor = hexToRgba(gnssColor, 0.1);
       }
 
       const signalBarsEl = block.querySelector(".signal-bars");
-      const sortedCellData = data.cell_data.sort((a, b) => a.CELLPRN - b.CELLPRN);
-      signalBarsEl.innerHTML = sortedCellData.map(cell => createSignalBar(cell, gnssColor, gnss, gnssSignalFreqMap)).join("");
+      renderSignalBars(signalBarsEl, data.cell_data, gnss, gnssSignalFreqMap);
     } catch (error) {
       console.error("处理WebSocket数据出错:", error);
-      addLog(`数据处理错误: ${error.message}`, 'error');
+      addLog(`${I18N.t('ws.data_error')}: ${error.message}`, 'error');
     }
   };
 
   ws.onerror = (error) => {
     console.error("WebSocket错误:", error);
-    addLog(`连接错误: ${error.message}`, 'error');
+    addLog(`${I18N.t('ws.error')}: ${error.message}`, 'error');
     handleDisconnection();
   };
 
   ws.onclose = (event) => {
     console.log("WebSocket连接关闭，代码:", event.code, "原因:", event.reason);
-    addLog(`连接关闭 (代码: ${event.code}): ${event.reason}`, 'warning');
+    addLog(I18N.t('ws.closed', { code: event.code, reason: event.reason }), 'warning');
     handleDisconnection();
   };
 }
 
 // 更新静态运行状态
+// 后端 /api/load_config 返回的是扁平键（mode / serial_port / relay_host ...），
+// 原实现读的是 config.general.mode、config.serial.port 这种嵌套结构，永远取不到值。
 function updateStaticRunStatus(config) {
+  if (!config || typeof config !== 'object') return;
+  _lastConfig = config;
+
+  const mode = config.mode || 'none';
+
   // 更新运行模式显示
-  runModeEl.textContent = config.general.mode === 'serial' ? '串口模式' : '中继模式';
+  if (mode === 'serial') {
+    runModeEl.textContent = I18N.t('mode.serial');
+  } else if (mode === 'relay') {
+    runModeEl.textContent = I18N.t('mode.relay');
+  } else {
+    runModeEl.textContent = I18N.t('mode.none');
+  }
 
   // 根据模式显示数据源
-  if (config.general.mode === 'serial') {
-    const port = config.serial.port || "自动检测";
-    const baud = config.serial.baud_rate || "自动检测";
+  if (mode === 'serial') {
+    const port = config.serial_port || I18N.t('mode.auto');
+    const baud = config.baud_rate || I18N.t('mode.auto');
     dataSourceEl.textContent = `${port} @ ${baud}bps`;
-  } else {
-    const host = config.relay.host || "未配置";
-    const port = config.relay.port || "未配置";
-    const mountpoint = config.relay.mountpoint || "未配置";
+  } else if (mode === 'relay') {
+    const host = config.relay_host || I18N.t('mode.none');
+    const port = config.relay_port || I18N.t('mode.none');
+    const mountpoint = config.relay_mountpoint || I18N.t('mode.none');
     dataSourceEl.textContent = `${host}:${port}/${mountpoint}`;
   }
-  
+
   // 显示目标caster
-  const ntripHost = config.ntrip.host || "未配置";
-  const ntripPort = config.ntrip.port || "未配置";
-  const ntripMountpoint = config.ntrip.mountpoint || "未配置";
+  const ntripHost = config.caster_host || I18N.t('mode.none');
+  const ntripPort = config.caster_port || I18N.t('mode.none');
+  const ntripMountpoint = config.caster_mountpoint || I18N.t('mode.none');
   targetCasterEl.textContent = `${ntripHost}:${ntripPort}/${ntripMountpoint}`;
+
+  // 上传端卡片的静态兜底（websocket 数据到达前先显示目标地址/挂载点）
+  if (upStatusEl && upTargetEl) {
+    const hasHost = !!config.caster_host;
+    if (hasHost) {
+      upTargetEl.textContent = `${ntripHost}:${ntripPort}/${ntripMountpoint}`;
+      upMountpointEl.textContent = config.caster_mountpoint || '--';
+    } else {
+      upStatusEl.textContent = I18N.t('up.unconfigured');
+      upStatusEl.className = 'kv-value is-warning';
+      upTargetEl.textContent = '--';
+      upMountpointEl.textContent = '--';
+    }
+  }
 }
 
 // 更新运行状态
 function updateRunStatus(status) {
+  _lastRunStatus = status;
   if (status.mode) runModeEl.textContent = status.mode;
   if (status.data_source) dataSourceEl.textContent = status.data_source;
   if (status.target_caster) targetCasterEl.textContent = status.target_caster;
   if (status.data_sent) dataSentEl.textContent = status.data_sent;
   if (status.run_time) runTimeEl.textContent = status.run_time;
+  if (status.local_caster) updateLocalCaster(status.local_caster);
+  if (status.upload) updateUploadStatus(status.upload);
+}
+
+// 上传端 NTRIP Caster 状态：显示往哪个地址/挂载点推、认证结果、已发送量、速率、重连次数。
+function updateUploadStatus(info) {
+  if (!info || !upStatusEl) return;
+  _lastUpload = info;
+
+  const setValue = (el, text, kind) => {
+    if (!el) return;
+    el.textContent = text;
+    el.className = 'kv-value' + (kind ? ' is-' + kind : '');
+  };
+
+  // 地址 / 挂载点
+  const host = info.host || '';
+  const port = info.port || '';
+  const mp = info.mountpoint || '';
+  upTargetEl.textContent = info.target || (host ? `${host}:${port}/${mp}` : '--');
+  upMountpointEl.textContent = mp || '--';
+
+  // 数据统计
+  const bytes = Number(info.sent_bytes) || 0;
+  const frames = Number(info.sent_frames) || 0;
+  upSentEl.textContent = `${formatBytes(bytes)} · ${frames} ${I18N.t('up.frames')}`;
+  const rate = Number(info.rate_bps) || 0;
+  upRateEl.textContent = rate > 0 ? `${formatBytes(rate)}/s` : '--';
+  upReconnectsEl.textContent = String(Number(info.reconnects) || 0);
+  upSessionEl.textContent = info.session_time || '0h 0m 0s';
+
+  const state = info.state || 'idle';
+  const stateText = info.state_text || state;
+
+  if (!info.enabled) {
+    setValue(upStatusEl, I18N.t('up.unconfigured'), 'warning');
+    if (upHintEl) upHintEl.textContent = I18N.t('up.unconfigured_hint');
+  } else if (state === 'authed') {
+    setValue(upStatusEl, stateText, 'success');
+    if (upHintEl) upHintEl.textContent = I18N.t('up.connected_hint', { target: info.target });
+  } else if (state === 'connecting') {
+    setValue(upStatusEl, stateText, '');
+    if (upHintEl) upHintEl.textContent = I18N.t('up.connecting_hint');
+  } else if (state === 'retrying') {
+    setValue(upStatusEl, stateText, 'warning');
+    if (upHintEl) upHintEl.textContent = info.last_error
+      ? I18N.t('up.retrying_hint', { error: info.last_error })
+      : I18N.t('up.retrying_hint_noerr');
+  } else if (state === 'error') {
+    setValue(upStatusEl, stateText, 'error');
+    if (upHintEl) upHintEl.textContent = info.last_error || I18N.t('up.error_hint');
+  } else {
+    setValue(upStatusEl, stateText, '');
+    if (upHintEl) upHintEl.textContent = '';
+  }
+}
+
+// 本地 Caster 状态：配置页的勾选是"保存后生效"，这里显示的是实际在跑的监听服务，
+// 两者可能暂时不一致（刚改完还没重启），所以文案要区分"未启用"和"已启用但没跑起来"。
+function updateLocalCaster(info) {
+  if (!info || !lcStatusEl) return;
+  _lastLocalCaster = info;
+
+  const setValue = (el, text, kind) => {
+    if (!el) return;
+    el.textContent = text;
+    el.className = 'kv-value' + (kind ? ' is-' + kind : '');
+  };
+
+  lcAddressEl.textContent = info.example || '--';
+  lcMountEl.textContent = info.mountpoint
+    ? `${info.mountpoint} / ${info.user || '--'}`
+    : '--';
+
+  if (!info.enabled) {
+    setValue(lcStatusEl, I18N.t('lc.disabled'), 'warning');
+    setValue(lcClientsEl, '--', '');
+    if (lcHintEl) lcHintEl.textContent = I18N.t('lc.disabled_hint');
+  } else if (info.running) {
+    setValue(lcStatusEl, I18N.t('lc.running'), 'success');
+    setValue(lcClientsEl, `${info.clients} / ${info.max_clients}`, info.clients > 0 ? 'success' : '');
+    if (lcHintEl) {
+      lcHintEl.textContent =
+        I18N.t('lc.running_hint', { addr: info.example, mp: info.mountpoint, user: info.user });
+    }
+  } else if (info.mode === 'none') {
+    setValue(lcStatusEl, I18N.t('lc.none'), 'warning');
+    setValue(lcClientsEl, '--', '');
+    if (lcHintEl) lcHintEl.textContent = I18N.t('lc.none_hint');
+  } else {
+    setValue(lcStatusEl, I18N.t('lc.enabled_not_run'), 'warning');
+    setValue(lcClientsEl, '--', '');
+    if (lcHintEl) lcHintEl.textContent = I18N.t('lc.enabled_not_run_hint');
+  }
 }
 
 // 处理断开连接
@@ -792,23 +1031,23 @@ function handleDisconnection() {
   if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
     reconnectAttempts++;
     const delay = RECONNECT_DELAY * reconnectAttempts;
-    addLog(`连接断开，${Math.round(delay/1000)}秒后尝试重连 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`, 'warning');
+    addLog(I18N.t('ws.disconnected', { sec: Math.round(delay/1000), cur: reconnectAttempts, max: MAX_RECONNECT_ATTEMPTS }), 'warning');
     loadingIndicator.classList.remove('hidden');
     loadingIndicator.innerHTML = `
-      <div class="text-center py-4 text-warning">
-        <i class="fa fa-refresh fa-spin text-xl mb-3"></i>
-        <p>连接断开，${Math.round(delay/1000)}秒后尝试重连 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})</p>
+      <div class="card-pad empty-state is-warning">
+        <i class="fa fa-refresh spin" aria-hidden="true"></i>
+        <span>${I18N.t('ws.disconnected_retry', { sec: Math.round(delay/1000), cur: reconnectAttempts, max: MAX_RECONNECT_ATTEMPTS })}</span>
       </div>
     `;
     
     setTimeout(initWebSocket, delay);
   } else {
     loadingIndicator.classList.remove('hidden');
-    addLog('无法重新连接，请刷新页面', 'error');
+    addLog(I18N.t('ws.cannot_reconnect'), 'error');
     loadingIndicator.innerHTML = `
-      <div class="text-center py-4 text-danger">
-        <i class="fa fa-exclamation-triangle text-3xl mb-3"></i>
-        <p>无法重新连接，请刷新页面</p>
+      <div class="card-pad empty-state is-error">
+        <i class="fa fa-exclamation-triangle" aria-hidden="true"></i>
+        <span>${I18N.t('ws.cannot_reconnect')}</span>
       </div>
     `;
   }
@@ -817,13 +1056,13 @@ function handleDisconnection() {
 // 更新时间显示
 function updateTimeDisplay() {
   const now = new Date();
-  updateTimeEl.textContent = `最后更新: ${now.toLocaleString()}`;
+  updateTimeEl.textContent = `${I18N.t('ws.last_update')}: ${now.toLocaleString()}`;
 }
 
 // 更新观测星座显示
 function updateObservedSystemsDisplay() {
   if (observedSystems.size === 0) {
-    observedSystemsEl.textContent = "暂无数据";
+    observedSystemsEl.textContent = I18N.t('sat.no_data');
     return;
   }
   
@@ -841,7 +1080,7 @@ function updateObservedSystemsDisplay() {
 }
 
 // 更新统计信息
-function updateStatistics(gnss, cellData, identity, sats) {
+function updateStatistics(gnss, cellData) {
   // 仅在新系统首次出现时增加计数
   if (!allSatellites[gnss]) {
     systemCount++;
@@ -850,13 +1089,19 @@ function updateStatistics(gnss, cellData, identity, sats) {
 
   allSatellites[gnss] = cellData;
 
-  // 更新 msmSatsMap 中对应消息类型的 sats 值
-  if (identity) {
-    msmSatsMap[identity] = sats;
-  }
-
-  // 重新计算所有 MSM 消息类型的 sats 值总和
-  satelliteCount = Object.values(msmSatsMap).reduce((sum, value) => sum + value, 0);
+  // 卫星总数按 (星座, PRN) 去重
+  // 原实现是把各 MSM 消息号（1074/1075/1077…）的 sats 相加，
+  // 同一星座同时播发多种 MSM 时，同一颗卫星会被重复计数 2~3 次。
+  const uniqueSatelliteIds = new Set();
+  Object.entries(allSatellites).forEach(([system, satellites]) => {
+    if (!satellites) return;
+    satellites.forEach(sat => {
+      if (sat && sat.CELLPRN !== undefined) {
+        uniqueSatelliteIds.add(`${system}_${sat.CELLPRN}`);
+      }
+    });
+  });
+  satelliteCount = uniqueSatelliteIds.size;
   satelliteCountEl.textContent = satelliteCount;
 
   // 使用Set确保卫星唯一性
@@ -868,11 +1113,12 @@ function updateStatistics(gnss, cellData, identity, sats) {
     
     // 遍历系统内的所有卫星
     satellites.forEach(sat => {
+      if (!sat) return;
       // 获取信号强度（优先使用DF408，否则使用其他字段）
       const strength = sat.DF408 ?? sat.DF403 ?? sat.DF409 ?? sat.DF405 ?? 0;
       
-      // 信号强度超过35视为强信号
-      if (strength > 35) {
+      // 信号强度超过阈值视为强信号
+      if (strength >= STRONG_SIGNAL_DB_HZ) {
         const satId = `${system}_${sat.CELLPRN}`;
         strongSatelliteIds.add(satId);
       }
@@ -883,53 +1129,97 @@ function updateStatistics(gnss, cellData, identity, sats) {
   strongSignalCountEl.textContent = strongSignalCount;
 }
 
-// 创建信号条
-function createSignalBar(cell, gnssColor, gnss, freqMap) {
-  // 数据验证
-  if (!cell || !cell.CELLPRN || !cell.CELLSIG) {
-    console.error("无效的cell数据:", cell);
-    return "";
-  }
-
-  const prn = cell.CELLPRN;
-  const sig = cell.CELLSIG;
-  const strength = cell.DF408 ?? cell.DF403 ?? cell.DF409 ?? cell.DF405 ?? 0;
-
-  // 使用传入的gnss参数（不是cell.GNSS）查询频率信息
-  const freqInfo = freqMap?.[gnss]?.[sig] || {
-    band: '未知',
-    freq: '未知'
-  };
-
-  // 设置柱条颜色
+// 计算信号条的样式（高度 + 颜色）
+function computeBarStyle(strength) {
   let barColor = '#86909C'; // 默认灰色
-  if (strength > 45) barColor = '#00B42A';
-  else if (strength > 30) barColor = '#FF7D00';
-  else if (strength > 15) barColor = '#F53F3F';
+  if (strength >= BAR_GREEN_DB_HZ) barColor = '#00B42A';
+  else if (strength >= BAR_AMBER_DB_HZ) barColor = '#FF7D00';
+  else if (strength >= BAR_RED_DB_HZ) barColor = '#F53F3F';
 
   const maxHeight = 120;
   let barHeight = Math.min(Math.round((strength / 100) * maxHeight), maxHeight);
   barHeight = Math.max(barHeight, 4); // 最小高度
+  return { height: barHeight, color: barColor };
+}
 
-  // 构建Tooltip文本
-  const tooltip = `
-信号类型: ${sig}
-频段: ${freqInfo.band}
-频率: ${freqInfo.freq} MHz
-信号强度: ${strength}dBHz 
-所属系统: ${gnss}
-卫星PRN: ${prn}
-  `.trim();
+function getSignalStrength(cell) {
+  return cell.DF408 ?? cell.DF403 ?? cell.DF409 ?? cell.DF405 ?? 0;
+}
 
-  return `
-    <div class="signal-bar inline-block rounded-t-md relative"
-         style="height: ${barHeight}px; width: 40px;
-                background: linear-gradient(to top, ${barColor}, rgba(255,255,255,0.3))"
-         title="${tooltip}">
-      <div class="text-xs text-center absolute bottom-full left-0 right-0 mb-1 text-white">${freqInfo.band}</div>
-      <div class="text-[9px] text-center absolute top-full left-0 right-0 mt-1 font-medium text-white">${prn}</div>
-    </div>
+// 创建单个信号条 DOM 节点
+function createSignalBarNode(cell, gnss, freqMap) {
+  const prn = cell.CELLPRN;
+  const sig = cell.CELLSIG;
+  // 使用传入的gnss参数（不是cell.GNSS）查询频率信息
+  const freqInfo = freqMap?.[gnss]?.[sig] || { band: I18N.t('sig.unknown'), freq: I18N.t('sig.unknown') };
+
+  const bar = document.createElement('div');
+  bar.className = 'signal-bar';
+  bar.dataset.key = `${prn}_${sig}`;
+  bar.innerHTML = `
+      <span class="bar-band"></span>
+      <span class="bar-prn"></span>
   `;
+  bar.querySelector('.bar-band').textContent = freqInfo.band;
+  bar.querySelector('.bar-prn').textContent = prn;
+  return bar;
+}
+
+// 更新单个信号条的动态部分
+function updateSignalBarNode(bar, cell, gnss, freqMap) {
+  const prn = cell.CELLPRN;
+  const sig = cell.CELLSIG;
+  const strength = getSignalStrength(cell);
+  const freqInfo = freqMap?.[gnss]?.[sig] || { band: I18N.t('sig.unknown'), freq: I18N.t('sig.unknown') };
+  const style = computeBarStyle(strength);
+
+  bar.style.height = `${style.height}px`;
+  // 只给纯色，顶部高光和圆角交给 .signal-bar 的 CSS，切换主题/配色不用再动 JS
+  bar.style.backgroundColor = style.color;
+  bar.title = [
+    `${I18N.t('sig.band')}: ${sig}`,
+    `${I18N.t('sig.freq_band')}: ${freqInfo.band}`,
+    `${I18N.t('sig.freq')}: ${freqInfo.freq} MHz`,
+    `${I18N.t('sig.strength')}: ${strength}dBHz `,
+    `${I18N.t('sig.system')}: ${gnss}`,
+    `${I18N.t('sig.prn')}: ${prn}`
+  ].join('\n').trim();
+
+  const bandEl = bar.querySelector('.bar-band');
+  if (bandEl) bandEl.textContent = freqInfo.band;
+}
+
+// 增量渲染信号条：复用已有 DOM 节点，只更新高度/颜色
+// 原实现每次都重建整段 innerHTML，MSM 高频播发时会整块闪烁并反复触发重排。
+function renderSignalBars(container, cells, gnss, freqMap) {
+  if (!container || !Array.isArray(cells)) return;
+
+  const valid = cells.filter(cell => cell && cell.CELLPRN && cell.CELLSIG);
+  const sorted = valid.slice().sort((a, b) => a.CELLPRN - b.CELLPRN);
+
+  const existing = new Map();
+  Array.from(container.children).forEach(el => {
+    if (el.dataset && el.dataset.key) existing.set(el.dataset.key, el);
+  });
+
+  const usedKeys = new Set();
+  sorted.forEach(cell => {
+    const key = `${cell.CELLPRN}_${cell.CELLSIG}`;
+    usedKeys.add(key);
+    let bar = existing.get(key);
+    if (!bar) {
+      bar = createSignalBarNode(cell, gnss, freqMap);
+    }
+    updateSignalBarNode(bar, cell, gnss, freqMap);
+    // appendChild 对已有节点是"移动"，顺带完成按 PRN 排序
+    container.appendChild(bar);
+  });
+
+  // 移除本轮不再出现的频点
+  Array.from(container.children).forEach(el => {
+    const key = el.dataset ? el.dataset.key : undefined;
+    if (key && !usedKeys.has(key)) el.remove();
+  });
 }
 
 
@@ -938,9 +1228,8 @@ setInterval(() => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     try {
       ws.send(JSON.stringify({ type: "heartbeat" }));
-      console.log("发送心跳包");
     } catch (e) {
-      console.error("发送心跳失败:", e);
+      console.warn("发送心跳失败:", e);
     }
   }
 }, 15000); // 每15秒发送一次心跳
@@ -961,5 +1250,53 @@ document.addEventListener('visibilitychange', () => {
         initWebSocket();
       }
     }
+  }
+});
+// 捐赠面板：桌面端靠 :hover 展开，触屏（手簿/平板）没有 hover，必须支持点按开合。
+(function () {
+  const donate = document.querySelector('.donate');
+  const btn = donate && donate.querySelector('.donate-btn');
+  if (!donate || !btn) return;
+
+  const toggle = (open) => {
+    donate.classList.toggle('is-open', open);
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  };
+
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggle(!donate.classList.contains('is-open'));
+  });
+
+  // 点击面板外部关闭（仅点按态需要，悬停态不受影响）
+  document.addEventListener('click', (e) => {
+    if (donate.classList.contains('is-open') && !donate.contains(e.target)) {
+      toggle(false);
+    }
+  });
+
+  // Esc 关闭
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && donate.classList.contains('is-open')) {
+      toggle(false);
+      btn.focus();
+    }
+  });
+})();
+
+// ============================================================================
+// 语言切换：切换后立即按新语言重渲染所有动态文案（静态 data-i18n 已由 i18n.js 处理）
+// ============================================================================
+document.addEventListener('langchange', () => {
+  // 静态运行状态（模式/数据源/目标 caster）
+  if (_lastConfig) updateStaticRunStatus(_lastConfig);
+  // 上传端 / 本地 Caster 状态
+  if (_lastUpload) updateUploadStatus(_lastUpload);
+  if (_lastLocalCaster) updateLocalCaster(_lastLocalCaster);
+  // 观测星座的空态文案
+  updateObservedSystemsDisplay();
+  // 地图标记文字（如果地图已初始化且有位置）
+  if (stationPosition) {
+    updateMarker(stationPosition.lat, stationPosition.lon, dataSourceEl.textContent || I18N.t('map.marker'));
   }
 });

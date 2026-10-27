@@ -1,0 +1,23 @@
+# 运行时产物
+server.log
+server.log.*
+nohup.out
+# 运行期数据库：含管理员口令哈希与连接配置，属于本机数据，不进版本库。
+# 首次启动由 init_db() 自动建表并写入 DEFAULT_CONFIG，克隆后无需手工准备。
+2RTKserver.db
+*.db.bak
+*.db.temp
+*.db-wal
+*.db-shm
+.secret_key
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/

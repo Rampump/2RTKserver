@@ -39,24 +39,33 @@ if [ -f "$INSTALL_DIR/2RTKserver.db" ]; then
     echo "数据库已备份为: $INSTALL_DIR/2RTKserver.db.bak"
 fi
 
+# 记录脚本所在目录（源码目录），避免依赖当前工作目录
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # 更新程序文件
 echo -e "${YELLOW}更新程序文件...${NC}"
-# 如果当前目录已包含程序文件，则复制
-if [ -f "./server.py" ]; then
+# 检查源码目录中是否存在程序文件
+if [ -f "$SRC_DIR/server.py" ]; then
     # 保留数据库文件
     if [ -f "$INSTALL_DIR/2RTKserver.db" ]; then
         mv $INSTALL_DIR/2RTKserver.db $INSTALL_DIR/2RTKserver.db.temp
     fi
-    
-    # 复制新文件
-    cp -r ./* $INSTALL_DIR/
-    
+
+    # 只复制运行所需的文件，排除 .git / .secret_key / 数据库 / 日志 / __pycache__ / venv，
+    # 避免把开发机的数据带入，也避免覆盖安装目录里已经建好的 venv 虚拟环境。
+    for item in server.py reset_config.py requirements.txt install.sh uninstall.sh update.sh \
+                README.md INSTALL.md INSTALL.en.md LICENSE templates static; do
+        if [ -e "$SRC_DIR/$item" ]; then
+            cp -r "$SRC_DIR/$item" "$INSTALL_DIR/"
+        fi
+    done
+
     # 恢复数据库文件
     if [ -f "$INSTALL_DIR/2RTKserver.db.temp" ]; then
         mv $INSTALL_DIR/2RTKserver.db.temp $INSTALL_DIR/2RTKserver.db
     fi
 else
-    echo -e "${RED}未找到程序文件${NC}"
+    echo -e "${RED}未找到程序文件: $SRC_DIR/server.py${NC}"
     echo "请确保在包含更新文件的目录中运行此脚本"
     systemctl start $SERVICE_NAME
     exit 1
