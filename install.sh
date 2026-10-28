@@ -40,6 +40,20 @@ echo -e "${YELLOW}安装系统依赖...${NC}"
 apt update
 apt install -y python3 python3-pip python3-venv git systemd
 
+# 检查 Python 版本（代码用到了 f-string、typing 等 3.8+ 特性）
+PY_VER=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)
+if [ -z "$PY_VER" ]; then
+    echo -e "${RED}未检测到 python3，安装已中止${NC}"
+    exit 1
+fi
+PY_MAJOR=$(echo "$PY_VER" | cut -d. -f1)
+PY_MINOR=$(echo "$PY_VER" | cut -d. -f2)
+if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 8 ]; }; then
+    echo -e "${RED}Python 版本过低（当前 $PY_VER），需要 3.8 或更高${NC}"
+    exit 1
+fi
+echo -e "Python 版本: ${GREEN}$PY_VER${NC}"
+
 # 记录脚本所在目录（也就是源码目录）。
 # 原先是先 cd "$INSTALL_DIR" 再检查 ./server.py，导致全新安装时
 # 检查的是空的目标目录，必然报"未找到程序文件"退出。
@@ -55,8 +69,9 @@ echo -e "${YELLOW}复制程序文件...${NC}"
 if [ -f "$SRC_DIR/server.py" ]; then
     # 只复制运行所需的文件，排除 .git / .secret_key / 数据库 / 日志 / __pycache__ 等
     # 开发机或本机运行产生的数据，不应带入干净的目标安装目录。
+    # docs 是 README 里引用的截图目录，漏掉会让安装后的 README 图片全变成裂图。
     for item in server.py reset_config.py requirements.txt install.sh uninstall.sh update.sh \
-                README.md INSTALL.md INSTALL.en.md LICENSE templates static; do
+                README.md INSTALL.md INSTALL.en.md LICENSE templates static docs; do
         if [ -e "$SRC_DIR/$item" ]; then
             cp -r "$SRC_DIR/$item" "$INSTALL_DIR/"
         fi
@@ -96,15 +111,21 @@ echo -e "${YELLOW}创建系统服务...${NC}"
 cat > /etc/systemd/system/$SERVICE_NAME.service << EOF
 [Unit]
 Description=2RTK NTRIP Server
-After=network.target
+# network-online：开机时先等网络就绪，避免上传/中继在没网时白重连几轮
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/venv/bin/python3 $INSTALL_DIR/server.py
+# 关掉 Python 输出缓冲，journalctl 里能实时看到日志（否则只能看到一大块延迟输出）
+Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=5
+# 停止时给足时间让线程退出、释放端口（本地 Caster / 数传串口）
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target

@@ -45,6 +45,18 @@ rm -f /usr/local/bin/2rtkserver
 
 # 删除安装目录
 echo -e "${YELLOW}删除安装目录...${NC}"
+
+# 安装目录里除了程序，还有配置数据库（管理员口令 + 全部连接设置）和会话密钥，
+# 一并删掉就找不回来了，先问一句要不要留个备份。
+if [ -f "$INSTALL_DIR/2RTKserver.db" ]; then
+    echo -e "${YELLOW}注意：$INSTALL_DIR/2RTKserver.db 内含管理员口令和全部连接配置，删除后无法恢复。${NC}"
+    read -p "是否先备份到 /root/ 下? (y/n): " backup_confirm
+    if [[ $backup_confirm == [yY] ]]; then
+        BACKUP_FILE="/root/2RTKserver-$(date +%F-%H%M).db"
+        cp "$INSTALL_DIR/2RTKserver.db" "$BACKUP_FILE" && echo "已备份到: $BACKUP_FILE"
+    fi
+fi
+
 rm -rf $INSTALL_DIR
 
 echo -e "${GREEN}=== 卸载完成! ===${NC}"

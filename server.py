@@ -100,7 +100,9 @@ WS_DROP_LIMIT = 100                 # 连续丢帧超过该值说明客户端长
 #       移动站/手簿直接连本机取差分，不必再绕到外网 Caster。
 # 注意：这里是"再发一份"，不改变原有的上传链路——原来往哪上传现在还往哪上传。
 LOCAL_CASTER_HOST = '0.0.0.0'             # 默认监听所有网卡
-LOCAL_CASTER_PORT = 2101
+# 默认 2102 而不是 2101：2101 已经是中继/上传端口的默认值，而本地 Caster 是
+# 「本机真实监听」，配置页要求它与出口端口错开，两个默认值一样会一开就撞。
+LOCAL_CASTER_PORT = 2102
 LOCAL_CASTER_MOUNTPOINT = '2RTK'          # 唯一挂载点，固定
 LOCAL_CASTER_USER = '2RTK'                # 固定账号
 LOCAL_CASTER_PASSWORD = '2RTK'            # 固定密码
@@ -544,7 +546,7 @@ DEFAULT_CONFIG = {
     "relay_password": "",
     "local_caster_enabled": "0",
     "local_caster_host": "0.0.0.0",
-    "local_caster_port": "2101",
+    "local_caster_port": "2102",
     "radio_enabled": "0",
     "radio_port": "",
     "radio_baud": "115200",
@@ -1598,7 +1600,7 @@ def config_page():
             new_cfg.update({
                 "local_caster_enabled": "1" if form_data.get('local_caster_enabled') else "0",
                 "local_caster_host": (form_data.get('local_caster_host') or '').strip() or '0.0.0.0',
-                "local_caster_port": (form_data.get('local_caster_port') or '').strip() or '2101',
+                "local_caster_port": (form_data.get('local_caster_port') or '').strip() or str(LOCAL_CASTER_PORT),
             })
 
             # 出口 3：无线电数传透传

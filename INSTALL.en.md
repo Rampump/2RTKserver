@@ -140,8 +140,13 @@ python3 server.py
    - **none**: collect only, no forwarding.
 3. Fill in the upstream caster's address / port / mount point / password.
 4. (Optional) enable the "Local Caster" so LAN rovers connect directly:
-   - Default listen `0.0.0.0:2101`, mount point `2RTK`, user/password both `2RTK`.
-   - Rovers/handhelds use `device-ip:2101/2RTK`.
+   - Default listen `0.0.0.0:2102`, mount point `2RTK`, user/password both `2RTK`.
+   - Rovers/handhelds use `device-ip:2102/2RTK`.
+   - **About ports**: the local caster's listen port is really bound on this device, while the
+     ports typed for relay/upload are **remote** endpoints — this device only dials out to
+     them with an ephemeral local port, so 2101 can be used for both without conflict. The
+     local caster defaults to 2102 just to keep the defaults distinct; the settings page also
+     probes the port before saving and refuses a duplicate value.
 5. (Optional) enable "Radio datalink bridge" to transparently forward the same RTCM stream
    to a USB radio modem:
    - Plug a USB radio modem (transmitter) into the Armbian host; nearby rovers without
@@ -224,6 +229,24 @@ PIP_BREAK_SYSTEM_PACKAGES=1 pip install -r requirements.txt
 ```bash
 journalctl -u 2rtkserver -n 50
 ```
+
+### Local caster fails to start / port already in use
+
+The log shows `cannot listen on 0.0.0.0:2102 ([Errno 98] Address already in use)` — something
+**on this device** already listens on that port (most often a previous instance that has not
+exited yet, or another NTRIP program).
+
+```bash
+ss -lntp | grep :2102
+sudo lsof -i :2102
+```
+
+Fix accordingly: kill the stale instance (`sudo 2rtkserver restart`, or `pkill`), or change the
+local caster port in the settings page (2103, etc.). The settings page probes the port before
+saving and shows the pid/process name that holds it.
+
+> Note: the 2101 you type for relay/upload is a **remote** port. Outbound connections use an
+> ephemeral local port, so it never collides with the local caster's listen port.
 
 ### Can't access the web UI
 

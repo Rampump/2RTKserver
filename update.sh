@@ -54,7 +54,7 @@ if [ -f "$SRC_DIR/server.py" ]; then
     # 只复制运行所需的文件，排除 .git / .secret_key / 数据库 / 日志 / __pycache__ / venv，
     # 避免把开发机的数据带入，也避免覆盖安装目录里已经建好的 venv 虚拟环境。
     for item in server.py reset_config.py requirements.txt install.sh uninstall.sh update.sh \
-                README.md INSTALL.md INSTALL.en.md LICENSE templates static; do
+                README.md INSTALL.md INSTALL.en.md LICENSE templates static docs; do
         if [ -e "$SRC_DIR/$item" ]; then
             cp -r "$SRC_DIR/$item" "$INSTALL_DIR/"
         fi
@@ -91,6 +91,7 @@ fi
 # 设置权限
 echo -e "${YELLOW}设置权限...${NC}"
 chmod +x $INSTALL_DIR/server.py
+[ -f "$INSTALL_DIR/reset_config.py" ] && chmod +x $INSTALL_DIR/reset_config.py
 
 # 启动服务
 echo -e "${YELLOW}启动服务...${NC}"
