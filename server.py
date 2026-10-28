@@ -1689,20 +1689,51 @@ class LocalCaster:
         )
 
     # ---------- 生命周期 ----------
-    def start(self) -> bool:
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((self.host, self.port))
-            sock.listen(16)
-            self._listen = sock
-        except OSError as e:
-            logging.error(f"本地 NTRIP Caster 启动失败：无法监听 {self.host}:{self.port}（{e}）")
+    def start(self, retry: int = 3) -> bool:
+        """尝试监听端口。
+
+        为什么要重试：重启程序时，上一轮的 accept 线程可能还阻塞在 accept() 上。
+        POSIX 下 close() 一个正被别的线程 accept() 的监听 socket，并不保证那个
+        阻塞的 syscall 立刻返回——fd 引用要到 syscall 退出后才真正释放，这期间
+        端口仍算被占用，新实例 bind 就会拿到 EADDRINUSE。
+        实测在 systemd 重启 / 网页保存重启时这个窗口能到 1~2 秒，
+        所以这里用退避重试覆盖它，而不是一次失败就永久放弃本地 Caster。
+        """
+        last_err = None
+        sock = None
+        for attempt in range(max(1, retry)):
             try:
-                if 'sock' in dir() and sock:
-                    sock.close()
-            except OSError:
-                pass
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((self.host, self.port))
+                sock.listen(16)
+                # 关键：accept 设超时，让 _accept_loop 每秒能回来检查 _running。
+                # 不设的话线程会一直卡在 accept() 里，stop() 的 join 只能等超时，
+                # 端口也就迟迟释放不掉。
+                sock.settimeout(1.0)
+                self._listen = sock
+                last_err = None
+                break
+            except OSError as e:
+                last_err = e
+                try:
+                    if sock is not None:
+                        sock.close()
+                except OSError:
+                    pass
+                sock = None
+                if attempt < retry - 1:
+                    logging.warning(
+                        f"本地 Caster 监听 {self.host}:{self.port} 失败（{e}），"
+                        f"1 秒后重试（{attempt + 1}/{retry - 1}）"
+                    )
+                    time.sleep(1.0)
+
+        if last_err is not None:
+            logging.error(
+                f"本地 NTRIP Caster 启动失败：无法监听 {self.host}:{self.port}（{last_err}）。"
+                f"若端口被其他程序占用，请在配置页改用其他端口"
+            )
             return False
 
         self._running = True
@@ -1716,12 +1747,20 @@ class LocalCaster:
 
     def stop(self):
         self._running = False
-        if self._listen is not None:
+        listen = self._listen
+        self._listen = None
+        if listen is not None:
+            # 先 shutdown 再 close：shutdown 能把阻塞中的 accept() 叫醒，
+            # 只 close 的话 Linux 上阻塞的那个 syscall 不一定立刻返回，
+            # 端口会一直占着，下一个实例 bind 就 EADDRINUSE。
             try:
-                self._listen.close()
+                listen.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            self._listen = None
+            try:
+                listen.close()
+            except OSError:
+                pass
         with self._lock:
             clients = list(self._clients)
             self._clients.clear()
@@ -1735,9 +1774,15 @@ class LocalCaster:
                 c.sock.close()
             except OSError:
                 pass
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(2)
+        thread = self._thread
         self._thread = None
+        if thread is not None and thread.is_alive():
+            # accept 已设 1 秒超时，正常情况几乎立刻退出；给 3 秒足够宽裕。
+            thread.join(3)
+            if thread.is_alive():
+                logging.warning(
+                    f"本地 Caster accept 线程未在超时内退出，端口 {self.port} 可能被短暂占用"
+                )
 
     # ---------- 数据分发 ----------
     def publish(self, data: bytes):
@@ -1773,8 +1818,16 @@ class LocalCaster:
     # ---------- 内部 ----------
     def _accept_loop(self):
         while self._running:
+            listen = self._listen
+            if listen is None:
+                break
             try:
-                sock, addr = self._listen.accept()
+                sock, addr = listen.accept()
+            except socket.timeout:
+                # accept 设了 1 秒超时：超时只代表这一轮没新连接，
+                # 不是错误，回到 while 顶端重新检查 _running。
+                # 注意必须先于 OSError 捕获——TimeoutError 是 OSError 的子类。
+                continue
             except OSError:
                 break  # 监听 socket 被 close()，正常退出
             except Exception as e:
@@ -2600,9 +2653,17 @@ def describe_targets(cfg) -> str:
         parts.append(f"上传 {cfg.get('caster_host')}:{cfg.get('caster_port')}"
                      f"/{cfg.get('caster_mountpoint')}")
     if str(cfg.get('local_caster_enabled', '0')) == '1':
-        parts.append(f"本地 Caster {cfg.get('local_caster_host')}:{cfg.get('local_caster_port')}")
+        # 只有真正监听成功才会有对象；bind 失败时这里是 None。
+        # 之前只看配置项，导致"启动失败"仍打印成"就绪"，状态页也显示正常，容易误判。
+        if local_caster is not None:
+            parts.append(f"本地 Caster {cfg.get('local_caster_host')}:{cfg.get('local_caster_port')}")
+        else:
+            parts.append(f"本地 Caster 启动失败（端口 {cfg.get('local_caster_port')} 不可用）")
     if str(cfg.get('radio_enabled', '0')) == '1':
-        parts.append(f"数传 {cfg.get('radio_port')}")
+        if serial_bridge is not None:
+            parts.append(f"数传 {cfg.get('radio_port')}")
+        else:
+            parts.append("数传 未配置串口")
     return " + ".join(parts) if parts else "仅本地监控（未启用任何出口）"
 
 
