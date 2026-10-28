@@ -70,8 +70,18 @@
               <div class="form-row field-serial">
                 <div class="field">
                   <label class="form-label" for="serial_port" data-i18n="cfg.serial_port">串口名称 Serial port</label>
-                  <input type="text" id="serial_port" name="serial_port" value="{{ config.serial_port or '' }}"
-                         class="form-input" placeholder="例如 /dev/ttyUSB0 或 COM3">
+                  <div class="input-row">
+                    <input type="text" id="serial_port" name="serial_port" value="{{ config.serial_port or '' }}"
+                           class="form-input" list="serial-port-list" autocomplete="off"
+                           placeholder="例如 /dev/ttyUSB0 或 COM3">
+                    <button type="button" id="scan-serial-ports" class="btn btn-secondary">
+                      <i class="fa fa-usb" aria-hidden="true"></i><span data-i18n="cfg.scan_ports">扫描串口</span>
+                    </button>
+                  </div>
+                  <datalist id="serial-port-list"></datalist>
+                  <div class="field-hint" id="serial-port-hint" data-i18n="cfg.serial_port_hint">
+                    可点击「扫描串口」从下拉里选，也可以直接手动输入。
+                  </div>
                 </div>
                 <div class="field">
                   <label class="form-label" for="baud_rate" data-i18n="cfg.baud">波特率 Baud rate</label>
@@ -189,6 +199,62 @@
                 <dd id="lc-status">读取中…</dd>
               </dl>
               <div class="field-hint" id="lc-example"></div>
+
+              <div class="section-sep"></div>
+
+              <h2 class="sub-title"><i class="fa fa-rss" aria-hidden="true"></i><span data-i18n="cfg.radio_title">无线电数传透传（数传电台）</span></h2>
+              <div class="field-hint" style="margin-bottom: 4px;" data-i18n="cfg.radio_hint">
+                把本机正在转发的同一路 RTCM 数据，额外透传到一个 USB 数传电台（发送端）。
+                附近无网络的流动站用配套数传电台即可直接接收差分，无需 NTRIP 账号密码。
+                本功能与本地 Caster 完全独立，可同时开、也可单独开。
+              </div>
+
+              <label class="switch-row" for="radio_enabled">
+                <input type="checkbox" id="radio_enabled" name="radio_enabled"
+                       {{ 'checked' if config.radio_enabled == '1' }}>
+                <span data-i18n="cfg.radio_enable">启用数传透传</span>
+              </label>
+
+              <div class="form-row">
+                <div class="field">
+                  <label class="form-label" for="radio_port" data-i18n="cfg.radio_port">数传串口 Radio port</label>
+                  <div class="input-row">
+                    <input type="text" id="radio_port" name="radio_port" value="{{ config.radio_port or '' }}"
+                           class="form-input" list="radio-port-list" autocomplete="off"
+                           placeholder="例如 /dev/ttyUSB1 或 COM4">
+                    <button type="button" id="scan-radio-ports" class="btn btn-secondary">
+                      <i class="fa fa-usb" aria-hidden="true"></i><span data-i18n="cfg.scan_ports">扫描串口</span>
+                    </button>
+                  </div>
+                  <datalist id="radio-port-list"></datalist>
+                  <div class="field-hint" id="radio-port-hint" data-i18n="cfg.radio_port_hint">
+                    可点击「扫描串口」从下拉里选，也可以直接手动输入。已用作 GNSS 模块的串口会自动排除。
+                  </div>
+                </div>
+                <div class="field">
+                  <label class="form-label" for="radio_baud" data-i18n="cfg.radio_baud">波特率 Baud rate</label>
+                  <input type="number" id="radio_baud" name="radio_baud" value="{{ config.radio_baud or '115200' }}"
+                         class="form-input" list="radio-baud-list" placeholder="115200">
+                  <datalist id="radio-baud-list">
+                    <option value="9600"></option>
+                    <option value="19200"></option>
+                    <option value="38400"></option>
+                    <option value="57600"></option>
+                    <option value="115200"></option>
+                    <option value="230400"></option>
+                    <option value="460800"></option>
+                    <option value="921600"></option>
+                  </datalist>
+                </div>
+              </div>
+
+              <dl class="kv kv--compact">
+                <dt data-i18n="cfg.radio_dir">传输方向</dt>
+                <dd class="mono" data-i18n="cfg.radio_dir_val">单向广播（仅发送，不接收）</dd>
+                <dt data-i18n="cfg.radio_status">运行状态</dt>
+                <dd id="radio-status" data-i18n="cfg.radio_reading">读取中…</dd>
+              </dl>
+              <div class="field-hint" id="radio-example"></div>
 
               <div class="form-actions">
                 <button type="submit" name="restart_program" class="btn btn-primary">
@@ -389,6 +455,91 @@ sudo systemctl start 2rtkserver</pre>
 
     // 语言切换后重刷本地 Caster 状态文案
     document.addEventListener('langchange', refreshLocalCaster);
+
+    // ---------- 串口扫描 / 枚举 ----------
+    // GNSS 模块串口和数传串口都能"点扫描串口从下拉选"，也能手动输入。
+    // 数传下拉会自动禁用/剔除当前已用作 GNSS 模块的那个串口，防止误选。
+    async function scanPorts(target, listEl, hintEl, excludeGnss) {
+      const btn = target === 'serial' ? document.getElementById('scan-serial-ports')
+                                      : document.getElementById('scan-radio-ports');
+      const orig = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fa fa-refresh fa-spin" aria-hidden="true"></i>' + I18N.t('cfg.scanning');
+      try {
+        const res = await fetch('/api/serial_ports');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const frag = document.createDocumentFragment();
+        const gnss = data.gnss_port || '';
+        for (const p of data.ports) {
+          const opt = document.createElement('option');
+          opt.value = p.device;
+          let label = p.device;
+          if (p.description) label += ' — ' + p.description;
+          if (excludeGnss && gnss && p.device === gnss) label += ' — ' + I18N.t('cfg.port_gnss_tag');
+          opt.label = label;
+          // 数传下拉：GNSS 模块串口不可选（但保留显示，标注原因）
+          if (excludeGnss && gnss && p.device === gnss) opt.disabled = true;
+          frag.appendChild(opt);
+        }
+        listEl.replaceChildren(frag);
+        if (hintEl) {
+          hintEl.textContent = data.ports.length
+            ? I18N.t('cfg.port_count', { n: data.ports.length })
+            : I18N.t('cfg.port_none');
+        }
+      } catch (err) {
+        listEl.replaceChildren();
+        if (hintEl) hintEl.textContent = I18N.t('cfg.port_fail', { msg: err.message });
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = orig;
+      }
+    }
+
+    document.getElementById('scan-serial-ports').addEventListener('click', () => {
+      scanPorts('serial',
+        document.getElementById('serial-port-list'),
+        document.getElementById('serial-port-hint'),
+        false);
+    });
+    document.getElementById('scan-radio-ports').addEventListener('click', () => {
+      scanPorts('radio',
+        document.getElementById('radio-port-list'),
+        document.getElementById('radio-port-hint'),
+        true);
+    });
+
+    // ---------- 数传透传运行状态 ----------
+    // 配置页勾选的是"保存后生效"的配置，这里显示后端实际运行状态，两者可能暂时不一致。
+    async function refreshRadio() {
+      const statusEl = document.getElementById('radio-status');
+      const exampleEl = document.getElementById('radio-example');
+      try {
+        const res = await fetch('/api/serial_ports');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        // 运行状态需从 ws 推的 run_status 拿，但配置页没有 ws；这里仅展示当前
+        // 已配置的串口与是否被 GNSS 占用，运行态在状态页可见。
+        const radioPort = data.radio_port || '';
+        if (!radioPort) {
+          statusEl.textContent = I18N.t('cfg.radio_unconfigured');
+          statusEl.className = 'kv-value';
+          exampleEl.textContent = '';
+        } else {
+          statusEl.textContent = I18N.t('cfg.radio_configured', { port: radioPort });
+          statusEl.className = 'kv-value';
+          exampleEl.textContent = I18N.t('cfg.radio_example_hint');
+        }
+      } catch (err) {
+        statusEl.textContent = I18N.t('cfg.lc_fail', { msg: err.message });
+        statusEl.className = 'kv-value is-danger';
+        exampleEl.textContent = '';
+      }
+    }
+
+    refreshRadio();
+    document.addEventListener('langchange', refreshRadio);
   </script>
 </body>
 </html>

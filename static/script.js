@@ -35,6 +35,13 @@ const upRateEl = document.getElementById('up-rate');
 const upReconnectsEl = document.getElementById('up-reconnects');
 const upSessionEl = document.getElementById('up-session');
 const upHintEl = document.getElementById('up-hint');
+const radioStatusEl = document.getElementById('radio-status');
+const radioPortEl = document.getElementById('radio-port');
+const radioBaudEl = document.getElementById('radio-baud');
+const radioSentEl = document.getElementById('radio-sent');
+const radioRateEl = document.getElementById('radio-rate');
+const radioReconnectsEl = document.getElementById('radio-reconnects');
+const radioHintEl = document.getElementById('radio-hint');
 const amapBtn = document.getElementById('amap-btn');
 const osmBtn = document.getElementById('osm-btn');
 
@@ -42,6 +49,7 @@ const osmBtn = document.getElementById('osm-btn');
 let _lastRunStatus = null;
 let _lastUpload = null;
 let _lastLocalCaster = null;
+let _lastRadio = null;
 let _lastConfig = null;
 
 // 字节数转可读字符串（与后端 format_bytes 一致）
@@ -790,6 +798,11 @@ function initWebSocket() {
         updateLocalCaster(data.local_caster);
       }
 
+      // 数传透传状态兜底（同样在 mode=none 时靠首帧下发）
+      if (data.radio) {
+        updateRadioStatus(data.radio);
+      }
+
       // 更新设备信息
       if (data.antenna_info) {
         antennaModelEl.textContent = data.antenna_info.antenna_name || "--";
@@ -932,6 +945,7 @@ function updateRunStatus(status) {
   if (status.run_time) runTimeEl.textContent = status.run_time;
   if (status.local_caster) updateLocalCaster(status.local_caster);
   if (status.upload) updateUploadStatus(status.upload);
+  if (status.radio) updateRadioStatus(status.radio);
 }
 
 // 上传端 NTRIP Caster 状态：显示往哪个地址/挂载点推、认证结果、已发送量、速率、重连次数。
@@ -1023,6 +1037,48 @@ function updateLocalCaster(info) {
     setValue(lcStatusEl, I18N.t('lc.enabled_not_run'), 'warning');
     setValue(lcClientsEl, '--', '');
     if (lcHintEl) lcHintEl.textContent = I18N.t('lc.enabled_not_run_hint');
+  }
+}
+
+// 无线电数传透传状态：单向广播，只发不收。显示串口/波特率/已发送/速率/重连次数。
+function updateRadioStatus(info) {
+  if (!info || !radioStatusEl) return;
+  _lastRadio = info;
+
+  const setValue = (el, text, kind) => {
+    if (!el) return;
+    el.textContent = text;
+    el.className = 'kv-value' + (kind ? ' is-' + kind : '');
+  };
+
+  radioPortEl.textContent = info.port || '--';
+  radioBaudEl.textContent = info.baud ? `${info.baud} bps` : '--';
+
+  const bytes = Number(info.sent_bytes) || 0;
+  radioSentEl.textContent = formatBytes(bytes);
+  const rate = Number(info.rate_bps) || 0;
+  radioRateEl.textContent = rate > 0 ? `${formatBytes(rate)}/s` : '--';
+  radioReconnectsEl.textContent = String(Number(info.reconnects) || 0);
+
+  if (!info.enabled) {
+    setValue(radioStatusEl, I18N.t('radio.disabled'), 'warning');
+    if (radioHintEl) radioHintEl.textContent = I18N.t('radio.disabled_hint');
+  } else if (!info.port) {
+    setValue(radioStatusEl, I18N.t('radio.no_port'), 'warning');
+    if (radioHintEl) radioHintEl.textContent = I18N.t('radio.no_port_hint');
+  } else if (info.connected) {
+    setValue(radioStatusEl, I18N.t('radio.sending'), 'success');
+    if (radioHintEl) radioHintEl.textContent = I18N.t('radio.sending_hint', { port: info.port });
+  } else if (info.running && !info.connected) {
+    setValue(radioStatusEl, I18N.t('radio.reconnecting'), 'warning');
+    if (radioHintEl) {
+      radioHintEl.textContent = info.last_error
+        ? I18N.t('radio.reconnecting_hint', { error: info.last_error })
+        : I18N.t('radio.reconnecting_hint_noerr');
+    }
+  } else {
+    setValue(radioStatusEl, I18N.t('radio.not_run'), 'warning');
+    if (radioHintEl) radioHintEl.textContent = I18N.t('radio.not_run_hint');
   }
 }
 
@@ -1290,9 +1346,10 @@ document.addEventListener('visibilitychange', () => {
 document.addEventListener('langchange', () => {
   // 静态运行状态（模式/数据源/目标 caster）
   if (_lastConfig) updateStaticRunStatus(_lastConfig);
-  // 上传端 / 本地 Caster 状态
+  // 上传端 / 本地 Caster / 数传透传 状态
   if (_lastUpload) updateUploadStatus(_lastUpload);
   if (_lastLocalCaster) updateLocalCaster(_lastLocalCaster);
+  if (_lastRadio) updateRadioStatus(_lastRadio);
   // 观测星座的空态文案
   updateObservedSystemsDisplay();
   // 地图标记文字（如果地图已初始化且有位置）

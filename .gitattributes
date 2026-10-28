@@ -1,0 +1,9 @@
+# 强制所有文本文件使用 LF 换行符
+# 确保在 Windows 上 checkout 时不会被转成 CRLF，保证 Armbian 上脚本可直接运行
+* text=auto eol=lf
+
+# 二进制文件
+*.jpg binary
+*.ico binary
+*.png binary
+*.db binary

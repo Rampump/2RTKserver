@@ -142,7 +142,21 @@ python3 server.py
 4. (Optional) enable the "Local Caster" so LAN rovers connect directly:
    - Default listen `0.0.0.0:2101`, mount point `2RTK`, user/password both `2RTK`.
    - Rovers/handhelds use `device-ip:2101/2RTK`.
-5. Click "Save & Restart".
+5. (Optional) enable "Radio datalink bridge" to transparently forward the same RTCM stream
+   to a USB radio modem:
+   - Plug a USB radio modem (transmitter) into the Armbian host; nearby rovers without
+     network receive corrections over a paired radio (receiver) — **no NTRIP auth required**.
+   - **One-way broadcast, send-only**: the program only writes the RTCM byte stream to the
+     serial port; it parses nothing and adds no protocol. Radio modems are transparent
+     serial devices — transmitter and receiver must share the same frequency / channel /
+     baud rate.
+   - The serial path can be typed manually, or click the field to auto-scan/enumerate; the
+     port already used by the GNSS module is **auto-disabled** in the list to avoid conflict.
+   - Default baud rate is 115200 (changeable); it must be ≥ the radio's air rate, otherwise
+     data backs up and rovers lose fix.
+   - The radio switch, the local caster switch, and the run mode are **fully independent** —
+     they can run together or separately without affecting each other.
+6. Click "Save & Restart".
 
 ---
 

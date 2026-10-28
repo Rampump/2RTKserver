@@ -220,6 +220,10 @@ def push_run_status():
         run_status["upload"] = upload_snapshot()
     except Exception:
         pass
+    try:
+        run_status["radio"] = serial_bridge_snapshot()
+    except Exception:
+        pass
     send_to_clients({"run_status": run_status})
 
 
@@ -314,6 +318,9 @@ DEFAULT_CONFIG = {
     "local_caster_enabled": "0",
     "local_caster_host": "0.0.0.0",
     "local_caster_port": "2101",
+    "radio_enabled": "0",
+    "radio_port": "",
+    "radio_baud": "115200",
     "admin_user": "admin",
     "admin_password": "admin"
 }
@@ -448,7 +455,7 @@ def get_config():
     # 会话密钥不能出现在配置接口/模板里，否则等于把密钥交给前端
     config.pop('secret_key', None)
     logging.debug("配置信息读取完成")
-    int_fields = ['caster_port', 'relay_port', 'baud_rate', 'local_caster_port']
+    int_fields = ['caster_port', 'relay_port', 'baud_rate', 'local_caster_port', 'radio_baud']
     for field in int_fields:
         raw_val = config.get(field)
         if raw_val is None or raw_val == '':
@@ -492,6 +499,13 @@ def run_once():
             start_local_caster(cfg)
         else:
             stop_local_caster()
+
+        # 数传透传同样与数据源、本地 Caster 完全解耦：独立开关、独立生命周期。
+        # 关闭数传不影响本地 Caster，关闭本地 Caster 也不影响数传读取数据。
+        if str(cfg.get('radio_enabled', '0')) == '1':
+            start_serial_bridge(cfg)
+        else:
+            stop_serial_bridge()
 
         # 初始化所有可能在finally中用到的变量
         ser = None
@@ -571,6 +585,7 @@ def run_once():
     finally:
         thread_exit_event.set()
         stop_local_caster()
+        stop_serial_bridge()
         threads_to_join = []
         # 现在这些变量都已初始化，不会出现未定义错误
         if upload_thread and upload_thread.is_alive():
@@ -815,11 +830,14 @@ def validate_config(cfg):
         return False
 
     # 2. 检查两种模式的公共必填参数（Caster相关配置）
-    #    例外：如果只是想让本机充当本地 Caster（不开上传），caster_host 可以留空，
-    #    此时 open_caster() 返回一个空实现，数据只往本地 Caster 分发。
+    #    例外1：如果只是想让本机充当本地 Caster（不开上传），caster_host 可以留空，
+    #          此时 open_caster() 返回一个空实现，数据只往本地 Caster 分发。
+    #    例外2：如果开启了数传透传（radio），数据有独立出口，同样不强制要求上传 Caster。
+    #          三种出口（上传 Caster / 本地 Caster / 数传透传）至少有一个即可。
     local_caster_on = str(cfg.get('local_caster_enabled', '0')) == '1'
-    if not cfg.get('caster_host') and not local_caster_on:
-        err("NTRIP Caster服务器地址未配置，请补充")
+    radio_on = str(cfg.get('radio_enabled', '0')) == '1'
+    if not cfg.get('caster_host') and not local_caster_on and not radio_on:
+        err("NTRIP Caster服务器地址未配置，请补充（或至少开启本地 Caster / 数传透传其中一个数据出口）")
         return False
     if cfg.get('caster_host') and not cfg.get('caster_mountpoint'):
         err("NTRIP Caster挂载点未配置，请补充")
@@ -1049,7 +1067,7 @@ class _NullCaster:
 
 def open_caster(cfg):
     if not cfg.get('caster_host'):
-        logging.info("未配置上传端 Caster，本次仅由本地 Caster 对外发布数据")
+        logging.info("未配置上传端 Caster，数据由本地 Caster / 数传透传等本地出口对外发布")
         mark_upload_state('idle', cfg, error='')
         return _NullCaster()
     logging.info(f">>>向上传端NTRIP Caster 申请连接{cfg['caster_host']}:{cfg['caster_port']}")
@@ -1295,6 +1313,14 @@ def config_page():
                 "local_caster_port": (form_data.get('local_caster_port') or '').strip() or '2101',
             })
 
+            # 数传透传设置同样与运行模式、本地 Caster 完全解耦，任何模式下都能开
+            radio_baud = (form_data.get('radio_baud') or '').strip() or '115200'
+            new_cfg.update({
+                "radio_enabled": "1" if form_data.get('radio_enabled') else "0",
+                "radio_port": (form_data.get('radio_port') or '').strip(),
+                "radio_baud": radio_baud,
+            })
+
             if mode == 'serial':
                 new_cfg.update({
                     "serial_port": form_data.get('serial_port', ''),
@@ -1393,6 +1419,37 @@ def api_local_caster():
     info = local_caster_snapshot()
     info['mode'] = get_config().get('mode') or 'none'
     return jsonify(info)
+
+
+@app.route('/api/serial_ports', methods=['GET'])
+@login_required
+def api_serial_ports():
+    """枚举系统当前可见的串口设备，供配置页下拉选择。
+
+    返回每个串口的 device 与描述，并额外标注：
+      - gnss_port：当前已配置为 GNSS 模块输入的串口（serial_port），
+        前端据此把它在下拉里禁用，避免把数传电台选到 GNSS 模块那个口上。
+      - radio_port：当前已配置为数传输出的串口（radio_port）。
+    串口列表只反映"此刻插着哪些设备"，用户仍可手动填写列表外的路径。
+    """
+    try:
+        ports = serial.tools.list_ports.comports()
+        items = []
+        for p in ports:
+            items.append({
+                'device': p.device,
+                'description': (p.description or '').strip(),
+                'hwid': getattr(p, 'hwid', '') or '',
+            })
+    except Exception as e:
+        logging.error(f"枚举串口失败：{e}")
+        items = []
+    cfg = get_config()
+    return jsonify({
+        'ports': items,
+        'gnss_port': (cfg.get('serial_port') or '').strip(),
+        'radio_port': (cfg.get('radio_port') or '').strip(),
+    })
 
 # ==================== 中继挂载点列表（NTRIP SOURCETABLE） ====================
 # 为什么这件事必须由后端做、前端 JS 做不了：
@@ -1932,6 +1989,260 @@ def publish_to_local_caster(data: bytes):
         local_caster.publish(data)
 
 
+# ==================== 无线电数传透传（Radio Serial Bridge） ====================
+# 设计目标：把本机正在转发的同一路 RTCM 数据，额外以"串口透传"的方式送给一个
+# USB 数传电台（发送端），让附近无网络的流动站通过配套数传电台直接收差分，
+# 无需 NTRIP 账号密码。
+#
+# 关键取舍（与本地 Caster 相同的思路，但更强调"单向、只发不收、绝不影响主链路"）：
+#   1. 独立开关：radio_enabled 与 local_caster_enabled、运行模式三者完全解耦，
+#      关掉数传不影响本地 Caster，反之亦然；两者可同时开、也可独立开。
+#   2. 独立线程 + 有界队列：串口写入在专用线程里做，publish 永远是非阻塞 put_nowait，
+#      串口卡死/写慢只会丢弃数传这一路的数据，绝不拖累串口/中继主数据流。
+#   3. 只发不收（单向广播）：数传场景 base 只发、流动站只收，串口以纯写打开，
+#      不读任何回传字节，避免与 GNSS 模块串口产生任何读冲突。
+#   4. 断线重连：串口被拔/写失败时自动关串口、定时重试重开，期间静默丢弃数据，
+#      不向上抛异常、不影响主链路。
+RADIO_QUEUE_SIZE = 512             # 待发帧上限，满了丢弃最旧（数传串口写慢时保护）
+RADIO_RECONNECT_INTERVAL = 3.0     # 串口断线后的重连间隔（秒）
+RADIO_VALID_BAUDS = [115200, 921600, 460800, 230400, 57600, 38400, 19200, 9600]
+
+
+class SerialBridge:
+    """把 RTCM 字节流透传给一个 USB 数传串口（单向发送）。"""
+
+    def __init__(self, port: str, baud: int):
+        self.port = port
+        self.baud = baud
+        self._ser = None
+        self._thread = None
+        self._running = False
+        self._outbox = queue.Queue(maxsize=RADIO_QUEUE_SIZE)
+        self._connected = False
+        self._sent_bytes = 0
+        self._reconnects = 0
+        self._last_error = ''
+        self._rate_last_time = 0.0
+        self._rate_last_bytes = 0
+        self._rate_bps = 0.0
+        self._lock = threading.Lock()
+
+    # ---------- 生命周期 ----------
+    def start(self) -> bool:
+        """启动发送线程。串口打不开也照常起线程，由线程内的重连逻辑兜底。
+
+        返回 True 表示线程已启动（含"串口尚未打开、后台持续重试"的情况）。
+        """
+        self._running = True
+        self._thread = threading.Thread(target=self._send_loop, name='radio-bridge', daemon=True)
+        self._thread.start()
+        if self._connected:
+            logging.info(f"数传透传已启动：{self.port} @ {self.baud}bps（单向广播，只发不收）")
+        else:
+            logging.warning(f"数传透传已启用但串口未打开，将持续重试：{self.port} @ {self.baud}")
+        return True
+
+    def stop(self):
+        self._running = False
+        self._close_serial()
+        # 清空队列里残留的待发数据，避免下次启动后立刻把旧数据灌给电台
+        try:
+            while True:
+                self._outbox.get_nowait()
+        except queue.Empty:
+            pass
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(2)
+        self._thread = None
+
+    # ---------- 数据入口（非阻塞，永不影响调用方） ----------
+    def publish(self, data: bytes):
+        if not data or not self._running:
+            return
+        try:
+            self._outbox.put_nowait(data)
+        except queue.Full:
+            # 数传串口写得太慢，队列积压：丢最旧，保证永远是最新的差分出去
+            try:
+                self._outbox.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._outbox.put_nowait(data)
+            except queue.Full:
+                pass
+
+    # ---------- 对外状态 ----------
+    def status(self) -> dict:
+        with self._lock:
+            return {
+                'running': self._running,
+                'connected': self._connected,
+                'port': self.port,
+                'baud': self.baud,
+                'sent_bytes': self._sent_bytes,
+                'rate_bps': self._rate_bps,
+                'reconnects': self._reconnects,
+                'last_error': self._last_error,
+                'queue_size': self._outbox.qsize(),
+            }
+
+    # ---------- 内部 ----------
+    def _open(self) -> bool:
+        try:
+            new_ser = serial.Serial(
+                port=self.port,
+                baudrate=self.baud,
+                timeout=0.5,
+                write_timeout=1.0,
+            )
+            new_ser.reset_output_buffer()
+            with self._lock:
+                self._ser = new_ser
+                self._connected = True
+                self._last_error = ''
+            return True
+        except (serial.SerialException, OSError, ValueError) as e:
+            with self._lock:
+                self._connected = False
+                self._last_error = str(e)
+            logging.error(f"数传串口打开失败 {self.port} @ {self.baud}: {e}")
+            return False
+
+    def _close_serial(self):
+        with self._lock:
+            ser = self._ser
+            self._ser = None
+            self._connected = False
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+    def _send_loop(self):
+        # 首次进入时若串口还没打开（配置保存时串口未插/打不开），先尝试打开一次
+        if self._ser is None:
+            self._open()
+        while self._running:
+            try:
+                data = self._outbox.get(timeout=0.5)
+            except queue.Empty:
+                # 没数据时也要给"尚未打开串口"的情况一个重试打开的机会
+                if self._ser is None and self._running:
+                    self._open()
+                    if self._ser is None:
+                        time.sleep(RADIO_RECONNECT_INTERVAL)
+                continue
+
+            # 在锁内取串口对象的快照，避免 stop() 并发把 self._ser 置 None 后
+            # 这里仍对 None 调用 write/flush 导致 AttributeError。
+            with self._lock:
+                ser = self._ser
+            if ser is None:
+                # 串口还没打开：丢弃这条数据，并尝试打开
+                self._open()
+                if self._ser is None:
+                    time.sleep(RADIO_RECONNECT_INTERVAL)
+                continue
+
+            try:
+                ser.write(data)
+                ser.flush()
+                with self._lock:
+                    self._sent_bytes += len(data)
+                self._tick_rate(len(data))
+            except (serial.SerialException, OSError, serial.SerialTimeoutException) as e:
+                logging.error(f"数传串口写入失败：{e}")
+                with self._lock:
+                    self._reconnects += 1
+                    self._last_error = str(e)
+                self._close_serial()
+                # 断线重连：定时重试重开，期间继续消费队列丢弃数据，不阻塞主链路
+                while self._running and self._ser is None:
+                    if not self._open():
+                        time.sleep(RADIO_RECONNECT_INTERVAL)
+                    else:
+                        logging.info(f"数传串口重连成功：{self.port} @ {self.baud}")
+                        break
+            except Exception as e:
+                logging.error(f"数传串口发送异常：{e}")
+                self._close_serial()
+        self._close_serial()
+
+    def _tick_rate(self, nbytes: int):
+        now = time.time()
+        with self._lock:
+            if now - self._rate_last_time >= 2.0:
+                elapsed = now - self._rate_last_time
+                if elapsed > 0:
+                    self._rate_bps = (self._sent_bytes - self._rate_last_bytes) / elapsed
+                self._rate_last_time = now
+                self._rate_last_bytes = self._sent_bytes
+
+
+serial_bridge: Optional['SerialBridge'] = None
+
+
+def start_serial_bridge(cfg) -> Optional['SerialBridge']:
+    """按配置启动数传透传；失败只记日志，不影响主链路。"""
+    global serial_bridge
+    stop_serial_bridge()
+    port = (cfg.get('radio_port') or '').strip()
+    if not port:
+        logging.info("数传透传未配置串口，跳过启动")
+        return None
+    try:
+        baud = int(cfg.get('radio_baud') or 115200)
+    except (TypeError, ValueError):
+        baud = 115200
+    bridge = SerialBridge(port, baud)
+    bridge.start()
+    # 串口暂时打不开也没关系：线程会在后台持续重试，状态页能看到"已启用但未连接"
+    serial_bridge = bridge
+    return bridge
+
+
+def stop_serial_bridge():
+    global serial_bridge
+    if serial_bridge is not None:
+        serial_bridge.stop()
+        serial_bridge = None
+        logging.info("数传透传已停止")
+
+
+def publish_to_serial_bridge(data: bytes):
+    """把数据额外透传一份给数传串口（没启用时是空操作，永不影响主链路）。"""
+    if serial_bridge is not None:
+        serial_bridge.publish(data)
+
+
+def serial_bridge_snapshot() -> dict:
+    """数传透传的对外可见快照，供状态页卡片使用（不含任何口令，可公开推送）。"""
+    cfg = get_config()
+    enabled = str(cfg.get('radio_enabled', '0')) == '1'
+    if serial_bridge is not None:
+        info = serial_bridge.status()
+    else:
+        try:
+            baud = int(cfg.get('radio_baud') or 115200)
+        except (TypeError, ValueError):
+            baud = 115200
+        info = {
+            'running': False,
+            'connected': False,
+            'port': cfg.get('radio_port') or '',
+            'baud': baud,
+            'sent_bytes': 0,
+            'rate_bps': 0.0,
+            'reconnects': 0,
+            'last_error': '',
+            'queue_size': 0,
+        }
+    info['enabled'] = enabled
+    return info
+
+
 def local_caster_snapshot() -> dict:
     """本地 Caster 的对外可见快照，供状态页卡片与 ws 首帧使用。
 
@@ -2057,6 +2368,11 @@ def websocket(ws):
         client.enqueue(json.dumps({
             "type": "local_caster",
             "local_caster": local_caster_snapshot()
+        }))
+        # 数传透传状态同样补一条首帧兜底（mode=none 时靠它显示）
+        client.enqueue(json.dumps({
+            "type": "radio",
+            "radio": serial_bridge_snapshot()
         }))
 
         # 单线程同时负责"发"和"收"：
@@ -2431,6 +2747,8 @@ def upload_via_serial(ser, caster, cfg, thread_exit_event):
 
             # 先分发给本地 Caster 的客户端：即使后面上传端挂了，本地依然有差分数据
             publish_to_local_caster(data)
+            # 同一路数据再透传一份给数传电台（未启用时空操作，永不影响主链路）
+            publish_to_serial_bridge(data)
 
             try:
                 caster.sendall(data)
@@ -2540,6 +2858,8 @@ def forward_relay(relay, caster, cfg, thread_exit_event):
                 total_bytes += len(data)
                 # 先分发给本地 Caster，避免上传端重连期间本地客户端断流
                 publish_to_local_caster(data)
+                # 同一路数据再透传一份给数传电台（未启用时空操作）
+                publish_to_serial_bridge(data)
                 try:
                     caster.sendall(data)
                 except Exception as send_err:

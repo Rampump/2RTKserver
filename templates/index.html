@@ -163,6 +163,28 @@
 
       <section class="card card-pad mb-16 fade-in">
         <div class="card-hd">
+          <h2 class="card-title"><i class="fa fa-rss" aria-hidden="true"></i><span data-i18n="card.radio">无线电数传透传</span></h2>
+          <span class="card-hint" data-i18n="card.hint.radio">单向广播 · 附近流动站免 NTRIP 验证直接收差分</span>
+        </div>
+        <dl class="kv kv--compact">
+          <dt data-i18n="radio.status">运行状态</dt>
+          <dd id="radio-status" class="kv-value" data-i18n="radio.reading">读取中…</dd>
+          <dt data-i18n="radio.port">数传串口</dt>
+          <dd id="radio-port" class="kv-value mono">--</dd>
+          <dt data-i18n="radio.baud">波特率</dt>
+          <dd id="radio-baud" class="kv-value mono">--</dd>
+          <dt data-i18n="radio.sent">已发送</dt>
+          <dd id="radio-sent" class="kv-value">--</dd>
+          <dt data-i18n="radio.rate">实测速率</dt>
+          <dd id="radio-rate" class="kv-value">--</dd>
+          <dt data-i18n="radio.reconnects">重连次数</dt>
+          <dd id="radio-reconnects" class="kv-value">--</dd>
+        </dl>
+        <div class="field-hint" id="radio-hint"></div>
+      </section>
+
+      <section class="card card-pad mb-16 fade-in">
+        <div class="card-hd">
           <h2 class="card-title"><i class="fa fa-terminal" aria-hidden="true"></i><span data-i18n="card.log">系统日志</span></h2>
           <span class="card-hint" data-i18n="card.hint.log">实时推送 · 最多保留 500 条</span>
         </div>

@@ -26,6 +26,8 @@ Works on Linux / Armbian; tested on OneCloud and compatible with Raspberry Pi an
   Built-in web UI for live configuration and monitoring.
 - **内置本地 NTRIP Caster**：把正在转发的同一路 RTCM 数据额外向内网发布，移动站 / 手簿直连本机取差分。默认监听 `0.0.0.0:2101`，挂载点 `2RTK`，账号密码均为 `2RTK`。
   **Built-in local NTRIP Caster**: publishes the same stream on the LAN so rovers connect directly. Defaults to `0.0.0.0:2101`, mount point `2RTK`, user/password `2RTK`.
+- **无线电数传透传（Radio datalink bridge）**：把同一路 RTCM 数据透传到 USB 数传电台的串口，附近无网络的流动站通过数传模块直接收差分，**无需 NTRIP 验证**。单向广播（只发不收），与本地 Caster / GNSS 模块开关完全独立、互不影响。
+  **Radio datalink bridge**: transparently forwards the same RTCM stream to a USB radio modem's serial port, so nearby rovers without network can get corrections over radio — **no NTRIP auth needed**. One-way broadcast (send-only), fully independent from the local caster and the GNSS module.
 - Web 端实时监控收星数量、信号质量，以图表展示。
   Live satellite count & signal quality charts.
 - 自动获取基站经纬度并标记在地图上（国内高德、其他地区 OpenStreetMap），并显示 20KM / 50KM 覆盖圈。
@@ -77,6 +79,8 @@ sudo ./install.sh
   Pull from another NTRIP caster and re-forward. "Fetch Mount Points" reads the peer's source table.
 - **本地 Caster（可选叠加）**：把同一路数据额外向内网发布，移动站直连本机。
   Local caster (optional overlay): publish the same stream on the LAN.
+- **数传透传（可选叠加）**：把同一路数据透传到 USB 数传电台串口，附近无网络流动站经无线电免验证收差分。独立开关，只发不收。
+  Radio bridge (optional overlay): forward the same stream to a USB radio modem serial port; nearby offline rovers get corrections over radio with no auth. Independent switch, send-only.
 
 ---
 
