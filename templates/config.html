@@ -98,33 +98,10 @@
                 </div>
               </div>
 
-              <div class="form-row field-caster">
-                <div class="field">
-                  <label class="form-label" for="caster_host" data-i18n="cfg.caster_host">上传地址 Caster address</label>
-                  <input type="text" id="caster_host" name="caster_host" value="{{ config.caster_host }}" class="form-input">
-                </div>
-                <div class="field">
-                  <label class="form-label" for="caster_port" data-i18n="cfg.caster_port">上传端口 Caster port</label>
-                  <input type="number" id="caster_port" name="caster_port" value="{{ config.caster_port }}" class="form-input">
-                </div>
-              </div>
-
-              <div class="form-row field-caster">
-                <div class="field">
-                  <label class="form-label" for="caster_mountpoint" data-i18n="cfg.caster_mount">挂载点 Mount point</label>
-                  <input type="text" id="caster_mountpoint" name="caster_mountpoint" value="{{ config.caster_mountpoint }}" class="form-input">
-                </div>
-                <div class="field">
-                  <label class="form-label" for="caster_password" data-i18n="cfg.caster_password">上传密码 Password</label>
-                  <input type="password" id="caster_password" name="caster_password" value="{{ config.caster_password }}"
-                         autocomplete="off" class="form-input">
-                </div>
-              </div>
-
               <div class="form-row field-relay">
                 <div class="field">
                   <label class="form-label" for="relay_host" data-i18n="cfg.relay_host">中继地址 Relay address</label>
-                  <input type="text" id="relay_host" name="relay_host" value="{{ config.relay_host }}" class="form-input">
+                  <input type="text" id="relay_host" name="relay_host" value="{{ config.relay_host }}" class="form-input" data-req="1">
                 </div>
                 <div class="field">
                   <label class="form-label" for="relay_port" data-i18n="cfg.relay_port">中继端口 Relay port</label>
@@ -138,7 +115,7 @@
                   <input type="text" id="relay_mountpoint" name="relay_mountpoint"
                          value="{{ config.relay_mountpoint }}" class="form-input"
                          list="relay-mountpoint-list" autocomplete="off"
-                         placeholder="点右侧按钮拉取，或直接手动输入">
+                         placeholder="点右侧按钮拉取，或直接手动输入" data-req="1">
                   <button type="button" id="fetch-mountpoints" class="btn btn-secondary">
                     <i class="fa fa-cloud-download" aria-hidden="true"></i><span data-i18n="cfg.fetch">获取挂载点</span>
                   </button>
@@ -163,7 +140,48 @@
 
               <div class="section-sep"></div>
 
-              <h2 class="sub-title"><i class="fa fa-server" aria-hidden="true"></i><span data-i18n="cfg.local_title">本地 NTRIP Caster</span></h2>
+              <h2 class="sub-title"><i class="fa fa-share-alt" aria-hidden="true"></i><span data-i18n="cfg.out_title">数据出口（可多选，互相独立）</span></h2>
+              <div class="field-hint" style="margin-bottom: 8px;" data-i18n="cfg.out_hint">
+                勾选哪个出口就启动哪个，可多选、也可全不选（全不选时只做本地监控，不向任何外部发送）。
+                三个出口互不影响：其中一个断线或出错，其他照常工作。
+              </div>
+
+              <label class="switch-row" for="caster_enabled">
+                <input type="checkbox" id="caster_enabled" name="caster_enabled"
+                       {{ 'checked' if config.caster_enabled == '1' }}>
+                <span data-i18n="cfg.out_upload">① 上传到云端 NTRIP Caster</span>
+              </label>
+
+              <div class="field-caster-group">
+                <div class="form-row">
+                  <div class="field">
+                    <label class="form-label" for="caster_host" data-i18n="cfg.caster_host">上传地址 Caster address</label>
+                    <input type="text" id="caster_host" name="caster_host" value="{{ config.caster_host }}" class="form-input" data-req="1">
+                  </div>
+                  <div class="field">
+                    <label class="form-label" for="caster_port" data-i18n="cfg.caster_port">上传端口 Caster port</label>
+                    <input type="number" id="caster_port" name="caster_port" value="{{ config.caster_port }}" class="form-input">
+                  </div>
+                </div>
+                <div class="form-row">
+                  <div class="field">
+                    <label class="form-label" for="caster_mountpoint" data-i18n="cfg.caster_mount">挂载点 Mount point</label>
+                    <input type="text" id="caster_mountpoint" name="caster_mountpoint" value="{{ config.caster_mountpoint }}" class="form-input" data-req="1">
+                  </div>
+                  <div class="field">
+                    <label class="form-label" for="caster_password" data-i18n="cfg.caster_password">上传密码 Password</label>
+                    <input type="password" id="caster_password" name="caster_password" value="{{ config.caster_password }}"
+                           autocomplete="off" class="form-input">
+                  </div>
+                </div>
+                <div class="field-hint" data-i18n="cfg.out_upload_hint">
+                  以 NTRIP SOURCE 协议推送到上游 Caster。独立线程运行，断线自动重连，不影响其他出口。
+                </div>
+              </div>
+
+              <div class="section-sep"></div>
+
+              <h2 class="sub-title"><i class="fa fa-server" aria-hidden="true"></i><span data-i18n="cfg.local_title">② 本地 NTRIP Caster</span></h2>
               <div class="field-hint" style="margin-bottom: 4px;" data-i18n="cfg.local_hint">
                 把本机正在转发的同一路 RTCM 数据，额外以 NTRIP Caster 的形式向内网发布。
                 移动站/手簿直接连本机即可取差分，不必再绕到外网 Caster。原有上传链路不受影响。
@@ -202,7 +220,7 @@
 
               <div class="section-sep"></div>
 
-              <h2 class="sub-title"><i class="fa fa-rss" aria-hidden="true"></i><span data-i18n="cfg.radio_title">无线电数传透传（数传电台）</span></h2>
+              <h2 class="sub-title"><i class="fa fa-rss" aria-hidden="true"></i><span data-i18n="cfg.radio_title">③ 无线电数传透传（数传电台）</span></h2>
               <div class="field-hint" style="margin-bottom: 4px;" data-i18n="cfg.radio_hint">
                 把本机正在转发的同一路 RTCM 数据，额外透传到一个 USB 数传电台（发送端）。
                 附近无网络的流动站用配套数传电台即可直接接收差分，无需 NTRIP 账号密码。
@@ -293,21 +311,43 @@ sudo systemctl start 2rtkserver</pre>
   <script>
     document.getElementById('year').textContent = new Date().getFullYear();
 
-    // 按运行模式显示/隐藏字段组。原先直接改 style.display = 'block'，
-    // 会把 .form-row 的 display:grid 覆盖掉，导致两列字段塌成单列。
+    // 字段显隐与必填的完整规则：
+    //   数据源字段（串口 / 中继）—— 随 mode 显示；
+    //   出口字段 —— 只随各自的独立开关显示。
+    // required 严格跟随「该字段此刻是否可见」，不可见的字段绝不会拦截提交。
+    // 这正是修复「不填上传地址就无法保存」的关键：未勾选上传出口时，
+    // caster_host 既不可见、也不会被标记 required。
+    //
+    // 原先用 style.display='block' 会把 .form-row 的 display:grid 覆盖掉，
+    // 导致两列字段塌成单列，所以这里统一用 hidden 类控制。
     function updateFormFields(mode = document.getElementById('mode').value) {
+      const casterOn = !!document.getElementById('caster_enabled').checked;
+
       const toggle = (selector, visible, required) => {
         document.querySelectorAll(selector).forEach(el => {
           el.classList.toggle('hidden', !visible);
-          const input = el.querySelector('input');
-          if (input) input.toggleAttribute('required', required && visible);
+          el.querySelectorAll('input').forEach(input => {
+            // 只有标了 data-req="1" 的关键字段才参与必填校验；
+            // 端口、密码这类有默认值或可留空的字段永远不强制。
+            const needReq = required && visible && input.dataset.req === '1';
+            input.toggleAttribute('required', needReq);
+          });
         });
       };
 
+      // 数据源
       toggle('.field-serial', mode === 'serial', false);
       toggle('.field-relay', mode === 'relay', mode === 'relay');
-      toggle('.field-caster', mode !== 'none', mode !== 'none');
+
+      // 出口 1：上传云端 Caster —— 勾选才展开、才必填
+      toggle('.field-caster-group', casterOn, casterOn);
     }
+
+    // 模式与三个出口开关都会影响字段显隐，统一绑定
+    ['mode', 'caster_enabled', 'local_caster_enabled', 'radio_enabled'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('change', () => updateFormFields());
+    });
 
     async function loadConfig() {
       try {
@@ -328,7 +368,6 @@ sudo systemctl start 2rtkserver</pre>
       }
     }
 
-    document.getElementById('mode').addEventListener('change', () => updateFormFields());
     document.addEventListener('DOMContentLoaded', () => updateFormFields());
 
     // ---------- 中继挂载点列表 ----------

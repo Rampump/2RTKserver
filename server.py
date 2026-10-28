@@ -257,19 +257,27 @@ UPLOAD_STATE_TEXT = {
 
 
 def upload_snapshot(cfg=None) -> dict:
-    """首页展示用的上传链路快照。口令类字段一律不下发。"""
+    """首页展示用的上传链路快照。口令类字段一律不下发。
+
+    状态来源优先级：运行中的 CasterUploader 实例 > 全局 upload_status 兜底。
+    这样状态页读到的是真实推流线程的统计，而不是另外维护的一份影子数据。
+    """
+    if caster_uploader is not None:
+        return caster_uploader.status()
     info = dict(upload_status)
     info.pop('secret_key', None)
     if cfg is not None:
-        has_host = bool(cfg.get('caster_host'))
-        info['enabled'] = has_host
-        if has_host:
-            info['target'] = (f"{cfg['caster_host']}:{cfg['caster_port']}"
-                              f"/{cfg['caster_mountpoint']}")
+        # 只看独立开关。未启用时把地址一起清掉，避免把历史残留值显示成"正在上传"。
+        enabled = str(cfg.get('caster_enabled', '0')) == '1'
+        info['enabled'] = enabled
+        if enabled:
+            info['target'] = (f"{cfg.get('caster_host', '')}:{cfg.get('caster_port', '')}"
+                              f"/{cfg.get('caster_mountpoint', '')}")
         else:
-            info['target'] = "不上传（仅本地 Caster）"
-    if _upload_session_start:
-        info['session_time'] = format_duration(time.time() - _upload_session_start)
+            info['target'] = "未启用"
+            info['host'] = ''
+            info['port'] = ''
+            info['mountpoint'] = ''
     return info
 
 
@@ -279,14 +287,20 @@ def mark_upload_state(state: str, cfg=None, error: str = '', reconnect: bool = F
     upload_status['state'] = state
     upload_status['state_text'] = UPLOAD_STATE_TEXT.get(state, state)
     if cfg is not None:
-        has_host = bool(cfg.get('caster_host'))
-        upload_status['enabled'] = has_host
-        upload_status['host'] = cfg.get('caster_host') or ''
-        upload_status['port'] = str(cfg.get('caster_port') or '')
-        upload_status['mountpoint'] = cfg.get('caster_mountpoint') or ''
-        upload_status['target'] = (f"{upload_status['host']}:{upload_status['port']}"
-                                   f"/{upload_status['mountpoint']}"
-                                   if has_host else "不上传（仅本地 Caster）")
+        enabled = str(cfg.get('caster_enabled', '0')) == '1'
+        upload_status['enabled'] = enabled
+        if enabled:
+            upload_status['host'] = cfg.get('caster_host') or ''
+            upload_status['port'] = str(cfg.get('caster_port') or '')
+            upload_status['mountpoint'] = cfg.get('caster_mountpoint') or ''
+            upload_status['target'] = (f"{upload_status['host']}:{upload_status['port']}"
+                                       f"/{upload_status['mountpoint']}")
+        else:
+            # 未启用：清空地址与挂载点，状态页显示"未启用"而不是残留的历史配置
+            upload_status['host'] = ''
+            upload_status['port'] = ''
+            upload_status['mountpoint'] = ''
+            upload_status['target'] = '未启用'
     if error:
         upload_status['last_error'] = error
     if reconnect:
@@ -306,6 +320,9 @@ DEFAULT_CONFIG = {
     "mode": "none",
     "serial_port": "",
     "baud_rate": "",
+    # 三个数据出口各自一个独立开关，默认全关：程序启动只做采集/监控，
+    # 不连接任何外部服务。需要哪个出口由用户在配置页显式勾选。
+    "caster_enabled": "0",
     "caster_host": "",
     "caster_port": "2101",
     "caster_mountpoint": "",
@@ -468,6 +485,13 @@ def get_config():
     return config
 
 def run_once():
+    """一轮完整运行：先启动数据出口，再启动数据源；停机严格逆序。
+
+    这是整个程序的调度中心，职责边界很清楚：
+      - 出口是否启动，只看各自的 _enabled 独立开关（与本函数里的 mode 无关）；
+      - 数据源是否启动，只看 mode；
+      - 任何模块启动失败都只记日志，不阻断其他模块，也不中断整体运行。
+    """
     global worker_thread
 
     # 上一轮的工作线程若仍未退出（例如卡在阻塞的 recv 里），
@@ -484,6 +508,10 @@ def run_once():
     msg_types_seen.clear()
     msg_types_recent.clear()
 
+    ser = None
+    relay = None
+    source_thread = None
+
     try:
         cfg = get_config()
         if not validate_config(cfg):
@@ -493,58 +521,53 @@ def run_once():
 
         mode = cfg['mode']
 
-        # 本地 Caster 与数据源解耦：先启动监听，串口/中继任一路数据进来都能对内发布。
-        # 端口被占用等失败只记日志，不影响原有上传链路。
+        # ==================== 阶段 2：启动数据出口（先起，等着接数据）====================
+        # 顺序：本地 Caster（开始 listen）→ 数传（开串口待命）→ 上传（建连 + 握手）
+        # 三者各自独立线程；任何一个启动失败只记日志，绝不影响另外两个，也不影响数据源。
+
         if str(cfg.get('local_caster_enabled', '0')) == '1':
             start_local_caster(cfg)
         else:
             stop_local_caster()
 
-        # 数传透传同样与数据源、本地 Caster 完全解耦：独立开关、独立生命周期。
-        # 关闭数传不影响本地 Caster，关闭本地 Caster 也不影响数传读取数据。
         if str(cfg.get('radio_enabled', '0')) == '1':
             start_serial_bridge(cfg)
         else:
             stop_serial_bridge()
 
-        # 初始化所有可能在finally中用到的变量
-        ser = None
-        relay = None
-        caster = None
-        upload_thread = None
-        forward_thread = None  # 确保在所有代码路径中都有定义
+        # 上传出口是独立线程 + 队列：建连失败会在后台一直重试，
+        # 绝不会把数据源堵在这里（这正是本次改造要根治的老问题）。
+        if str(cfg.get('caster_enabled', '0')) == '1':
+            start_caster_uploader(cfg)
+        else:
+            stop_caster_uploader()
+            mark_upload_state('idle', cfg, error='')
 
+        logging.info(f"数据出口就绪：{describe_targets(cfg)}")
+
+        # ==================== 阶段 3：启动数据源（后起，一起来就有数据）====================
         if mode == 'serial':
             logging.info("进入串口模式")
             port, baud = detect_serial(cfg)
-            if port and baud:
-                cfg['serial_port'], cfg['baud_rate'] = port, baud
-                try:
-                    ser = serial.Serial(port=port, baudrate=baud, timeout=1)
-                except Exception as e:
-                    logging.error(f"打开串口失败: {e}")
-                    time.sleep(5)
-                    return
-                try:
-                    caster = open_caster(cfg)
-                except Exception as e:
-                    logging.error(f"打开Caster失败: {e}")
-                    time.sleep(5)
-                    return
-
-                upload_thread = threading.Thread(
-                    target=upload_via_serial,
-                    args=(ser, caster, cfg, thread_exit_event),
-                    daemon=True
-                )
-                upload_thread.start()
-                worker_thread = upload_thread
-
-                while not restart_event.is_set() and not shutdown_event.is_set():
-                    time.sleep(1)
-            else:
+            if not (port and baud):
                 logging.warning("未检测到有效串口，5秒后重试")
                 time.sleep(5)
+                return
+            cfg['serial_port'], cfg['baud_rate'] = port, baud
+            try:
+                ser = serial.Serial(port=port, baudrate=baud, timeout=1)
+            except Exception as e:
+                logging.error(f"打开串口失败: {e}")
+                time.sleep(5)
+                return
+
+            source_thread = threading.Thread(
+                target=upload_via_serial,
+                args=(ser, cfg, thread_exit_event),
+                daemon=True
+            )
+            source_thread.start()
+            worker_thread = source_thread
 
         elif mode == 'relay':
             logging.info("进入中继模式")
@@ -554,27 +577,23 @@ def run_once():
                 logging.error(f"打开中继连接失败: {e}")
                 time.sleep(5)
                 return
-            try:
-                caster = open_caster(cfg)
-            except Exception as e:
-                logging.error(f"打开上传Caster失败: {e}")
-                time.sleep(5)
-                return
 
-            forward_thread = threading.Thread(
+            source_thread = threading.Thread(
                 target=forward_relay,
-                args=(relay, caster, cfg, thread_exit_event),
+                args=(relay, cfg, thread_exit_event),
                 daemon=True
             )
-            forward_thread.start()
-            worker_thread = forward_thread
-
-            while not restart_event.is_set() and not shutdown_event.is_set():
-                time.sleep(1)
+            source_thread.start()
+            worker_thread = source_thread
 
         else:
             logging.error(f"未知模式: {mode}")
             time.sleep(5)
+            return
+
+        # ==================== 阶段 4：等待重启 / 退出信号 ====================
+        while not restart_event.is_set() and not shutdown_event.is_set():
+            time.sleep(1)
 
     except ThreadExitRequested:
         logging.info("检测到重启/退出信号，提前结束本轮运行")
@@ -583,49 +602,35 @@ def run_once():
         time.sleep(5)
 
     finally:
+        # ==================== 停机：严格按启动的逆序 ====================
+        # 1) 先停数据源：不再产生新数据，避免"源还在推、出口已关"的报错
         thread_exit_event.set()
-        stop_local_caster()
-        stop_serial_bridge()
-        threads_to_join = []
-        # 现在这些变量都已初始化，不会出现未定义错误
-        if upload_thread and upload_thread.is_alive():
-            threads_to_join.append((upload_thread, "串口上传"))
-        if forward_thread and forward_thread.is_alive():
-            threads_to_join.append((forward_thread, "中继转发"))
-
-        timeout = 5
-        start_time = time.time()
-        clean_exit = True
-
-        for thread, name in threads_to_join:
-            remaining = max(0, timeout - (time.time() - start_time))
-            if remaining > 0:
-                thread.join(remaining)
-            if thread.is_alive():
-                # 关键：不再无条件清除退出信号。
-                # 老线程会在下一次循环检查时看到信号并自行退出；
-                # 只要它还活着，worker_thread 就保留，下一轮 run_once 会被守卫拦住。
-                logging.warning(f"{name}线程未在超时时间内退出，将继续等待其自行结束")
-                clean_exit = False
-
-        if clean_exit:
+        if source_thread is not None and source_thread.is_alive():
+            source_thread.join(5)
+        if source_thread is None or not source_thread.is_alive():
             worker_thread = None
+        else:
+            # 关键：不再无条件清除退出信号。老线程会在下一次循环检查时看到信号并自行退出；
+            # 只要它还活着，worker_thread 就保留，下一轮 run_once 会被守卫拦住。
+            logging.warning("数据源线程未在超时时间内退出，将继续等待其自行结束")
 
-        if ser:
+        # 2) 再停出口：上传 → 数传 → 本地 Caster
+        #    本地 Caster 最后停，让内网客户端尽量晚一刻断流。
+        stop_caster_uploader()
+        stop_serial_bridge()
+        stop_local_caster()
+
+        # 3) 关闭数据源自己持有的句柄
+        if ser is not None:
             try:
                 ser.close()
             except Exception as e:
                 logging.error(f"关闭串口时出错: {e}")
-        if relay:
+        if relay is not None:
             try:
                 relay.close()
             except Exception as e:
                 logging.error(f"关闭中继连接时出错: {e}")
-        if caster:
-            try:
-                caster.close()
-            except Exception as e:
-                logging.error(f"关闭Caster连接时出错: {e}")
 
         if restart_event.is_set():
             logging.info("接收到重启指令，等待所有资源关闭后重新加载配置")
@@ -820,50 +825,68 @@ def validate_config(cfg):
     def warn(message):
         _log_validate_problem('warning', message)
 
-    # 1. 首先检查运行模式是否有效
-    mode = cfg.get('mode', 'none')
+    # ========== 第一层：数据源（三选一） ==========
+    # 三个数据出口各自一个独立开关，只有「已勾选」的出口才校验其必填项；
+    # 未勾选的字段即使数据库里残留着历史值，也一律不校验、不连接。
+    mode = cfg.get('mode', 'none') or 'none'
+    caster_on = str(cfg.get('caster_enabled', '0')) == '1'
+    local_caster_on = str(cfg.get('local_caster_enabled', '0')) == '1'
+    radio_on = str(cfg.get('radio_enabled', '0')) == '1'
+
     if mode == 'none':
-        err("请在Web页面配置程序运行模式为（串口/中继）")
+        # 这不是错误：用户还没在配置页选数据源。程序保持运行（网页/改密仍可用），
+        # 只是不往下启动任何数据模块，安静等待配置。
+        _log_validate_problem('warning', '尚未选择数据源（串口 / 中继），等待在 Web 配置页完成配置')
         return False
-    if mode not in ['serial', 'relay']:
+    if mode not in ('serial', 'relay'):
         err(f"无效的运行模式: {mode}，请选择串口或中继模式")
         return False
 
-    # 2. 检查两种模式的公共必填参数（Caster相关配置）
-    #    例外1：如果只是想让本机充当本地 Caster（不开上传），caster_host 可以留空，
-    #          此时 open_caster() 返回一个空实现，数据只往本地 Caster 分发。
-    #    例外2：如果开启了数传透传（radio），数据有独立出口，同样不强制要求上传 Caster。
-    #          三种出口（上传 Caster / 本地 Caster / 数传透传）至少有一个即可。
-    local_caster_on = str(cfg.get('local_caster_enabled', '0')) == '1'
-    radio_on = str(cfg.get('radio_enabled', '0')) == '1'
-    if not cfg.get('caster_host') and not local_caster_on and not radio_on:
-        err("NTRIP Caster服务器地址未配置，请补充（或至少开启本地 Caster / 数传透传其中一个数据出口）")
-        return False
-    if cfg.get('caster_host') and not cfg.get('caster_mountpoint'):
-        err("NTRIP Caster挂载点未配置，请补充")
-        return False
-    if cfg.get('caster_host'):
+    # ========== 第二层：数据出口（勾了谁才校验谁） ==========
+    # 出口 1：上传到云端 NTRIP Caster
+    if caster_on:
+        if not (cfg.get('caster_host') or '').strip():
+            err("已勾选「上传到云端 Caster」，请填写上传地址")
+            return False
+        if not (cfg.get('caster_mountpoint') or '').strip():
+            err("已勾选「上传到云端 Caster」，请填写挂载点")
+            return False
         try:
-            if int(cfg.get('caster_port', 0)) <= 0 or int(cfg.get('caster_port', 0)) > 65535:
-                err("NTRIP Caster端口号无效，必须是1-65535之间的整数")
-                return False
+            p = int(cfg.get('caster_port') or 0)
+            if p <= 0 or p > 65535:
+                raise ValueError
         except (ValueError, TypeError):
-            err("NTRIP Caster端口号必须是有效的整数")
+            err("上传 Caster 端口号无效，必须是1-65535之间的整数")
             return False
 
-    # 本地 Caster 端口校验（开启时才校验）
+    # 出口 2：本地 NTRIP Caster
     if local_caster_on:
         try:
-            p = int(cfg.get('local_caster_port', 0))
+            p = int(cfg.get('local_caster_port') or 0)
             if p <= 0 or p > 65535:
-                err("本地 Caster 端口号无效，必须是1-65535之间的整数")
-                return False
+                raise ValueError
         except (ValueError, TypeError):
-            err("本地 Caster 端口号必须是有效的整数")
+            err("本地 Caster 端口号无效，必须是1-65535之间的整数")
             return False
         if not (cfg.get('local_caster_host') or '').strip():
             err("本地 Caster 监听地址未配置，可填 0.0.0.0 表示所有网卡")
             return False
+
+    # 出口 3：无线电数传透传
+    if radio_on:
+        if not (cfg.get('radio_port') or '').strip():
+            err("已勾选「无线电数传」，请填写数传串口")
+            return False
+        try:
+            if int(cfg.get('radio_baud') or 0) <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            err("数传波特率无效，必须是正整数")
+            return False
+
+    # 零出口：允许运行——数据仍会被解析并显示在监控页（看星数、星历等），只是不向外分发
+    if not (caster_on or local_caster_on or radio_on):
+        warn("未勾选任何数据出口，数据只用于本地监控显示，不会向外分发")
 
     # 3. 根据不同模式检查专属必填参数
     if mode == 'serial':
@@ -1065,9 +1088,15 @@ class _NullCaster:
         return None
 
 
+# ==================== 以下为已废弃（deprecated）的上传连接实现 ====================
+# 上传出口现已由 CasterUploader（独立线程 + 队列）接管，运行路径不再调用
+# open_caster / _NullCaster / reconnect_caster。保留仅为参考与平滑过渡，
+# 后续版本可安全删除。判定"是否启用上传"一律看 caster_enabled 独立开关。
 def open_caster(cfg):
-    if not cfg.get('caster_host'):
-        logging.info("未配置上传端 Caster，数据由本地 Caster / 数传透传等本地出口对外发布")
+    # 判定只看独立开关，不看"地址是否为空"：
+    # 地址是用户填过的历史配置，不代表他这次想启用上传。未勾选就绝不去连。
+    if str(cfg.get('caster_enabled', '0')) != '1':
+        logging.info("未勾选「上传到云端 Caster」，数据只走本地出口")
         mark_upload_state('idle', cfg, error='')
         return _NullCaster()
     logging.info(f">>>向上传端NTRIP Caster 申请连接{cfg['caster_host']}:{cfg['caster_port']}")
@@ -1306,14 +1335,25 @@ def config_page():
 
             new_cfg = {"mode": mode}
 
-            # 本地 Caster 设置与运行模式无关，任何模式下都能开
+            # ===== 三个数据出口与运行模式完全解耦 =====
+            # 任何模式下这三个开关都独立生效：勾了才启动，不勾就绝不连接。
+            # 出口 1：上传到云端 NTRIP Caster
+            new_cfg.update({
+                "caster_enabled": "1" if form_data.get('caster_enabled') else "0",
+                "caster_host": (form_data.get('caster_host') or '').strip(),
+                "caster_port": (form_data.get('caster_port') or '').strip() or '2101',
+                "caster_mountpoint": (form_data.get('caster_mountpoint') or '').strip(),
+                "caster_password": form_data.get('caster_password', ''),
+            })
+
+            # 出口 2：本地 NTRIP Caster
             new_cfg.update({
                 "local_caster_enabled": "1" if form_data.get('local_caster_enabled') else "0",
                 "local_caster_host": (form_data.get('local_caster_host') or '').strip() or '0.0.0.0',
                 "local_caster_port": (form_data.get('local_caster_port') or '').strip() or '2101',
             })
 
-            # 数传透传设置同样与运行模式、本地 Caster 完全解耦，任何模式下都能开
+            # 出口 3：无线电数传透传
             radio_baud = (form_data.get('radio_baud') or '').strip() or '115200'
             new_cfg.update({
                 "radio_enabled": "1" if form_data.get('radio_enabled') else "0",
@@ -1321,26 +1361,19 @@ def config_page():
                 "radio_baud": radio_baud,
             })
 
+            # ===== 数据源：只有当前模式对应的字段才保存 =====
             if mode == 'serial':
                 new_cfg.update({
-                    "serial_port": form_data.get('serial_port', ''),
-                    "baud_rate": form_data.get('baud_rate', ''),
-                    "caster_host": form_data.get('caster_host', ''),
-                    "caster_port": form_data.get('caster_port', '2101'),
-                    "caster_mountpoint": form_data.get('caster_mountpoint', ''),
-                    "caster_password": form_data.get('caster_password', '')
+                    "serial_port": (form_data.get('serial_port') or '').strip(),
+                    "baud_rate": (form_data.get('baud_rate') or '').strip(),
                 })
             elif mode == 'relay':
                 new_cfg.update({
-                    "relay_host": form_data.get('relay_host', ''),
-                    "relay_port": form_data.get('relay_port', '2101'),
-                    "relay_mountpoint": form_data.get('relay_mountpoint', ''),
-                    "relay_user": form_data.get('relay_user', ''),
+                    "relay_host": (form_data.get('relay_host') or '').strip(),
+                    "relay_port": (form_data.get('relay_port') or '').strip() or '2101',
+                    "relay_mountpoint": (form_data.get('relay_mountpoint') or '').strip(),
+                    "relay_user": (form_data.get('relay_user') or '').strip(),
                     "relay_password": form_data.get('relay_password', ''),
-                    "caster_host": form_data.get('caster_host', ''),
-                    "caster_port": form_data.get('caster_port', '2101'),
-                    "caster_mountpoint": form_data.get('caster_mountpoint', ''),
-                    "caster_password": form_data.get('caster_password', '')
                 })
 
             logging.info(f"保存的配置信息: {mask_config(new_cfg)}")
@@ -2034,12 +2067,16 @@ class SerialBridge:
         返回 True 表示线程已启动（含"串口尚未打开、后台持续重试"的情况）。
         """
         self._running = True
-        self._thread = threading.Thread(target=self._send_loop, name='radio-bridge', daemon=True)
-        self._thread.start()
+        # 先同步打开一次串口，再起线程。
+        # 原先是在线程 start() 之后立刻读 self._connected——那时 _send_loop 还没跑到 _open()，
+        # _connected 必然是 False，于是串口明明正常也会打印"未打开，将持续重试"，误导排查。
+        self._open()
         if self._connected:
             logging.info(f"数传透传已启动：{self.port} @ {self.baud}bps（单向广播，只发不收）")
         else:
             logging.warning(f"数传透传已启用但串口未打开，将持续重试：{self.port} @ {self.baud}")
+        self._thread = threading.Thread(target=self._send_loop, name='radio-bridge', daemon=True)
+        self._thread.start()
         return True
 
     def stop(self):
@@ -2241,6 +2278,332 @@ def serial_bridge_snapshot() -> dict:
         }
     info['enabled'] = enabled
     return info
+
+
+# ==================== 上传出口：云端 NTRIP Caster（Caster Uploader） ====================
+# 历史问题（本次修复的核心）：原先 caster.sendall() 直接写在数据源循环里，
+# 上传端一旦超时/断线，重连的 while 循环就把整个数据源循环卡住——
+# 表现为"上传挂了，本地 Caster 和数传同时断流"。
+#
+# 现在的结构：独立线程 + 有界队列。数据源只做一次非阻塞 put_nowait，
+# TCP 建连、NTRIP SOURCE 握手、推流、断线重连全部在本线程内完成。
+# 上传端怎么超时重连，都不影响数据源读取和其他两个出口。
+CASTER_QUEUE_SIZE = 512            # 待发帧上限，满了丢最旧（上传慢时保护内存）
+CASTER_RECONNECT_INTERVAL = 5.0    # 断线重连基础间隔（秒）
+
+
+class CasterUploader:
+    """把 RTCM 字节流推送到上游 NTRIP Caster（NTRIP 1.0 / 2.0 的 SOURCE 协议）。"""
+
+    def __init__(self, cfg):
+        self._host = (cfg.get('caster_host') or '').strip()
+        self._port = str(cfg.get('caster_port') or '2101')
+        self._mountpoint = (cfg.get('caster_mountpoint') or '').strip()
+        self._password = cfg.get('caster_password') or ''
+        self._sock = None
+        self._thread = None
+        self._running = False
+        self._outbox = queue.Queue(maxsize=CASTER_QUEUE_SIZE)
+        self._authed = False
+        self._state = 'idle'
+        self._state_text = UPLOAD_STATE_TEXT.get('idle', '未配置')
+        self._last_error = ''
+        self._sent_bytes = 0
+        self._sent_frames = 0
+        self._reconnects = 0
+        self._session_start = 0.0
+        self._rate_last_time = 0.0
+        self._rate_last_bytes = 0
+        self._rate_bps = 0
+        self._lock = threading.Lock()
+
+    # ---------- 生命周期 ----------
+    def start(self) -> bool:
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, name='caster-upload', daemon=True)
+        self._thread.start()
+        logging.info(f"上传出口已启动：{self.target()}（独立线程，断线自动重连）")
+        return True
+
+    def stop(self):
+        self._running = False
+        self._close()
+        # 清空待发队列，避免下次启动把旧数据灌给上游
+        try:
+            while True:
+                self._outbox.get_nowait()
+        except queue.Empty:
+            pass
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(3)
+        self._thread = None
+
+    # ---------- 数据入口（非阻塞，永不拖慢调用方） ----------
+    def feed(self, data: bytes):
+        if not data or not self._running:
+            return
+        try:
+            self._outbox.put_nowait(data)
+        except queue.Full:
+            # 上传链路太慢导致积压：丢最旧，保证送出去的是最新差分
+            try:
+                self._outbox.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._outbox.put_nowait(data)
+            except queue.Full:
+                pass
+
+    # ---------- 对外状态 ----------
+    def target(self) -> str:
+        return f"{self._host}:{self._port}/{self._mountpoint}"
+
+    def status(self) -> dict:
+        with self._lock:
+            session = (time.time() - self._session_start) if self._session_start else 0.0
+            return {
+                'enabled': True,
+                'state': self._state,
+                'state_text': self._state_text,
+                'host': self._host,
+                'port': self._port,
+                'mountpoint': self._mountpoint,
+                'target': self.target(),
+                'sent_bytes': self._sent_bytes,
+                'sent_frames': self._sent_frames,
+                'rate_bps': self._rate_bps,
+                'reconnects': self._reconnects,
+                'last_error': self._last_error,
+                'session_time': format_duration(session),
+                'queue_size': self._outbox.qsize(),
+            }
+
+    # ---------- 内部 ----------
+    def _set_state(self, state: str, error: str = None):
+        with self._lock:
+            self._state = state
+            self._state_text = UPLOAD_STATE_TEXT.get(state, state)
+            if error is not None:
+                self._last_error = error
+            if state == 'authed':
+                self._session_start = time.time()
+            elif state in ('idle', 'connecting', 'retrying', 'error'):
+                self._session_start = 0.0
+
+    def _close(self):
+        with self._lock:
+            sock = self._sock
+            self._sock = None
+            self._authed = False
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _sleep(self, seconds: float):
+        """可被 stop() 快速打断的 sleep（不依赖全局事件，本模块独立生命周期）。"""
+        end = time.time() + max(0.0, seconds)
+        while self._running and time.time() < end:
+            time.sleep(min(0.2, max(0.0, end - time.time())))
+
+    def _connect(self) -> bool:
+        """TCP 建连 + NTRIP SOURCE 握手。成功返回 True，失败不抛异常。"""
+        self._set_state('connecting')
+        try:
+            sock = connect_to_host(self._host, int(self._port))
+        except Exception as e:
+            self._set_state('retrying', error=str(e))
+            logging.error(f"上传出口连接失败：{e}")
+            return False
+
+        hdr = (
+            f"SOURCE {self._password} {self._mountpoint}\r\n"
+            "Source-Agent: NTRIP 2RTKserver\r\n"
+            "STR: \r\n\r\n"
+        )
+        try:
+            sock.settimeout(NTRIP_HANDSHAKE_TIMEOUT)
+            sock.sendall(hdr.encode())
+            resp = sock.recv(1024).decode(errors='ignore')
+        except Exception as e:
+            self._set_state('retrying', error=str(e))
+            logging.error(f"上传出口握手失败：{e}")
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return False
+
+        if 'ICY 200 OK' not in resp and '200 OK' not in resp:
+            head = (resp.splitlines() or ['无响应'])[0]
+            self._set_state('error', error=f"认证失败：{head}")
+            logging.error(f"上传 Caster 认证失败，响应：{resp.splitlines()[:3]}")
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return False
+
+        try:
+            sock.settimeout(CASTER_WRITE_TIMEOUT)
+        except Exception:
+            pass
+
+        with self._lock:
+            self._sock = sock
+            self._authed = True
+            self._sent_bytes = 0
+            self._sent_frames = 0
+            self._rate_last_time = time.time()
+            self._rate_last_bytes = 0
+            self._rate_bps = 0
+        self._set_state('authed')
+        logging.info(f"上传出口认证通过，开始推送：{self.target()}")
+        return True
+
+    def _retry_connect(self):
+        while self._running and self._sock is None:
+            if self._connect():
+                return
+            self._sleep(CASTER_RECONNECT_INTERVAL)
+
+    def _loop(self):
+        # 首次建连：失败就退避重试，直到成功或收到停止信号
+        while self._running and self._sock is None:
+            if self._connect():
+                break
+            self._sleep(CASTER_RECONNECT_INTERVAL)
+
+        while self._running:
+            try:
+                data = self._outbox.get(timeout=0.5)
+            except queue.Empty:
+                if self._sock is None and self._running:
+                    self._retry_connect()
+                continue
+
+            # 锁内取快照，避免与 stop()/重连并发把 self._sock 置 None 后仍去 sendall
+            with self._lock:
+                sock = self._sock
+            if sock is None:
+                # 连接不可用：直接丢弃这一帧，后台继续重连
+                continue
+
+            try:
+                sock.sendall(data)
+                with self._lock:
+                    self._sent_bytes += len(data)
+                    self._sent_frames += 1
+                self._tick_rate()
+            except Exception as e:
+                logging.error(f"上传出口发送失败：{e}")
+                with self._lock:
+                    self._reconnects += 1
+                self._set_state('retrying', error=str(e))
+                self._close()
+                self._retry_connect()
+        self._close()
+
+    def _tick_rate(self):
+        now = time.time()
+        with self._lock:
+            if now - self._rate_last_time >= 2.0:
+                elapsed = now - self._rate_last_time
+                if elapsed > 0:
+                    self._rate_bps = int((self._sent_bytes - self._rate_last_bytes) / elapsed)
+                self._rate_last_time = now
+                self._rate_last_bytes = self._sent_bytes
+
+
+caster_uploader: Optional['CasterUploader'] = None
+
+
+def start_caster_uploader(cfg) -> Optional['CasterUploader']:
+    """按独立开关启动上传出口；未勾选则什么都不做。"""
+    global caster_uploader
+    stop_caster_uploader()
+    if str(cfg.get('caster_enabled', '0')) != '1':
+        logging.info("未勾选「上传到云端 Caster」，跳过启动")
+        return None
+    if not (cfg.get('caster_host') or '').strip():
+        logging.warning("已勾选上传出口但未填地址，跳过启动")
+        return None
+    up = CasterUploader(cfg)
+    up.start()
+    caster_uploader = up
+    return up
+
+
+def stop_caster_uploader():
+    global caster_uploader
+    if caster_uploader is not None:
+        caster_uploader.stop()
+        caster_uploader = None
+        logging.info("上传出口已停止")
+
+
+def feed_caster_uploader(data: bytes):
+    """把数据投递给上传出口（未启用时是空操作）。"""
+    if caster_uploader is not None:
+        caster_uploader.feed(data)
+
+
+# ==================== M0 统一数据分发器 ====================
+def distribute(data: bytes):
+    """把一路 RTCM 数据扇出给所有「已启用」的出口 + 解析线程。
+
+    设计约束（这是整个架构改造的核心）：
+      1. 永不阻塞：所有出口都是"队列投递"或"内存扇出"，本函数不做任何网络/串口 IO。
+      2. 永不抛错：每个出口单独 try/except，一个出口异常绝不影响其他出口。
+      3. 顺序固定：本地 Caster 与数传在前（本地优先，外网断了本地仍可用），
+         上传出口在后（远端可能慢），解析缓冲最后（纯内存，最不可能失败）。
+
+    数据源（串口 / 中继）只调这一个函数，不再关心有哪几个出口、谁先谁后。
+    """
+    if not data:
+        return
+
+    # 出口 1：本地 NTRIP Caster —— 纯内存扇出
+    try:
+        publish_to_local_caster(data)
+    except Exception as e:
+        logging.error(f"分发到本地 Caster 失败：{e}")
+
+    # 出口 2：无线电数传 —— 入有界队列，满则丢最旧
+    try:
+        publish_to_serial_bridge(data)
+    except Exception as e:
+        logging.error(f"分发到数传出口失败：{e}")
+
+    # 出口 3：上传云端 Caster —— 仅入队，所有 IO 在独立线程完成
+    try:
+        feed_caster_uploader(data)
+    except Exception as e:
+        logging.error(f"分发到上传出口失败：{e}")
+
+    # 分支 4：RTCM 解析 —— 仅写内存缓冲，由常驻解析线程消费
+    try:
+        upload_data(data)
+    except Exception as e:
+        logging.error(f"分发到解析缓冲失败：{e}")
+
+
+def describe_targets(cfg) -> str:
+    """把「已启用」的出口拼成一句话，用于状态页和控制台显示。
+
+    未勾选的出口不会出现在这里——即使数据库里存着历史地址。
+    """
+    parts = []
+    if str(cfg.get('caster_enabled', '0')) == '1' and cfg.get('caster_host'):
+        parts.append(f"上传 {cfg.get('caster_host')}:{cfg.get('caster_port')}"
+                     f"/{cfg.get('caster_mountpoint')}")
+    if str(cfg.get('local_caster_enabled', '0')) == '1':
+        parts.append(f"本地 Caster {cfg.get('local_caster_host')}:{cfg.get('local_caster_port')}")
+    if str(cfg.get('radio_enabled', '0')) == '1':
+        parts.append(f"数传 {cfg.get('radio_port')}")
+    return " + ".join(parts) if parts else "仅本地监控（未启用任何出口）"
 
 
 def local_caster_snapshot() -> dict:
@@ -2487,9 +2850,8 @@ def upload_data(data):
             logging.warning(f"RTCM缓冲区溢出，丢弃最旧的 {overflow} 字节")
             del rtcm_buffer[:overflow]
         rtcm_buffer.extend(data)
-
-    # 上传端链路统计（节流到每秒更新一次，避免每次字节都重算速率）
-    _tick_upload_stats(len(data))
+    # 注意：这里不再做"上传统计"。原先把"进入解析缓冲的字节"记成"已上传字节"，
+    # 语义是错的（没开上传出口时也会累加）。真正的发送量由 CasterUploader 线程统计。
 
 
 def _tick_upload_stats(byte_count: int):
@@ -2702,23 +3064,22 @@ def reconnect_caster(cfg):
     
 
 # 通过串口上传数据
-def upload_via_serial(ser, caster, cfg, thread_exit_event):
+def upload_via_serial(ser, cfg, thread_exit_event):
+    """串口数据源：只负责「读串口 → 交给 distribute()」。
+
+    注意这里不再有任何 caster.sendall / 重连逻辑——那正是历史上
+    "上传端一卡住，串口读取停摆、本地 Caster 和数传一起断流"的根因。
+    推流、握手、断线重连全部由 CasterUploader 在自己的线程里完成。
+    """
     program_start = time.time()
     last_clear = program_start
     last_status_update = program_start
     total_bytes = 0
-    global run_status
 
-    run_status = {
-        "mode": "串口模式",
-        "data_source": f"{cfg['serial_port']} @ {cfg['baud_rate']}bps",
-        # 未配置上传端时（只做本地 Caster），别显示成 ":/" 这种空串
-        "target_caster": (f"{cfg['caster_host']}:{cfg['caster_port']}/{cfg['caster_mountpoint']}"
-                          if cfg.get('caster_host') else "不上传（仅本地 Caster）"),
-        "data_sent": "0B",
-        "run_time": "0h 0m 0s"
-    }
-
+    # 增量更新，不整体替换全局 dict：避免覆盖其他模块写入的 radio / local_caster 字段
+    run_status["mode"] = "串口模式"
+    run_status["data_source"] = f"{cfg['serial_port']} @ {cfg['baud_rate']}bps"
+    run_status["target_caster"] = describe_targets(cfg)
     push_run_status()
 
     while not thread_exit_event.is_set():
@@ -2745,42 +3106,9 @@ def upload_via_serial(ser, caster, cfg, thread_exit_event):
                 time.sleep(0.2)
                 continue
 
-            # 先分发给本地 Caster 的客户端：即使后面上传端挂了，本地依然有差分数据
-            publish_to_local_caster(data)
-            # 同一路数据再透传一份给数传电台（未启用时空操作，永不影响主链路）
-            publish_to_serial_bridge(data)
+            # 统一分发：本地 Caster / 数传 / 上传 / 解析，四路互相独立且全部非阻塞
+            distribute(data)
 
-            try:
-                caster.sendall(data)
-            except Exception as send_err:
-                logging.error(f"caster发送失败: {send_err}")
-                mark_upload_state('retrying', cfg, error=str(send_err), reconnect=True)
-                # 关闭旧连接
-                try:
-                    caster.close()
-                except:
-                    pass
-                
-                # 循环重试直到重连成功
-                caster = None
-                while caster is None and not thread_exit_event.is_set():
-                    try:
-                        caster = reconnect_caster(cfg)
-                        logging.info("caster重连成功")
-                    except ThreadExitRequested:
-                        break
-                    except Exception as reconnect_err:
-                        logging.error(f"caster重连失败: {reconnect_err}")
-                        if interruptible_sleep(15):
-                            break
-                
-                # 如果重连成功，继续处理数据
-                if caster:
-                    continue
-                else:  # 如果重连失败且收到退出信号
-                    break
-
-            upload_data(data)
             total_bytes += len(data)
 
             now = time.time()
@@ -2788,9 +3116,9 @@ def upload_via_serial(ser, caster, cfg, thread_exit_event):
                 clear_screen()
                 print(ART_LOGO)
                 print(f"串口模式: {cfg['serial_port']} @ {cfg['baud_rate']}bps")
-                print(f"上传到: {cfg['caster_host']}:{cfg['caster_port']}/{cfg['caster_mountpoint']}")
+                print(f"数据出口: {describe_targets(cfg)}")
                 print(f"运行时间: {format_duration(now - program_start)}")
-                print(f"发送数据量: {format_bytes(total_bytes)}")
+                print(f"读取数据量: {format_bytes(total_bytes)}")
                 last_clear = now
 
             if now - last_status_update > 2:
@@ -2804,38 +3132,34 @@ def upload_via_serial(ser, caster, cfg, thread_exit_event):
             try:
                 if ser:
                     ser.close()
-            except:
+            except Exception:
                 pass
             ser = None
             time.sleep(3)
 
-    # 退出前关闭"本次运行中重连出来的"新连接。
-    # run_once 的 finally 只会关闭它自己持有的那份引用，重连后的新 socket 之前是漏掉的。
-    for sock_obj in (caster, ser):
-        if sock_obj is not None:
-            try:
-                sock_obj.close()
-            except Exception:
-                pass
+    # 退出时只关自己持有的串口；上传连接由 CasterUploader 自己关闭
+    if ser is not None:
+        try:
+            ser.close()
+        except Exception:
+            pass
 
 
-def forward_relay(relay, caster, cfg, thread_exit_event):
+def forward_relay(relay, cfg, thread_exit_event):
+    """中继数据源：只负责「从上游拉 RTCM → 交给 distribute()」。
+
+    与串口模式的唯一区别就是数据从哪来；拿到数据之后的分发路径完全一致。
+    同样不再持有 caster 连接 —— 上传由 CasterUploader 的独立线程负责。
+    """
     program_start = time.time()
     last_clear = program_start
     last_recv = program_start
     last_status_update = program_start
     total_bytes = 0
-    global run_status
 
-    run_status = {
-        "mode": "中继模式",
-        "data_source": f"{cfg['relay_host']}:{cfg['relay_port']}/{cfg['relay_mountpoint']}",
-        # 未配置上传端时（只做本地 Caster），别显示成 ":/" 这种空串
-        "target_caster": (f"{cfg['caster_host']}:{cfg['caster_port']}/{cfg['caster_mountpoint']}"
-                          if cfg.get('caster_host') else "不上传（仅本地 Caster）"),
-        "data_sent": "0B",
-        "run_time": "0h 0m 0s"
-    }
+    run_status["mode"] = "中继模式"
+    run_status["data_source"] = f"{cfg['relay_host']}:{cfg['relay_port']}/{cfg['relay_mountpoint']}"
+    run_status["target_caster"] = describe_targets(cfg)
     push_run_status()
 
     while not thread_exit_event.is_set():
@@ -2856,35 +3180,8 @@ def forward_relay(relay, caster, cfg, thread_exit_event):
             if data:
                 last_recv = time.time()
                 total_bytes += len(data)
-                # 先分发给本地 Caster，避免上传端重连期间本地客户端断流
-                publish_to_local_caster(data)
-                # 同一路数据再透传一份给数传电台（未启用时空操作）
-                publish_to_serial_bridge(data)
-                try:
-                    caster.sendall(data)
-                except Exception as send_err:
-                    logging.error(f"发送数据到 Caster 失败: {send_err}")
-                    mark_upload_state('retrying', cfg, error=str(send_err), reconnect=True)
-                    # 关闭旧的caster连接
-                    try:
-                        caster.close()
-                    except:
-                        pass
-                    
-                    # 重新连接caster
-                    caster = None
-                    while caster is None and not thread_exit_event.is_set():
-                        try:
-                            caster = open_caster(cfg)
-                            logging.info("Caster重新连接成功")
-                        except ThreadExitRequested:
-                            break
-                        except Exception as e:
-                            logging.error(f"Caster重新连接失败: {e}")
-                            if interruptible_sleep(15):
-                                break
-                
-                upload_data(data)
+                # 与串口模式完全相同的统一分发路径
+                distribute(data)
             elif eof:
                 # 对端主动断开：立刻重连，不必等满 120 秒
                 logging.warning("中继连接已被对端关闭，立即重新连接")
@@ -2911,10 +3208,10 @@ def forward_relay(relay, caster, cfg, thread_exit_event):
             if current_time - last_clear > 100:
                 clear_screen()
                 print(ART_LOGO)
-                print(f"模式: 中继relay 数据源:{cfg['relay_host']}:{cfg['relay_port']}/{cfg['relay_mountpoint']}")
-                print(f"目的地: {cfg['caster_host']}:{cfg['caster_port']}/{cfg['caster_mountpoint']}")
-                print(f"已发送时间: {format_duration(current_time - program_start)}")
-                print(f"转发数据量: {format_bytes(total_bytes)}")
+                print(f"中继模式: {cfg['relay_host']}:{cfg['relay_port']}/{cfg['relay_mountpoint']}")
+                print(f"数据出口: {describe_targets(cfg)}")
+                print(f"运行时间: {format_duration(current_time - program_start)}")
+                print(f"接收数据量: {format_bytes(total_bytes)}")
                 last_clear = current_time
 
             if current_time - last_status_update > 2:
@@ -2927,41 +3224,30 @@ def forward_relay(relay, caster, cfg, thread_exit_event):
             break
         except Exception as e:
             logging.error(f"中继模式错误: {str(e)}")
-            # 同时重新连接relay和caster
+            # 只重连数据源本身。上传出口有自己的重连循环，互不牵连。
+            try:
+                if relay is not None:
+                    relay.close()
+            except Exception:
+                pass
             relay = None
-            caster = None
-            
-            # 先重新连接relay
             while relay is None and not thread_exit_event.is_set():
                 try:
                     relay = open_relay(cfg)
-                    logging.info("Relay重新连接成功")
+                    logging.info("中继数据源重新连接成功")
                 except ThreadExitRequested:
                     break
                 except Exception as e2:
-                    logging.error(f"Relay重新连接失败: {e2}")
+                    logging.error(f"中继数据源重新连接失败: {e2}")
                     if interruptible_sleep(15):
                         break
 
-            # 再重新连接caster
-            while caster is None and not thread_exit_event.is_set() and relay is not None:
-                try:
-                    caster = open_caster(cfg)
-                    logging.info("Caster重新连接成功")
-                except ThreadExitRequested:
-                    break
-                except Exception as e2:
-                    logging.error(f"Caster重新连接失败: {e2}")
-                    if interruptible_sleep(15):
-                        break
-
-    # 退出前关闭本次运行中重连出来的新连接
-    for sock_obj in (relay, caster):
-        if sock_obj is not None:
-            try:
-                sock_obj.close()
-            except Exception:
-                pass
+    # 退出时只关自己持有的中继连接
+    if relay is not None:
+        try:
+            relay.close()
+        except Exception:
+            pass
 
 def main():
     setup_logging()
@@ -2997,9 +3283,14 @@ def main():
         # 1. 先检查配置是否有效
         cfg = get_config()
         if not validate_config(cfg):
-            # 配置无效时每 10 秒检查一次。
-            # 这里不再额外打一条 INFO：validate_config 内部已经会（按 60 秒节流）
-            # 报出具体是哪个字段没配，重复打只会加快日志轮转、冲掉有用信息。
+            # 配置还没配好就安静等待：网页、登录、改密这些功能都照常可用，
+            # 只是不往下启动任何数据模块。validate_config 内部已按 60 秒节流
+            # 打出具体缺哪一项，这里不重复记日志。
+            if (cfg.get('mode') or 'none') == 'none':
+                # 让状态页能明确显示"等待配置"，而不是一片空白
+                run_status['mode'] = '等待配置'
+                run_status['data_source'] = '尚未选择数据源（串口 / 中继）'
+                run_status['target_caster'] = '尚未选择数据出口'
             time.sleep(10)
             continue  # 跳过后续逻辑，直接进入下一次循环
         

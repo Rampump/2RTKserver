@@ -56,7 +56,9 @@ let _lastConfig = null;
 function formatBytes(num) {
   if (num === null || num === undefined || isNaN(num)) return '0 B';
   let n = Number(num);
-  if (n < 1024) return n + ' B';
+  // 速率是浮点数（字节数 / 时间差），1024 以下也要取整，
+  // 否则状态页会显示成 "609.132737367983 B/s" 这种一长串小数。
+  if (n < 1024) return Math.round(n) + ' B';
   const units = ['KB', 'MB', 'GB', 'TB'];
   let i = -1;
   do {
@@ -959,12 +961,18 @@ function updateUploadStatus(info) {
     el.className = 'kv-value' + (kind ? ' is-' + kind : '');
   };
 
-  // 地址 / 挂载点
+  // 地址 / 挂载点：未启用上传出口时一律显示 --，
+  // 不把数据库里的历史残留地址显示成"正在上传"（这是用户当初的困惑点）。
   const host = info.host || '';
   const port = info.port || '';
   const mp = info.mountpoint || '';
-  upTargetEl.textContent = info.target || (host ? `${host}:${port}/${mp}` : '--');
-  upMountpointEl.textContent = mp || '--';
+  if (info.enabled) {
+    upTargetEl.textContent = info.target || (host ? `${host}:${port}/${mp}` : '--');
+    upMountpointEl.textContent = mp || '--';
+  } else {
+    upTargetEl.textContent = '--';
+    upMountpointEl.textContent = '--';
+  }
 
   // 数据统计
   const bytes = Number(info.sent_bytes) || 0;

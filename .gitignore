@@ -6,6 +6,7 @@ nohup.out
 # 首次启动由 init_db() 自动建表并写入 DEFAULT_CONFIG，克隆后无需手工准备。
 2RTKserver.db
 *.db.bak
+*.db.bak*
 *.db.temp
 *.db-wal
 *.db-shm
