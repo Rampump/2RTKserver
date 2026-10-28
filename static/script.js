@@ -1044,7 +1044,12 @@ function updateLocalCaster(info) {
   } else {
     setValue(lcStatusEl, I18N.t('lc.enabled_not_run'), 'warning');
     setValue(lcClientsEl, '--', '');
-    if (lcHintEl) lcHintEl.textContent = I18N.t('lc.enabled_not_run_hint');
+    if (lcHintEl) {
+      // 后端会把启动失败的具体原因带上来（比如 2101 端口被某个 pid 占用），
+      // 直接显示，省得用户去翻 server.log 猜为什么没起来。
+      const base = I18N.t('lc.enabled_not_run_hint');
+      lcHintEl.textContent = info.last_error ? `${base}（${info.last_error}）` : base;
+    }
   }
 }
 

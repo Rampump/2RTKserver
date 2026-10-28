@@ -196,6 +196,216 @@ def get_local_ip():
     except:
         return "localhost"
 
+
+# ==================== 端口占用诊断 ====================
+#
+# 这里有个非常常见的误判，先写在代码里备查：
+#   「中继 / 上传端填的 2101」是**对端端口**。本机出站时由内核分配一个临时端口
+#   （比如 54321），本地根本不会 bind 2101。所以「远端 Caster 用 2101」和
+#   「本地 Caster 监听 2101」并不冲突，两者可以同时存在。
+#
+#   真会报 EADDRINUSE(errno 98) 的只有三种：
+#     1) 上一个进程没退干净，还占着 2101（systemd 重启、网页保存重启时最常见）
+#     2) 本机别的程序占了 2101（str2str / 另一个实例 / 其它 NTRIP 软件）
+#     3) 上传目标写成了本机地址 + 同一个端口（自环，见 check_self_loop）
+#
+#   下面几个函数就是把这三件事在日志和网页里说清楚，而不是只丢一句 errno 98。
+
+
+def find_port_owner(port):
+    """尽力找出监听指定 TCP 端口的进程，返回 'pid 1234 (str2str)' 或 None。
+
+    只在 Linux 有效（读 /proc/net/tcp{,6} 取 socket inode，再反查 /proc/*/fd
+    找到持有它的进程）。只在启动失败、保存校验这类低频路径调用。
+    """
+    if not sys.platform.startswith('linux'):
+        return None
+    inodes = set()
+    for path in ('/proc/net/tcp', '/proc/net/tcp6'):
+        try:
+            with open(path, 'r') as f:
+                next(f, None)  # 跳过表头
+                for line in f:
+                    fields = line.split()
+                    # 表结构：sl local_address rem_address st ... 第 10 列为 inode
+                    # local_address 形如 00000000:08A1（08A1 就是端口）；st == '0A' 表示 LISTEN
+                    if len(fields) < 10 or fields[3] != '0A':
+                        continue
+                    try:
+                        if int(fields[1].rsplit(':', 1)[1], 16) != int(port):
+                            continue
+                    except (IndexError, ValueError):
+                        continue
+                    inodes.add('socket:[%s]' % fields[9])
+        except OSError:
+            continue
+    if not inodes:
+        return None
+    try:
+        pids = os.listdir('/proc')
+    except OSError:
+        return None
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        fd_dir = '/proc/%s/fd' % pid
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue  # 权限不足或进程已退出，跳过
+        for fd in fds:
+            try:
+                link = os.readlink(os.path.join(fd_dir, fd))
+            except OSError:
+                continue
+            if link in inodes:
+                try:
+                    with open('/proc/%s/comm' % pid, 'r') as f:
+                        name = f.read().strip()
+                except OSError:
+                    name = '?'
+                return 'pid %s (%s)' % (pid, name)
+    return None
+
+
+def probe_tcp_port(host, port):
+    """试一下 host:port 现在能不能监听。返回 (可用?, 说明)。
+
+    不可用时说明里尽量带上占用者，例如「被 pid 1234 (str2str) 占用」。
+
+    两个平台用的手段不同：
+      Linux/POSIX —— 直接 bind。加 SO_REUSEADDR 是为了不把 TIME_WAIT 里的旧连接
+                     误判成占用；真正有程序在 listen 时 bind 仍会 EADDRINUSE。
+      Windows     —— bind 探活不可靠（SO_REUSEADDR 语义允许抢端口，bind 照样成功），
+                     所以改成"连一下"：连得上就说明有程序在监听。
+    """
+    port = int(port)
+    host = host or LOCAL_CASTER_HOST
+
+    if os.name == 'nt':
+        target = '127.0.0.1' if host in ('0.0.0.0', '::', '*') else host
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.settimeout(0.3)
+        try:
+            probe.connect((target, port))
+            return False, '被本机某个程序监听（端口已被占用）'
+        except OSError:
+            return True, ''
+        finally:
+            try:
+                probe.close()
+            except OSError:
+                pass
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        return True, ''
+    except OSError as e:
+        owner = find_port_owner(port)
+        return False, ('被 %s 占用' % owner) if owner else str(e)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def local_addresses():
+    """本机可能被写进配置的"自己"的地址集合，用于自环判断。"""
+    ips = {'127.0.0.1', 'localhost', '0.0.0.0', '::1'}
+    try:
+        ip = get_local_ip()
+        if ip:
+            ips.add(ip)
+    except Exception:
+        pass
+    try:
+        hostname = socket.gethostname()
+        ips.add(hostname.lower())
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ips.add(info[4][0])
+    except Exception:
+        pass
+    return ips
+
+
+def check_self_loop(cfg):
+    """检查「出口指向自己」这类必然跑不通的配置，返回一句人话或 None。
+
+    上传：caster_host 是本机 + 端口等于本地 Caster 端口
+          → SOURCE 请求会打到自己刚开的 Caster 上（它只认 GET），现象就是
+            「连上了但一直 timeout」，非常像对端 Caster 有问题，实际是自环。
+    中继：relay_host 是本机 + 端口等于本地 Caster 端口
+          → 从自己身上拉流，原地打转。
+    """
+    if str(cfg.get('local_caster_enabled', '0')) != '1':
+        return None
+    try:
+        lc_port = int(cfg.get('local_caster_port') or LOCAL_CASTER_PORT)
+    except (TypeError, ValueError):
+        return None
+    ips = local_addresses()
+
+    if str(cfg.get('caster_enabled', '0')) == '1':
+        host = (cfg.get('caster_host') or '').strip().lower()
+        try:
+            cport = int(cfg.get('caster_port') or 0)
+        except (TypeError, ValueError):
+            cport = 0
+        if host and host in ips and cport == lc_port:
+            return (f"上传地址 {host}:{cport} 就是本机，且与本地 Caster 端口相同，"
+                    f"数据会推给自己（表现为连上后一直超时）。"
+                    f"请把上传地址改成远端 Caster，或把本地 Caster 端口改成别的值。")
+
+    if cfg.get('mode') == 'relay':
+        host = (cfg.get('relay_host') or '').strip().lower()
+        try:
+            rport = int(cfg.get('relay_port') or 0)
+        except (TypeError, ValueError):
+            rport = 0
+        if host and host in ips and rport == lc_port:
+            return (f"中继地址 {host}:{rport} 指向本机自己的 Caster，"
+                    f"等于从自己身上拉流，收不到新数据。")
+    return None
+
+
+def port_conflict_message(cfg):
+    """本地 Caster 监听端口与中继/上传端口重复时，返回一句提示，否则 None。
+
+    为什么要求错开：中继/上传填的是**对端端口**，本机出站用内核临时端口，
+    技术上可以和本地监听端口同为 2101 而不冲突。但同一个配置页里重复出现
+    2101，极容易被误读成「本地 Caster 抢了出口的端口」，也会在对端地址被写成
+    127.0.0.1 时直接变成自环。所以统一要求把本机监听端口错开。
+    """
+    if str(cfg.get('local_caster_enabled', '0')) != '1':
+        return None
+    try:
+        lc = int(cfg.get('local_caster_port') or LOCAL_CASTER_PORT)
+    except (TypeError, ValueError):
+        return None
+
+    same = []
+    if str(cfg.get('caster_enabled', '0')) == '1':
+        try:
+            if int(cfg.get('caster_port') or 0) == lc:
+                same.append('「上传到云端 Caster」')
+        except (TypeError, ValueError):
+            pass
+    if cfg.get('mode') == 'relay':
+        try:
+            if int(cfg.get('relay_port') or 0) == lc:
+                same.append('「中继取流」')
+        except (TypeError, ValueError):
+            pass
+
+    if not same:
+        return None
+    return (f"本地 Caster 监听端口 {lc} 与 {' / '.join(same)} 的端口相同。"
+            f"本地 Caster 会在本机真实占用 {lc}，请改成 2102 等未被占用的端口。")
+
+
 run_status = {
     "mode": "",
     "data_source": "",
@@ -871,6 +1081,17 @@ def validate_config(cfg):
         if not (cfg.get('local_caster_host') or '').strip():
             err("本地 Caster 监听地址未配置，可填 0.0.0.0 表示所有网卡")
             return False
+        # 端口被别的进程占着就提前说清楚是谁占的。这里只告警不拦截：
+        # 重启时上一轮实例可能还在退出的尾巴上，硬拦会把可自愈的情况变成启动失败
+        # （真正的绑定在 LocalCaster.start() 里带 3 次退避重试）。
+        lc_host = (cfg.get('local_caster_host') or '').strip() or LOCAL_CASTER_HOST
+        lc_port = int(cfg.get('local_caster_port'))
+        ours = (local_caster is not None and local_caster.port == lc_port)
+        if not ours:
+            ok, detail = probe_tcp_port(lc_host, lc_port)
+            if not ok:
+                warn(f"本地 Caster 端口 {lc_port} 当前不可用（{detail}）；"
+                     f"若监听失败，请改用其他端口或结束占用该端口的进程")
 
     # 出口 3：无线电数传透传
     if radio_on:
@@ -883,6 +1104,18 @@ def validate_config(cfg):
         except (ValueError, TypeError):
             err("数传波特率无效，必须是正整数")
             return False
+
+    # 自环：出口指向本机自己，跑起来一定是「连上了但没数据」，必须明确拦住
+    loop = check_self_loop(cfg)
+    if loop:
+        err(loop)
+        return False
+
+    # 端口重复只告警不拦截：老库里可能就是这种组合，硬拦会让程序直接停在
+    # 「等待配置」不再干活。真正的保存拦截在配置页提交时做。
+    dup = port_conflict_message(cfg)
+    if dup:
+        warn(dup + "（技术上不冲突，因为中继/上传用的是对端端口；但建议错开，避免混淆）")
 
     # 零出口：允许运行——数据仍会被解析并显示在监控页（看星数、星历等），只是不向外分发
     if not (caster_on or local_caster_on or radio_on):
@@ -1332,6 +1565,21 @@ def config_page():
                         message='本地 Caster 端口无效，应为 1-65535 的整数，配置未保存。',
                         message_type='error'
                     )
+                # 端口被别的进程占着，存进数据库也是白存：重启后必然 bind 失败，
+                # 网页上只留一句"本地 Caster 启动失败"，很难定位。这里直接拦住，
+                # 并且说明是谁占的（Linux 上能给出 pid 和进程名）。
+                lc_host = (form_data.get('local_caster_host') or '').strip() or LOCAL_CASTER_HOST
+                ours = (local_caster is not None and local_caster.port == lc_port)
+                if not ours:
+                    ok, detail = probe_tcp_port(lc_host, lc_port)
+                    if not ok:
+                        return render_template(
+                            'config.html', config=get_config(),
+                            message=f'本地 Caster 端口 {lc_port} 现在不可用（{detail}），'
+                                    f'配置未保存。请改成其他端口，或先结束占用该端口的进程。'
+                                    f'（中继/上传端填的 2101 是对端端口，不会占用本机 2101）',
+                            message_type='error'
+                        )
 
             new_cfg = {"mode": mode}
 
@@ -1375,6 +1623,14 @@ def config_page():
                     "relay_user": (form_data.get('relay_user') or '').strip(),
                     "relay_password": form_data.get('relay_password', ''),
                 })
+
+            # 前端已经拦过一次，这里再拦一次，防止直接构造 POST 绕过
+            dup = port_conflict_message(new_cfg)
+            if dup:
+                return render_template(
+                    'config.html', config=get_config(),
+                    message=dup + '配置未保存。', message_type='error'
+                )
 
             logging.info(f"保存的配置信息: {mask_config(new_cfg)}")
             save_config(new_cfg)
@@ -1730,9 +1986,13 @@ class LocalCaster:
                     time.sleep(1.0)
 
         if last_err is not None:
+            owner = find_port_owner(self.port)
+            who = f"，当前占用者：{owner}" if owner else ""
             logging.error(
-                f"本地 NTRIP Caster 启动失败：无法监听 {self.host}:{self.port}（{last_err}）。"
-                f"若端口被其他程序占用，请在配置页改用其他端口"
+                f"本地 NTRIP Caster 启动失败：无法监听 {self.host}:{self.port}（{last_err}）{who}。"
+                f"注意：中继/上传端填的对端端口与本机监听端口互不影响，"
+                f"这个报错只说明本机 {self.port} 已被占用；"
+                f"请在配置页改用其他端口，或结束占用该端口的进程后重启"
             )
             return False
 
@@ -2043,11 +2303,13 @@ class LocalCaster:
 
 
 local_caster: Optional['LocalCaster'] = None
+# 上一次启动失败的原因，供状态页卡片显示（只在内存里，不落库）
+local_caster_last_error = ''
 
 
 def start_local_caster(cfg) -> Optional['LocalCaster']:
     """按配置启动本地 Caster；失败只记日志，不影响原有的上传链路。"""
-    global local_caster
+    global local_caster, local_caster_last_error
     stop_local_caster()
     try:
         port = int(cfg.get('local_caster_port') or LOCAL_CASTER_PORT)
@@ -2056,7 +2318,10 @@ def start_local_caster(cfg) -> Optional['LocalCaster']:
     host = (cfg.get('local_caster_host') or LOCAL_CASTER_HOST).strip() or LOCAL_CASTER_HOST
     caster = LocalCaster(host, port)
     if not caster.start():
+        owner = find_port_owner(port)
+        local_caster_last_error = f"{port} 端口被占用" + (f"（{owner}）" if owner else "")
         return None
+    local_caster_last_error = ''
     local_caster = caster
     return caster
 
@@ -2692,6 +2957,7 @@ def local_caster_snapshot() -> dict:
     info['enabled'] = enabled
     info['mountpoint'] = LOCAL_CASTER_MOUNTPOINT
     info['user'] = LOCAL_CASTER_USER
+    info['last_error'] = local_caster_last_error
     info['example'] = f"{get_local_ip()}:{info['port']}/{LOCAL_CASTER_MOUNTPOINT}"
     return info
 

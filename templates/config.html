@@ -207,6 +207,8 @@
                          min="1" max="65535">
                 </div>
               </div>
+              <div class="field-hint" data-i18n="cfg.local_port_hint">「监听端口」是本机对外提供服务的端口，会真实占用本机 2101。中继 / 上传端填的端口是「对端端口」，本机只是出站去连对方，用的是内核临时端口，所以它们可以都用 2101、彼此不冲突。真正会冲突的只有本机已有程序（含上一个没退干净的进程）占着同一个端口。</div>
+              <div class="field-hint is-error hidden" id="lc-port-warn"></div>
 
               <dl class="kv kv--compact">
                 <dt data-i18n="cfg.lc_mount">挂载点</dt>
@@ -349,6 +351,78 @@ sudo systemctl start 2rtkserver</pre>
       if (el) el.addEventListener('change', () => updateFormFields());
     });
 
+    // ---------- 端口冲突检查 ----------
+    // 三个端口的含义完全不同：
+    //   本地 Caster 端口 —— 「本机监听端口」，会真实占用本机这个端口；
+    //   中继端口 / 上传端口 —— 「对端端口」，本机只是出站去连对方，用的是内核
+    //                          分配的临时端口，并不占用本机这个端口。
+    // 所以中继、上传都用 2101 不会打架，本地 Caster 监听 2101 才会和"本机上别的
+    // 监听者"打架。但同一个页面里重复出现 2101，既容易被误读成端口冲突，也会在
+    // 把对端地址填成本机时变成自环，因此这里要求本地 Caster 端口与两者错开。
+    const lcPortWarn = document.getElementById('lc-port-warn');
+
+    function checkPortConflicts() {
+      if (!lcPortWarn) return true;
+      const val = (id) => (document.getElementById(id) || {}).value;
+      const on = (id) => !!(document.getElementById(id) || {}).checked;
+
+      const mode = val('mode');
+      const lcOn = on('local_caster_enabled');
+      const casterOn = on('caster_enabled');
+      const lcPort = parseInt(val('local_caster_port'), 10) || 0;
+      const casterPort = parseInt(val('caster_port'), 10) || 0;
+      const relayPort = parseInt(val('relay_port'), 10) || 0;
+
+      const busy = new Set();
+      if (casterOn && casterPort) busy.add(casterPort);
+      if (mode === 'relay' && relayPort) busy.add(relayPort);
+
+      const hits = [];
+      if (lcOn && lcPort) {
+        if (casterOn && casterPort === lcPort) {
+          hits.push(I18N.t('cfg.port_conflict_upload', { port: lcPort }));
+        }
+        if (mode === 'relay' && relayPort === lcPort) {
+          hits.push(I18N.t('cfg.port_conflict_relay', { port: lcPort }));
+        }
+      }
+
+      if (!hits.length) {
+        lcPortWarn.classList.add('hidden');
+        lcPortWarn.textContent = '';
+        return true;
+      }
+
+      // 给一个能直接照抄的建议端口（避开本页已用到的端口号）
+      const suggest = [2102, 2103, 2104, 8080, 8081].find(p => !busy.has(p) && p !== lcPort) || 2105;
+      hits.push(I18N.t('cfg.port_conflict_fix', { suggest }));
+      lcPortWarn.textContent = hits.join(' ');
+      lcPortWarn.classList.remove('hidden');
+      return false;
+    }
+
+    ['mode', 'caster_enabled', 'local_caster_enabled', 'caster_port',
+     'local_caster_port', 'relay_port'].forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.addEventListener('change', checkPortConflicts);
+      el.addEventListener('input', checkPortConflicts);
+    });
+
+    // 冲突时直接拦下提交，避免"存进去但跑不起来"
+    const cfgForm = document.getElementById('configForm');
+    if (cfgForm) {
+      cfgForm.addEventListener('submit', (e) => {
+        if (checkPortConflicts()) return;
+        e.preventDefault();
+        const el = document.getElementById('local_caster_port');
+        if (el) {
+          el.focus();
+          el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        }
+      });
+    }
+
     async function loadConfig() {
       try {
         const res = await fetch('/api/load_config');
@@ -363,12 +437,16 @@ sudo systemctl start 2rtkserver</pre>
 
         document.getElementById('mode').value = cfg.mode || 'none';
         updateFormFields(cfg.mode || 'none');
+        checkPortConflicts();
       } catch (err) {
         alert(I18N.t('cfg.load_fail', { msg: err.message }));
       }
     }
 
-    document.addEventListener('DOMContentLoaded', () => updateFormFields());
+    document.addEventListener('DOMContentLoaded', () => {
+      updateFormFields();
+      checkPortConflicts();
+    });
 
     // ---------- 中继挂载点列表 ----------
     // 浏览器连不上 Caster 的 2101 端口：那是纯 TCP 的自定义协议，不是 HTTP，
