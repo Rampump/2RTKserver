@@ -140,15 +140,30 @@ Python packages (`requirements.txt`): `pyserial`, `pyrtcm`, `flask`, `flask-sock
 
 ## Quick start
 
+Copy this **one line** into the device's terminal and press Enter. It installs `git` if
+missing, tries the GitCode mirror first and falls back to GitHub, then runs the installer:
+
 ```bash
-git clone https://github.com/Rampump/2RTKserver.git
-cd 2RTKserver
-chmod +x install.sh
-sudo ./install.sh
+sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone --depth 1 https://gitcode.com/rampump/NTRIPserver.git /tmp/2rtk-install || (sudo rm -rf /tmp/2rtk-install && sudo git clone --depth 1 https://github.com/Rampump/2RTKserver.git /tmp/2rtk-install)) && sudo bash /tmp/2rtk-install/install.sh
 ```
 
 Then open `http://<device-ip>:5757` and log in with **`admin` / `admin`** — change the
 password immediately.
+
+> **Copying from a Windows browser.** Paste it straight into the terminal; do not retype it.
+> The line is plain ASCII with no line breaks and no smart quotes, so it survives copy/paste
+> intact — but three Windows habits break it on Armbian:
+> `CR LF` line endings (bash: `$'\r': command not found`), full-width punctuation
+> （，；：""）and line-wrap cutting the command in half. If you must save it to a file,
+> use LF, and run `sed -i 's/\r$//' file.sh` before executing.
+
+Prefer doing it by hand:
+
+```bash
+git clone https://github.com/Rampump/2RTKserver.git
+cd 2RTKserver
+sudo ./install.sh
+```
 
 The installer creates a venv under `/opt/2RTKserver`, installs dependencies, writes a
 systemd unit (`2rtkserver`, auto-start + auto-restart), and adds the `2rtkserver` helper
@@ -249,6 +264,13 @@ Update / uninstall:
 ```bash
 sudo ./update.sh      # backs up the DB, copies new files, reinstalls deps, restarts
 sudo ./uninstall.sh   # prompts to back up the DB, then removes service + install dir
+```
+
+One-line uninstall, for when the source tree is already gone (the two `y` answers are
+"yes, uninstall" and "yes, back the config DB up to `/root`"):
+
+```bash
+printf 'y\ny\n' | sudo bash /opt/2RTKserver/uninstall.sh
 ```
 
 ### In-browser upgrade & uninstall
@@ -365,6 +387,31 @@ ECEF 坐标提前测好写进模块），模块插到刷了 Armbian 的机顶盒
 选 relay，从别的 Caster 拉流再分发。
 
 安装、天线相位中心定位方法、故障排除见 [INSTALL.md](INSTALL.md)，本文件上方为英文说明。
+
+### 一键安装
+
+复制下面**这一整行**到 Armbian 终端里回车即可（缺 git 会先装 git；先试国内 GitCode 镜像，
+连不上再退到 GitHub）：
+
+```bash
+sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone --depth 1 https://gitcode.com/rampump/NTRIPserver.git /tmp/2rtk-install || (sudo rm -rf /tmp/2rtk-install && sudo git clone --depth 1 https://github.com/Rampump/2RTKserver.git /tmp/2rtk-install)) && sudo bash /tmp/2rtk-install/install.sh
+```
+
+装完浏览器打开 `http://设备IP:5757`，账号密码都是 `admin`，进去第一件事改密码。
+
+**从 Windows 复制粘贴的三个坑**（这一行是纯 ASCII、没有换行、没有中文标点，直接粘贴即可）：
+
+1. 不要用记事本 / Word 中转再拷 —— 会引入 `CR LF`，Armbian 上 bash 直接报
+   `$'\r': command not found`，脚本看起来"什么都没做"就退出了。
+   必须存成文件时用 LF 换行，执行前先 `sed -i 's/\r$//' 文件名`。
+2. 不要手打或输入法半途切换 —— 全角标点（`，` `；` `（` 和中文引号）会让命令变成非法语法。
+3. 浏览器窗口太窄会把命令折行显示，复制时确认整行都在代码块里、末尾没有断掉。
+
+卸载（源码目录已经删了也能用；两个 `y` 分别是"确认卸载"和"先把配置库备份到 /root"）：
+
+```bash
+printf 'y\ny\n' | sudo bash /opt/2RTKserver/uninstall.sh
+```
 
 ### 用固定地址访问（不用记 IP）
 

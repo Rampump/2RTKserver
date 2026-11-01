@@ -78,6 +78,22 @@ parses those messages for the map display and the NTRIP source table (STR).
 
 ## Automatic Install
 
+### One-liner (recommended)
+
+Paste this **single line** into the device terminal. It installs `git` if missing, tries the
+GitCode mirror first, falls back to GitHub, then runs the installer:
+
+```bash
+sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone --depth 1 https://gitcode.com/rampump/NTRIPserver.git /tmp/2rtk-install || (sudo rm -rf /tmp/2rtk-install && sudo git clone --depth 1 https://github.com/Rampump/2RTKserver.git /tmp/2rtk-install)) && sudo bash /tmp/2rtk-install/install.sh
+```
+
+> **Copying from Windows.** The line is plain ASCII with no line breaks — paste it, don't
+> retype it. `CR LF` line endings (saved via Notepad/Word) make bash fail with
+> `$'\r': command not found`; full-width punctuation also breaks it. If you must use a file,
+> convert it first: `sed -i 's/\r$//' file.sh`.
+
+### Step by step
+
 1. Clone the repository:
 
    ```bash

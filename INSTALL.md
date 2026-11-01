@@ -70,6 +70,24 @@ RTK 基准站输出的差分改正数，是**相对天线相位中心点（Anten
 
 ## 自动安装
 
+### 一键安装（推荐）
+
+复制下面**这一整行**到设备终端回车，全程自动（缺 git 会先装 git，先试国内 GitCode 镜像、
+连不上自动退到 GitHub）：
+
+```bash
+sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone --depth 1 https://gitcode.com/rampump/NTRIPserver.git /tmp/2rtk-install || (sudo rm -rf /tmp/2rtk-install && sudo git clone --depth 1 https://github.com/Rampump/2RTKserver.git /tmp/2rtk-install)) && sudo bash /tmp/2rtk-install/install.sh
+```
+
+> **从 Windows 复制注意**
+> - 命令是纯 ASCII 单行，直接粘贴即可，不要手打、不要中途切中文输入法（全角标点会报语法错）。
+> - 不要经记事本 / Word 中转保存成 `.sh`：Windows 会写入 `CR LF`，Armbian 上 bash 报
+>   `$'\r': command not found`，脚本看起来"没执行就退出"。必须用文件时先
+>   `sed -i 's/\r$//' 文件名`。
+> - 浏览器窗口窄会把命令折行显示，复制时确认整行完整、末尾没有被截断。
+
+### 分步安装
+
 1. 克隆仓库：
 
    ```bash
@@ -186,6 +204,12 @@ sudo ./update.sh     # 自动备份配置、更新文件、重启服务
 ```bash
 chmod +x uninstall.sh
 sudo ./uninstall.sh  # 停止并删除服务与安装目录
+```
+
+源码目录已经删掉、只想清干净系统时，用这一行（两个 `y` 分别是"确认卸载"和"先把配置库备份到 /root"）：
+
+```bash
+printf 'y\ny\n' | sudo bash /opt/2RTKserver/uninstall.sh
 ```
 
 网页方式（不用 SSH，登录后进 **运行设置 → 系统维护**）：
