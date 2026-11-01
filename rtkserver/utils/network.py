@@ -33,12 +33,74 @@ def get_local_ip():
         return "localhost"
 
 
+# 容器 / 虚拟机 / 网桥的虚拟网卡前缀。这些网卡上的地址在局域网里不可达，
+# 但 getaddrinfo(hostname) 会把它们一起返回（装了 Docker 的设备上，
+# docker0 的 172.17.0.1 / 172.31.0.1 必然出现）。若把它们写进 mDNS 的 A 记录，
+# 客户端解析 2rtk.local 时可能拿到这个不可达地址，表现为"时好时坏"。
+VIRTUAL_IF_PREFIXES = ('docker', 'br-', 'veth', 'virbr', 'lxc', 'lxd',
+                       'cni', 'flannel', 'kube', 'vmnet', 'vboxnet', 'zt')
+
+
+def is_virtual_interface(name):
+    """网卡名是否属于容器 / 网桥这类虚拟接口。"""
+    return bool(name) and name.lower().startswith(VIRTUAL_IF_PREFIXES)
+
+
+def interface_ipv4_map():
+    """{IPv4: 网卡名}，仅 Linux 有效；其它平台返回 {}。
+
+    getaddrinfo 只给地址不给网卡名，没法判断哪个是 docker0，
+    所以这里用 SIOCGIFADDR 逐张网卡取地址。纯标准库，失败就当作没有映射。
+    """
+    if not sys.platform.startswith('linux'):
+        return {}
+    try:
+        import fcntl
+        import struct
+    except ImportError:
+        return {}
+    mapping = {}
+    for _, name in socket.if_nameindex():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            req = struct.pack('256s', name[:15].encode('utf-8', 'replace'))
+            addr = fcntl.ioctl(sock.fileno(), 0x8915, req)[20:24]
+            mapping[socket.inet_ntoa(addr)] = name
+        except OSError:
+            pass            # 网卡没配 IPv4 / 已消失
+        finally:
+            sock.close()
+    return mapping
+
+
+def drop_virtual_addresses(ips, mapping=None):
+    """剔除落在容器 / 网桥网卡上的地址，保留原有顺序。
+
+    mapping 为 {IP: 网卡名}，默认现场探测（方便单测注入）。
+    第一个地址（默认路由地址）永远保留：万一整机只有虚拟网卡，
+    剔空之后状态页和 mDNS 就都没地址可显示，比多报一个更难排查。
+    """
+    if not ips:
+        return list(ips)
+    if mapping is None:
+        mapping = interface_ipv4_map()
+    if not mapping:
+        return list(ips)
+    kept = [ip for ip in ips if not is_virtual_interface(mapping.get(ip, ''))]
+    if not kept:
+        return list(ips)
+    if ips[0] not in kept:
+        kept.insert(0, ips[0])
+    return kept
+
+
 def local_ipv4_addresses():
     """本机全部非回环 IPv4 地址（按"最可能是主网卡"的顺序返回）。
 
     mDNS 的 A 记录要一次带上所有地址：设备可能同时连有线和 Wi-Fi，
     只报一个的话，接入另一张网卡的客户端解析到的是不可达地址。
     顺序规则：默认路由地址优先，其余按 getaddrinfo 顺序。
+    容器 / 网桥网卡的地址会被剔除（见 VIRTUAL_IF_PREFIXES）。
     """
     primary = None
     try:
@@ -70,7 +132,7 @@ def local_ipv4_addresses():
         except Exception:
             pass
 
-    return found
+    return drop_virtual_addresses(found)
 
 
 def find_port_owner(port):

@@ -127,6 +127,13 @@ iPhone / iPad / Linux+avahi 都支持）。**安卓手机 / 平板不支持 `.lo
 固定地址依赖 `requirements.txt` 里的 `zeroconf`。没装上也不影响其它功能，
 只是少了这个别名；装好后重启服务即可生效。
 
+同网段里已经有一台设备叫 `2rtk` 时，本机会自动退为 `2rtk-2.local`，日志里有一行
+WARNING，首页「固定地址」那行显示的也是实际名字。
+
+> **升级请用 `update.sh`**：`install.sh` 结尾只执行 `systemctl start`，对已在运行的服务
+> 是空操作 —— 文件换了，进程还是旧代码。`update.sh` 会先停服务、备份数据库、清掉旧
+> `rtkserver/` 再复制，最后启动。
+
 ---
 
 ## 配置基准站

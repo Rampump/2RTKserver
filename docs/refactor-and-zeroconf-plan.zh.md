@@ -345,3 +345,93 @@ IDE 跳转、静态检查、`python -m` 全部失效，得不偿失。
 2. 升级前后 `2RTKserver.db` / `server.log` / `.secret_key` **位置不变**（修正 ③）。
 3. `systemctl status` 无 `ModuleNotFoundError`（修正 ①）。
 4. 本地 Caster 端口通、改配置"保存并重启"Web 不断线。
+
+---
+
+## 11. 真机验证记录（Armbian，`192.168.1.71`）
+
+### 11.1 环境
+
+| 项 | 值 |
+| --- | --- |
+| 系统 | Armbian 26.8.3 / Ubuntu 22.04.5 LTS (jammy)，kernel 6.1.98-ophub aarch64 |
+| Python | 3.10.12（venv 内） |
+| 依赖 | zeroconf 0.139.0、flask 3.1.3、flask-sock 0.7.0、pyserial 3.5 |
+| 网卡 | `eth0 192.168.1.71/24` + `docker0 172.31.0.1/16`（关键，见 11.4） |
+| mDNS 环境 | `systemd-resolved` 运行中，`avahi-daemon` 未安装 |
+| 主机名 | `2RTKserver`（与广播名 `2rtk` 不冲突） |
+
+安装方式：删掉设备上 9 月的旧版（`/opt/2RTKserver` 整体删除，备份留在
+`/root/2rtk-backup-20261101-083405.tgz`），用 `bash install.sh` 全新安装。
+
+### 11.2 计划里"只能上真机验"的 4 项 —— 全部通过
+
+| # | 验收项 | 结果 |
+| --- | --- | --- |
+| 1 | `systemctl stop` 后 5 秒内 `ping 2rtk.local` 失败 | ✅ 停止耗时 **723 ms**；日志 `mDNS 广播已停止（已发送道别包）`；停止后 Windows 立刻报"找不到主机"，**没有**等 120 秒 TTL |
+| 2 | 升级前后 DB / 日志 / 密钥位置不变 | ✅ 均在 `/opt/2RTKserver/`；`.secret_key` mtime 未变（升级不掉登录态）；配置项 `mode=relay` 等原样保留 |
+| 3 | `systemctl status` 无 `ModuleNotFoundError` | ✅ `active (running)`，`install.sh` / `update.sh` 两条路径都验过 |
+| 4 | 本地 Caster 端口通、改配置 Web 不断线 | ✅ `0.0.0.0:2102` 监听；保存配置触发重启时**进程 PID 不变**，Web 全程可访问 |
+
+### 11.3 额外验证（计划里只是设计，这次跑成实测）
+
+| 项 | 结果 |
+| --- | --- |
+| 契约测试 | 设备上 `python -m unittest discover -s tests` → **41 passed**（Windows 同样 41） |
+| 名字访问 | `getaddrinfo('2rtk.local') → 192.168.1.71`；`curl http://2rtk.local:5757` → 200；`/config` 未登录 → 302 |
+| 任意端口 | `2rtk.local:2102/2RTK` 单靠 A 记录即可用，NTRIP 握手四种分支全对：无凭据 `401`、NTRIP1 `ICY 200 OK`、NTRIP2 `HTTP/1.1 200 + Ntrip-Version`、错误挂载点 `404`、源列表 `SOURCETABLE 200` |
+| `_ntrip._tcp` 广播 | `2rtk._ntrip._tcp.local.` port=2102，随配置页端口变化（`mDNS 已广播本地 Caster 端口：2102`） |
+| IP 变化看门狗 | 给 eth0 加第二地址 `192.168.1.77` → 30 秒内 `本机 IP 已变化，mDNS 记录已刷新：192.168.1.71, 192.168.1.77`；删掉后同样自动回退 |
+| 同名设备退让 | 用一台假设备抢走 `2rtk.local` → 本机 `WARNING 退为 http://2rtk-2.local:5757`，实际 A 记录也确实在 `2rtk-2.local`（`ping 2rtk-2.local → 192.168.1.71`，`ping 2rtk.local → 假设备`）；假设备退场后重启，本机抢回 `2rtk.local`，无残留 `2rtk-2` 记录 |
+| `/ws` 首帧 | 含 `local_ip=192.168.1.71`、`local_ips`、`mdns_url=http://2rtk.local:5757`、`mdns_state=running`；`mode=none` 首次打开就能看见 IP |
+| 首页/配置页文案 | 首页显示「本机 IP / 固定地址 / 安卓提示」；配置页有「局域网固定地址」+「安卓只能用 IP」两段（中英成对） |
+| 无 zeroconf 时降级 | `start()` 返回 False + 一条 WARNING，其余功能零影响（Windows 侧验过） |
+| `systemd-resolved` 共存 | 不冲突：resolved 只监听 `127.0.0.53:53`，5353 由 zeroconf 用 `SO_REUSEADDR` 独占，两者不抢端口 |
+
+### 11.4 真机现场才发现的两个缺陷（已修）
+
+**① docker0 的地址被写进了 A 记录。**
+设备装了 Docker，`172.31.0.1` 出现在 `getaddrinfo(hostname)` 里，被一起广播。
+Windows 解析 `2rtk.local` 拿到 **两个** A 记录（`192.168.1.71` 和 `172.31.0.1`），
+后者在局域网里根本不可达 —— 客户端"有时打得开有时打不开"，且换一台手机结果可能不同。
+更糟的是现场局域网若没有默认路由，`get_local_ip()` 会失败，首页「本机 IP」可能直接显示
+docker 地址。
+
+修法：`utils/network.drop_virtual_addresses()` 用 `SIOCGIFADDR` 逐张网卡取 IP→网卡名，
+剔除 `docker* / br-* / veth* / virbr* / lxc* / cni* / flannel* / kube* / vmnet* / zt*`
+上的地址；第一个地址（默认路由地址）永远保留，避免剔空。
+`zeroconf_announcer.py` 因为承诺"不 import 项目模块、可单独拷走"，刻意保留一份同样实现。
+
+**② 同名退让是"假的"。**
+`register_service(info, allow_name_change=True)` 只改**服务实例名**，A 记录用的
+`server`（`2rtk.local`）原样不动。实测：另一台设备占着 `2rtk.local` 时，本机日志写着
+"退为 http://2rtk-2.local"，实际仍在广播 `2rtk.local` —— 两台设备抢同一个名字，
+客户端 50% 概率连错机器，比不改名更难排查。
+
+修法：注册前先自己探测（浏览 `_http._tcp`，只看实例名以 `2rtk` 开头的，取其 `server`
+与自己的地址比对，地址不同才算别人），选出没人用的名字再注册；`allow_name_change`
+改成 `False`，并给 `register_service` 加 `NonUniqueNameException` 重试。
+所有对外文案（日志、`snapshot()`、`_ntrip` 的 server）统一取实际广播名 `self._server`。
+
+### 11.5 运维注意：`install.sh` 不是升级脚本
+
+升级到已经装好的目录时，`install.sh` 结尾的 `systemctl start` 对**正在运行**的服务是
+no-op —— 文件被替换了，但进程还在跑旧代码（本次实测踩到：装完新代码，日志里还是旧行为）。
+升级必须用 `update.sh`：它会 `stop` → 备份 DB（`.db.bak`）→ 先删 `rtkserver/` 再复制
+（防止残留 `.pyc` 指向已删模块）→ 恢复 DB → `start`。
+
+### 11.6 已知且刻意不改的
+
+- **首次保存配置最长 10 秒才生效**：配置无效时主循环走 `interruptible_sleep(10)`，
+  这是原版 `server.py` 就有的行为（原 3622 行 `time.sleep(10)`），不是拆分引入的回归。
+  要改成"保存即生效"只需让这个 sleep 同时被 `restart_event` 打断，属于行为变更，留待你决定。
+- 开发服务器警告（`WARNING: This is a development server`）是 Flask 自带提示，
+  单进程多线程是本程序的必要前提，不能换 gunicorn 多 worker。
+
+### 11.7 回滚
+
+设备上保留了三份可回退物料：
+
+- `/root/2rtk-backup-20261101-083405.tgz`：删旧版之前的完整 `/opt/2RTKserver` + systemd 单元
+- `/opt/2RTKserver/2RTKserver.db.bak`：`update.sh` 每次升级前的数据库备份
+- 仓库 tag `pre-split`：拆分前的单文件版本

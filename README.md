@@ -190,6 +190,10 @@ http://2rtk.local:5757
 - The advertised address follows the device when DHCP hands out a new IP; the name stays.
 - If the `zeroconf` package is missing, everything else keeps working — only this alias is gone.
 
+**Troubleshooting `2rtk.local` won't open:** check the "Fixed LAN address" line on the status page first — if the name was already taken, it shows the actual fallback (`2rtk-2.local`). Names resolve per network: a phone on cellular data, or a PC on a different VLAN, will not see it.
+
+**Upgrading:** use `update.sh`, not `install.sh`. `install.sh` ends with `systemctl start`, which is a no-op for an already-running service, so the old code keeps running after the files are replaced.
+
 **Android phones and tablets cannot resolve `.local` names — use the local IP shown on the status page instead (`http://<device-ip>:5757`).**
 
 ## Configuration
@@ -344,5 +348,9 @@ ECEF 坐标提前测好写进模块），模块插到刷了 Armbian 的机顶盒
 - 换 Wi-Fi、路由器重新分配 IP 后名字不变，地址会自动跟着刷新。
 - 同网段已有一台叫 `2rtk` 的设备时，本机会自动退为 `2rtk-2.local`（日志里有一行提示）。
 - 首页「运行状态」卡里会同时显示 **本机 IP** 和 **固定地址**，第一次使用也能照着输。
+
+**打不开 `2rtk.local` 时**：先看首页「固定地址」那一行 —— 名字被别的设备占了的话，这里显示的是实际的 `2rtk-2.local`。另外名字只在同一网段有效：手机走 4G、电脑在别的 VLAN 都解析不到。
+
+**升级请用 `update.sh`，不要用 `install.sh`**：后者结尾是 `systemctl start`，对已在运行的服务是空操作，文件换了但进程还跑旧代码。
 
 **安卓手机 / 平板：系统不支持 .local 名字解析，请用首页显示的「本机 IP」访问（`http://设备IP:5757`）。**

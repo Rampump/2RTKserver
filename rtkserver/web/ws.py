@@ -173,8 +173,11 @@ def websocket(ws):
         }))
         # 运行状态首帧：首次使用（还没配置数据源）时没有任何循环在推状态，
         # 首页必须靠这一帧显示本机 IP 与固定访问地址。
+        # 注意带上 type：前端对 run_status 是按字段名分发的，但带上 type
+        # 才能和其它帧保持一致（日志、抓包时一眼能看出这是什么消息）。
         from ..core.status import initial_run_status
         client.enqueue(json.dumps({
+            "type": "run_status",
             "run_status": initial_run_status()
         }))
 

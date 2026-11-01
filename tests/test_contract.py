@@ -324,6 +324,29 @@ class TestMdnsAnnouncer(unittest.TestCase):
         ann.stop()
         ann.stop()
 
+    def test_snapshot_follows_actual_server_after_rename(self):
+        """名字冲突退让后，对外显示/打印的地址必须是**实际广播**的那个名字。
+
+        踩过的坑：zeroconf 的 allow_name_change 只改服务实例名，A 记录用的
+        server 不变。当初用实例名生成 URL，日志会写"退为 2rtk-2.local"，
+        实际仍在广播 2rtk.local —— 两台设备抢同一个名字，客户端 50% 概率
+        连错机器。这里锁住：显示名一律来自 self._server。
+        """
+        from rtkserver.discovery.zeroconf_announcer import ZeroconfAnnouncer
+        ann = ZeroconfAnnouncer()
+        ann._server = '2rtk-2.local.'
+        snap = ann.snapshot()
+        self.assertEqual(snap['name'], '2rtk-2.local')
+        self.assertEqual(snap['web_url'], 'http://2rtk-2.local:5757')
+        self.assertEqual(snap['hostname'], '2rtk')      # 配置的本名不变
+        self.assertEqual(ann._host_label(), '2rtk-2')
+
+    def test_host_label_tolerates_bare_name(self):
+        from rtkserver.discovery.zeroconf_announcer import ZeroconfAnnouncer
+        ann = ZeroconfAnnouncer()
+        ann._server = ''
+        self.assertEqual(ann._host_label(), '2rtk')
+
 
 class TestRunStatusIp(unittest.TestCase):
     """首次使用（没配数据源）也要能看见本机 IP —— 安卓只能靠它访问。"""
@@ -337,6 +360,54 @@ class TestRunStatusIp(unittest.TestCase):
         self.assertIn('mdns_url', state.run_status)
         self.assertTrue(state.run_status['mdns_url'].startswith('http://2rtk.local'))
         self.assertIsInstance(state.run_status['local_ips'], list)
+
+
+class TestVirtualAddressFilter(unittest.TestCase):
+    """容器 / 网桥地址不能进 mDNS 的 A 记录。
+
+    现场设备常装 Docker：docker0 的 172.17.0.1 会出现在 getaddrinfo(hostname)
+    里。若写进 A 记录，客户端解析 2rtk.local 时可能拿到这个局域网不可达的
+    地址，表现为"时好时坏"，极难排查。
+    """
+
+    def setUp(self):
+        from rtkserver.utils.network import drop_virtual_addresses
+        self.drop = drop_virtual_addresses
+
+    def test_docker_and_overlay_dropped(self):
+        mapping = {'192.168.1.71': 'eth0', '172.31.0.1': 'docker0',
+                   '10.8.0.5': 'ztabc', '192.168.1.72': 'wlan0'}
+        got = self.drop(['192.168.1.71', '172.31.0.1', '10.8.0.5', '192.168.1.72'], mapping)
+        self.assertEqual(got, ['192.168.1.71', '192.168.1.72'])
+
+    def test_bridge_and_veth_dropped(self):
+        mapping = {'10.1.0.1': 'br-3f2a', '10.1.0.2': 'veth1a2b', '192.168.1.71': 'eth0'}
+        got = self.drop(['192.168.1.71', '10.1.0.1', '10.1.0.2'], mapping)
+        self.assertEqual(got, ['192.168.1.71'])
+
+    def test_first_address_kept_even_if_virtual(self):
+        """整机只有虚拟网卡时不能剔空，否则状态页无 IP 可显示。"""
+        mapping = {'172.31.0.1': 'docker0'}
+        self.assertEqual(self.drop(['172.31.0.1'], mapping), ['172.31.0.1'])
+
+    def test_no_mapping_is_passthrough(self):
+        """非 Linux（拿不到网卡名）时保持原行为，不误伤。"""
+        ips = ['192.168.1.71', '172.31.0.1']
+        self.assertEqual(self.drop(ips, {}), ips)
+        self.assertEqual(self.drop([], {}), [])
+
+    def test_unmapped_address_kept(self):
+        """映射里没有的地址说明不是本地虚拟网卡，必须保留。"""
+        mapping = {'192.168.1.71': 'eth0'}
+        self.assertEqual(self.drop(['192.168.1.71', '192.168.1.200'], mapping),
+                         ['192.168.1.71', '192.168.1.200'])
+
+    def test_announcer_uses_same_rule(self):
+        """announcer 自带一份实现（可独立拷走），规则必须与 utils 一致。"""
+        from rtkserver.discovery import zeroconf_announcer as ann
+        self.assertTrue(hasattr(ann, '_interface_ipv4_map'))
+        self.assertEqual(ann._VIRTUAL_IF_PREFIXES,
+                         __import__('rtkserver.utils.network', fromlist=['x']).VIRTUAL_IF_PREFIXES)
 
 
 if __name__ == '__main__':

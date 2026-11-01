@@ -24,6 +24,7 @@
 """
 import logging
 import socket
+import sys
 import threading
 import time
 
@@ -33,14 +34,50 @@ DEFAULT_WEB_PORT = 5757
 MDNS_HTTP_TYPE = '_http._tcp.local.'
 MDNS_NTRIP_TYPE = '_ntrip._tcp.local.'   # 非标准类型，仅作端口展示
 WATCH_INTERVAL = 30                      # 秒：IP 变化检查周期
+CONFLICT_PROBE_SECONDS = 1.5             # 秒：启动时探测同名设备的观察窗口
+MAX_NAME_SUFFIX = 5                      # 名字冲突时最多退到 -6
+
+# 容器 / 虚拟机 / 网桥的虚拟网卡前缀：这些地址在局域网里不可达，
+# 不能写进 A 记录（装了 Docker 的设备上 docker0 的 172.17.0.1 必然出现）。
+_VIRTUAL_IF_PREFIXES = ('docker', 'br-', 'veth', 'virbr', 'lxc', 'lxd',
+                        'cni', 'flannel', 'kube', 'vmnet', 'vboxnet', 'zt')
 
 logger = logging.getLogger(__name__)
+
+
+def _interface_ipv4_map():
+    """{IPv4: 网卡名}，仅 Linux 有效；其它平台返回 {}。
+
+    与 utils/network.py 中的同名逻辑刻意重复：本文件承诺"只依赖标准库 + zeroconf，
+    可单独拷走使用"，为此不 import 项目内任何模块。
+    """
+    if not sys.platform.startswith('linux'):
+        return {}
+    try:
+        import fcntl
+        import struct
+    except ImportError:
+        return {}
+    mapping = {}
+    for _, name in socket.if_nameindex():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            req = struct.pack('256s', name[:15].encode('utf-8', 'replace'))
+            addr = fcntl.ioctl(sock.fileno(), 0x8915, req)[20:24]
+            mapping[socket.inet_ntoa(addr)] = name
+        except OSError:
+            pass
+        finally:
+            sock.close()
+    return mapping
 
 
 def _local_ipv4_addresses():
     """本机全部非回环 IPv4（默认路由地址优先）。
 
     不 import 项目内 utils，保持本文件可独立拷走使用。
+    容器 / 网桥网卡的地址会被剔除：它们的地址在局域网里不可达，
+    写进 A 记录会让客户端解析到 http://2rtk.local 时随到随挂。
     """
     found = []
     try:
@@ -59,6 +96,15 @@ def _local_ipv4_addresses():
                 found.append(ip)
     except Exception:
         pass
+
+    mapping = _interface_ipv4_map()
+    if mapping and found:
+        kept = [ip for ip in found
+                if not mapping.get(ip, '').lower().startswith(_VIRTUAL_IF_PREFIXES)]
+        if kept:
+            if found[0] not in kept:
+                kept.insert(0, found[0])
+            found = kept
     return found
 
 
@@ -75,7 +121,9 @@ class ZeroconfAnnouncer:
         self._http_info = None
         self._ntrip_info = None
         self._addresses = []
-        self._registered_name = ''
+        # 实际对外的主机名（含 .local.）。名字冲突退让后与 self.hostname 不同，
+        # 所有对外展示与 _ntrip 记录的 server 都必须用它，否则客户端会被指向别人。
+        self._server = f'{self.hostname}.local.'
         self._state = 'stopped'      # stopped / running / unavailable
         self._last_error = ''
         self._lock = threading.Lock()
@@ -86,7 +134,7 @@ class ZeroconfAnnouncer:
     def start(self) -> bool:
         """注册 _http._tcp 服务（自带 A 记录）。失败只返回 False，不抛异常。"""
         try:
-            from zeroconf import IPVersion, ServiceInfo, Zeroconf
+            from zeroconf import IPVersion, NonUniqueNameException, ServiceInfo, Zeroconf
         except ImportError as e:
             # 老设备只更新代码、没更新依赖时走这里：其它功能完全不受影响
             self._state = 'unavailable'
@@ -111,27 +159,28 @@ class ZeroconfAnnouncer:
                 self._close_zc()
                 return False
 
-            info = ServiceInfo(
-                MDNS_HTTP_TYPE,
-                f"{self.hostname}.{MDNS_HTTP_TYPE}",
-                addresses=[socket.inet_aton(ip) for ip in addresses],
-                port=self.web_port,
-                properties={
-                    'path': '/',
-                    'product': '2RTK NTRIP Server',
-                    'version': '2.1.8',
-                },
-                server=f"{self.hostname}.local.",
-            )
-            # allow_name_change：同网段已有同名设备时自动退为 2rtk-2.local
-            registered = self._zc.register_service(info, allow_name_change=True)
-            if registered is not None:
-                info = registered
+            host = self._resolve_hostname(addresses)
+            info = None
+            # allow_name_change 只改「服务实例名」，A 记录用的 server 不会跟着改，
+            # 所以冲突必须由 _resolve_hostname 提前规避（它看的是真实的 server），
+            # 这里再用 allow_name_change=False 兜住"探测与注册之间"的竞态。
+            for suffix in range(0, MAX_NAME_SUFFIX + 1):
+                candidate_host = host if suffix == 0 else f'{self.hostname}-{suffix + 1}'
+                candidate = self._build_http_info(candidate_host, addresses)
+                try:
+                    self._zc.register_service(candidate, allow_name_change=False)
+                except NonUniqueNameException:
+                    logger.warning(f"mDNS 名称 {candidate_host}.local 注册时被占用，换下一个后缀重试")
+                    continue
+                info = candidate
+                self._server = f'{candidate_host}.local.'
+                break
+            if info is None:
+                raise RuntimeError('局域网内同名设备过多，未能取得可用的 mDNS 主机名')
 
             with self._lock:
                 self._http_info = info
                 self._addresses = list(addresses)
-                self._registered_name = (info.name or '').split('.')[0]
                 self._state = 'running'
                 self._last_error = ''
 
@@ -176,7 +225,7 @@ class ZeroconfAnnouncer:
         try:
             info = ServiceInfo(
                 MDNS_NTRIP_TYPE,
-                f"{self.hostname}.{MDNS_NTRIP_TYPE}",
+                f"{self._host_label()}.{MDNS_NTRIP_TYPE}",
                 addresses=[socket.inet_aton(ip) for ip in (self._addresses or _local_ipv4_addresses())],
                 port=port,
                 properties={
@@ -184,11 +233,9 @@ class ZeroconfAnnouncer:
                     'user': '2RTK',
                     'note': 'NTRIP Caster on this device',
                 },
-                server=f"{self.hostname}.local.",
+                server=self._server,
             )
-            registered = self._zc.register_service(info, allow_name_change=True)
-            if registered is not None:
-                info = registered
+            self._zc.register_service(info, allow_name_change=False)
             with lock:
                 self._ntrip_info = info
             logger.info(f"mDNS 已广播本地 Caster 端口：{port}（{mountpoint}）")
@@ -200,7 +247,7 @@ class ZeroconfAnnouncer:
 
     def snapshot(self) -> dict:
         with self._lock:
-            name = self._registered_name or self.hostname
+            name = self._host_label()
             ntrip_port = None
             if self._ntrip_info is not None:
                 try:
@@ -252,6 +299,97 @@ class ZeroconfAnnouncer:
         logger.info("mDNS 广播已停止（已发送道别包）")
 
     # ---------- 内部 ----------
+    def _host_label(self):
+        """实际广播的主机名（不含 .local），冲突退让后可能是 2rtk-2。"""
+        server = (self._server or '').rstrip('.')
+        return server[:-len('.local')] if server.endswith('.local') else (server or self.hostname)
+
+    def _build_http_info(self, host, addresses):
+        from zeroconf import ServiceInfo
+        return ServiceInfo(
+            MDNS_HTTP_TYPE,
+            f"{host}.{MDNS_HTTP_TYPE}",
+            addresses=[socket.inet_aton(ip) for ip in addresses],
+            port=self.web_port,
+            properties={
+                'path': '/',
+                'product': '2RTK NTRIP Server',
+                'version': '2.1.8',
+            },
+            server=f"{host}.local.",
+        )
+
+    def _resolve_hostname(self, our_addresses):
+        """挑一个局域网里没人用的主机名（默认 2rtk，被占则 2rtk-2、2rtk-3…）。
+
+        为什么要自己探测：zeroconf 的 allow_name_change 只改「服务实例名」，
+        A 记录用的 server（2rtk.local）原样不动。两台设备都叫 2rtk 时，
+        双方都会应答 2rtk.local 的 A 查询，客户端随机拿到一台 —— 表现为
+        "有时打得开有时打不开"，比干脆不改名更难排查（已实测复现）。
+
+        探测方式：浏览 _http._tcp，只看实例名以 2rtk 开头的（正常 0～2 条），
+        取其 server 与自己的地址比对。地址不同才是别人；地址相同说明是
+        本机上次没来得及发道别包留下的缓存，不能当成冲突。
+        """
+        names = []
+        ours = set(our_addresses)
+        prefix = self.hostname.lower()
+
+        class _Listener:
+            def add_service(self_, zc_, type_, name):
+                if name.split('.')[0].lower().startswith(prefix):
+                    names.append(name)
+
+            def update_service(self_, *args):
+                pass
+
+            def remove_service(self_, *args):
+                pass
+
+        browser = None
+        try:
+            from zeroconf import ServiceBrowser
+            browser = ServiceBrowser(self._zc, MDNS_HTTP_TYPE, _Listener())
+            deadline = time.monotonic() + CONFLICT_PROBE_SECONDS
+            while time.monotonic() < deadline and not names:
+                time.sleep(0.05)
+        except Exception as e:
+            logger.debug(f"mDNS 冲突探测不可用（按无冲突处理）：{e}")
+            return self.hostname
+
+        claimed = set()
+        try:
+            for name in list(names):
+                try:
+                    info = self._zc.get_service_info(MDNS_HTTP_TYPE, name, timeout=800)
+                except Exception:
+                    info = None
+                if not info or not info.server:
+                    continue
+                addrs = {socket.inet_ntoa(a) for a in info.addresses}
+                if addrs and addrs != ours:
+                    claimed.add(info.server.rstrip('.').lower())
+        finally:
+            if browser is not None:
+                try:
+                    browser.cancel()
+                except Exception:
+                    pass
+
+        host = self.hostname
+        suffix = 2
+        while f'{host}.local' in claimed:
+            if suffix > MAX_NAME_SUFFIX:
+                logger.warning(f"局域网内 {self.hostname} 名字被占满（已试到 -{MAX_NAME_SUFFIX}），"
+                               "仍使用原名广播")
+                return self.hostname
+            host = f'{self.hostname}-{suffix}'
+            suffix += 1
+        if host != self.hostname:
+            logger.warning(f"局域网内已存在同名设备（{self.hostname}.local 被占用），"
+                           f"本机固定地址退为 http://{host}.local:{self.web_port}")
+        return host
+
     def _close_zc(self):
         zc = self._zc
         self._zc = None
@@ -262,13 +400,8 @@ class ZeroconfAnnouncer:
                 pass
 
     def _log_started(self, info):
-        name = (info.name or '').split('.')[0] or self.hostname
-        if name != self.hostname:
-            logger.warning(f"局域网内已存在同名设备，本机固定地址退为 http://{name}.local:{self.web_port}"
-                           f"（原名字 {self.hostname}.local 被占用）")
-        else:
-            logger.info(f"固定地址已启用：http://{name}.local:{self.web_port}"
-                        f"（地址 {', '.join(self._addresses)}）")
+        logger.info(f"固定地址已启用：http://{self._host_label()}.local:{self.web_port}"
+                    f"（地址 {', '.join(self._addresses)}）")
         logger.info("提示：Windows / macOS / iPhone 可用固定地址访问；安卓系统不支持 .local，请用本机 IP")
 
     def _start_watchdog(self):
@@ -301,7 +434,7 @@ class ZeroconfAnnouncer:
                 addresses=[socket.inet_aton(ip) for ip in addresses],
                 port=info.port,
                 properties=info.properties,
-                server=f"{self._registered_name or self.hostname}.local.",
+                server=self._server,
             )
             self._zc.update_service(new_info)
             with self._lock:
