@@ -60,11 +60,20 @@ if [ -f "$SRC_DIR/server.py" ]; then
     rm -rf "$INSTALL_DIR/rtkserver"
     find "$INSTALL_DIR" -maxdepth 2 -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null
     for item in server.py rtkserver reset_config.py requirements.txt install.sh uninstall.sh update.sh \
-                README.md INSTALL.md INSTALL.en.md LICENSE templates static docs; do
+                README.md INSTALL.md INSTALL.en.md LICENSE templates static docs tests; do
         if [ -e "$SRC_DIR/$item" ]; then
             cp -r "$SRC_DIR/$item" "$INSTALL_DIR/"
         fi
     done
+
+    # 同步版本号，否则网页上的「当前版本 / 检查更新」会永远停在装机那一版
+    SRC_COMMIT=""
+    if [ -d "$SRC_DIR/.git" ] && command -v git >/dev/null 2>&1; then
+        SRC_COMMIT=$(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null || true)
+    fi
+    printf '{"commit":"%s","date":"%s","installed_at":"%s","source":"update.sh","channel":"update"}\n' \
+        "${SRC_COMMIT}" "$(date '+%Y-%m-%d %H:%M:%S')" "$(date '+%Y-%m-%d %H:%M:%S')" \
+        > "$INSTALL_DIR/.version"
 
     # 恢复数据库文件
     if [ -f "$INSTALL_DIR/2RTKserver.db.temp" ]; then

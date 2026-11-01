@@ -64,9 +64,10 @@ def create_app() -> Flask:
 
     app.after_request(_set_security_headers)
 
-    from . import api, routes, ws
+    from . import api, api_upgrade, routes, ws
     routes.register(app)
     api.register(app)
+    api_upgrade.register(app)
     ws.register(sock)
 
     logging.info("Web 应用已创建（模板 %s，静态 %s）", paths.TEMPLATES_DIR, paths.STATIC_DIR)

@@ -1174,3 +1174,122 @@ details[open].note > summary::before {
     height: 260px;
   }
 }
+
+/* ==========================================================================
+   系统维护（升级 / 卸载）
+   --------------------------------------------------------------------------
+   升级期间 Web 进程会退出，页面只能靠轮询恢复，所以这里的视觉重点是
+   "让用户明确知道现在轮到哪一步、不要关页面"。
+   ========================================================================== */
+
+.btn-danger {
+  background: var(--danger);
+  border: 1px solid var(--danger);
+  color: #fff;
+}
+
+.btn-danger:hover {
+  background: #b91c1c;
+  border-color: #b91c1c;
+}
+
+.btn:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+.maint-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(15, 23, 42, .55);
+  backdrop-filter: blur(2px);
+  padding: 16px;
+}
+
+.maint-panel {
+  width: min(640px, 100%);
+  max-height: 86vh;
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 24px 60px rgba(15, 23, 42, .28);
+  padding: 22px 22px 18px;
+}
+
+.maint-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--ink);
+  margin-bottom: 14px;
+}
+
+.maint-bar {
+  height: 8px;
+  border-radius: 99px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.maint-bar-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 99px;
+  background: linear-gradient(90deg, var(--accent), var(--teal));
+  transition: width .4s ease;
+}
+
+.maint-msg {
+  margin: 12px 0 6px;
+  color: var(--ink-2);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.maint-log {
+  margin: 8px 0 0;
+  max-height: 30vh;
+  overflow: auto;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.maint-foot {
+  margin-top: 10px;
+  font-size: 12px;
+}
+
+.is-ok { color: var(--success); }
+.is-bad { color: var(--danger); }
+.is-warn { color: var(--warning); }
+
+.maint-result-list {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.8;
+}
+
+.maint-result-list .row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.maint-result-list .mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}

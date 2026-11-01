@@ -64,6 +64,10 @@ class TestRoutes(unittest.TestCase):
         ('/api/local_caster', 'GET'),
         ('/api/serial_ports', 'GET'),
         ('/api/sourcetable', 'POST'),
+        ('/api/upgrade/status', 'GET'),
+        ('/api/upgrade/check', 'POST'),
+        ('/api/upgrade/start', 'POST'),
+        ('/api/upgrade/uninstall', 'POST'),
         ('/ws', 'GET'),
     }
 
@@ -412,3 +416,62 @@ class TestVirtualAddressFilter(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestUpgrade(unittest.TestCase):
+    """升级/卸载执行器的硬约束。
+
+    runner 必须能在「rtkserver/ 已被替换」之后继续正常工作，所以它不能
+    import 任何项目内模块——这条一旦破了，升级会死在半路，且只在真机上才暴露。
+    """
+
+    def setUp(self):
+        from rtkserver.upgrade import sources, service
+        self.sources = sources
+        self.service = service
+
+    def test_runner_only_uses_stdlib(self):
+        import re
+        import sys
+        from rtkserver.upgrade import service as svc
+        with open(svc.RUNNER_SRC, 'r', encoding='utf-8') as f:
+            src = f.read()
+        mods = set()
+        for line in src.splitlines():
+            m = re.match(r'\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)', line)
+            if m:
+                mods.add(m.group(1))
+        third_party = {m for m in mods if m not in sys.stdlib_module_names}
+        self.assertEqual(third_party, set(), f'执行器引入了非标准库依赖: {third_party}')
+
+    def test_runner_does_not_import_project(self):
+        from rtkserver.upgrade import service as svc
+        with open(svc.RUNNER_SRC, 'r', encoding='utf-8') as f:
+            src = f.read()
+        self.assertNotIn('from rtkserver', src)
+        self.assertNotIn('import rtkserver', src)
+        self.assertNotIn('from ..', src)
+
+    def test_sources_resolved(self):
+        conf = self.sources.resolved()
+        self.assertIn('branch', conf)
+        self.assertTrue(conf['sources'], '至少要有 github 一个源')
+        for key, label, url in conf['sources']:
+            self.assertTrue(url.startswith('http'), url)
+            self.assertTrue(label)
+
+    def test_source_by_key(self):
+        self.assertIsNone(self.sources.source_by_key('auto'))
+        self.assertIsNone(self.sources.source_by_key(''))
+        first_key = self.sources.resolved()['sources'][0][0]
+        self.assertTrue(self.sources.source_by_key(first_key).startswith('http'))
+
+    def test_managed_ports_include_web_port(self):
+        from rtkserver.core.constants import WEB_PORT
+        ports = self.service.managed_ports()
+        self.assertIn(WEB_PORT, ports)
+
+    def test_state_shape_when_missing(self):
+        st = self.service.read_state()
+        self.assertIn('stage', st)
+        self.assertIn('progress', st)

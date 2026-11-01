@@ -73,13 +73,23 @@ if [ -f "$SRC_DIR/server.py" ]; then
     # rtkserver 是拆包后的代码包（server.py 只是入口壳），漏掉它 systemctl start
     # 会立刻 ModuleNotFoundError: No module named 'rtkserver'。
     for item in server.py rtkserver reset_config.py requirements.txt install.sh uninstall.sh update.sh \
-                README.md INSTALL.md INSTALL.en.md LICENSE templates static docs; do
+                README.md INSTALL.md INSTALL.en.md LICENSE templates static docs tests; do
         if [ -e "$SRC_DIR/$item" ]; then
             cp -r "$SRC_DIR/$item" "$INSTALL_DIR/"
         fi
     done
     # 清掉源码目录可能带过来的字节码缓存，避免 .pyc 与源码不一致
     find "$INSTALL_DIR/rtkserver" -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null
+
+    # 记录安装版本。网页上的「当前版本 / 检查更新」全靠这个文件：
+    # 安装目录不带 .git，事后无法反查装的是哪一版。
+    SRC_COMMIT=""
+    if [ -d "$SRC_DIR/.git" ] && command -v git >/dev/null 2>&1; then
+        SRC_COMMIT=$(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null || true)
+    fi
+    printf '{"commit":"%s","date":"%s","installed_at":"%s","source":"install.sh","channel":"install"}\n' \
+        "${SRC_COMMIT}" "$(date '+%Y-%m-%d %H:%M:%S')" "$(date '+%Y-%m-%d %H:%M:%S')" \
+        > "$INSTALL_DIR/.version"
 else
     echo -e "${RED}未找到程序文件: $SRC_DIR/server.py${NC}"
     echo "请确保在包含 server.py 的目录中运行此脚本"

@@ -289,6 +289,68 @@
           </div>
         </section>
 
+        <!-- 系统维护：版本、升级、卸载。
+             升级会重启服务，页面会短暂断开，因此交互是「发起 → 轮询」两段式，
+             不依赖 WebSocket。 -->
+        <section class="card mt-20 fade-in" id="maint-card">
+          <div class="card-pad">
+            <div class="card-hd">
+              <h1 class="card-title"><i class="fa fa-cogs" aria-hidden="true"></i><span data-i18n="maint.title">系统维护</span></h1>
+            </div>
+
+            <dl class="kv kv--compact">
+              <dt data-i18n="maint.version">当前版本</dt>
+              <dd class="mono" id="maint-version">—</dd>
+              <dt data-i18n="maint.installed">最近升级</dt>
+              <dd id="maint-installed">—</dd>
+              <dt data-i18n="maint.ports">升级前需释放端口</dt>
+              <dd class="mono" id="maint-ports">—</dd>
+            </dl>
+
+            <div class="form-row">
+              <div class="field">
+                <label class="form-label" for="maint-source" data-i18n="maint.source">升级源</label>
+                <select id="maint-source" class="form-input"></select>
+              </div>
+              <div class="field">
+                <label class="form-label" style="visibility: hidden;">actions</label>
+                <div class="input-row">
+                  <button type="button" id="maint-check" class="btn btn-secondary">
+                    <i class="fa fa-refresh" aria-hidden="true"></i><span data-i18n="maint.check">检查更新</span>
+                  </button>
+                  <button type="button" id="maint-upgrade" class="btn btn-primary">
+                    <i class="fa fa-cloud-upload" aria-hidden="true"></i><span data-i18n="maint.upgrade">一键升级</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div class="field-hint" id="maint-result" data-i18n="maint.hint">
+              升级会停止服务以替换文件，页面会短暂断开，完成后自动恢复。升级失败会自动回退到当前版本。
+            </div>
+
+            <div class="section-sep"></div>
+            <h2 class="sub-title"><i class="fa fa-trash" aria-hidden="true"></i><span data-i18n="maint.uninstall_title">卸载本程序</span></h2>
+            <div class="field-hint" data-i18n="maint.uninstall_hint">
+              卸载会停止服务、删除 systemd 单元与整个安装目录（配置库先备份到 /root）。卸载后本页面将无法再访问，需要重新安装才能恢复。
+            </div>
+            <div class="form-row">
+              <div class="field">
+                <label class="form-label" for="maint-pwd" data-i18n="maint.password">管理员口令</label>
+                <input type="password" id="maint-pwd" class="form-input" autocomplete="current-password">
+              </div>
+              <div class="field">
+                <label class="form-label" for="maint-confirm" data-i18n="maint.confirm">输入 DELETE 以确认</label>
+                <input type="text" id="maint-confirm" class="form-input" placeholder="DELETE" autocomplete="off">
+              </div>
+            </div>
+            <div class="form-actions">
+              <button type="button" id="maint-uninstall" class="btn btn-danger">
+                <i class="fa fa-trash" aria-hidden="true"></i><span data-i18n="maint.uninstall">卸载程序</span>
+              </button>
+            </div>
+          </div>
+        </section>
+
         <!-- 彻底恢复默认配置：不提供网页入口，走 SSH 命令行 -->
         <section class="note mt-20 fade-in">
           <div class="note-title" data-i18n="cfg.reset_title">需要彻底恢复默认配置？</div>
@@ -312,7 +374,23 @@ sudo systemctl start 2rtkserver</pre>
     </div>
   </footer>
 
+  <!-- 升级/卸载进度遮罩：服务重启期间轮询会短暂失败，这里始终显示当前阶段，
+       让用户知道"页面断了是正常的、别关" -->
+  <div class="maint-overlay hidden" id="maint-overlay">
+    <div class="maint-panel">
+      <div class="maint-title">
+        <i class="fa fa-cog fa-spin" aria-hidden="true"></i>
+        <span id="maint-stage">…</span>
+      </div>
+      <div class="maint-bar"><div class="maint-bar-fill" id="maint-bar"></div></div>
+      <div class="maint-msg" id="maint-msg"></div>
+      <pre class="maint-log" id="maint-log"></pre>
+      <div class="maint-foot dim" id="maint-foot"></div>
+    </div>
+  </div>
+
   <script src="/static/i18n.js"></script>
+  <script src="/static/maintenance.js"></script>
   <script>
     document.getElementById('year').textContent = new Date().getFullYear();
 
