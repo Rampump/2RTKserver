@@ -468,6 +468,15 @@ class Runner:
     # ---------- 回滚 ----------
     def rollback(self, reason):
         self.set_state('rolling_back', 85, f'升级失败，正在回退：{reason}', error=reason)
+
+        # 回滚第一步必须是「把失败的版本停下来」。
+        # systemctl start 对已经在运行的服务是 no-op：新版本虽然健康检查不通过，
+        # 进程本身是活着的（只是没监听预期端口），不先 stop 就直接 start，
+        # 回滚后的文件根本不会被加载，服务会继续跑在坏版本上——
+        # 真机实测就是这样：回滚「成功」了，端口却还是新版本那个。
+        self.run(['systemctl', 'stop', self.service], timeout=120)
+        self.wait_ports_free(self.plan.get('ports') or [self.web_port], PORT_FREE_TIMEOUT)
+
         tar_path = self.state.get('backup_tar')
         ok = True
         if tar_path and os.path.exists(tar_path):
@@ -481,6 +490,13 @@ class Runner:
         else:
             self.log("没有可用备份，无法回退", 'ERROR')
             ok = False
+
+        # 备份里不含 __pycache__，但坏版本跑过之后会在目录里留下自己的 .pyc。
+        # 源码回退后 mtime 变旧，某些情况下仍可能命中这些残留字节码。
+        for root, dirs, _files in os.walk(self.install_dir):
+            if '__pycache__' in dirs:
+                shutil.rmtree(os.path.join(root, '__pycache__'), ignore_errors=True)
+                dirs.remove('__pycache__')
 
         db_bak = self.state.get('backup_db')
         db = os.path.join(self.install_dir, '2RTKserver.db')
