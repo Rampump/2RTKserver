@@ -78,9 +78,12 @@ def _run_shutdown_hooks():
 # 只在 main() 里挂一次。所有异常都被吞掉：mDNS 是旁路能力，
 # 它坏掉绝不能让 Web 配置页和数据转发跟着坏。
 def _register_discovery_hooks():
+    from ..version import __version__ as APP_VERSION
+
     def startup():
         from ..discovery.zeroconf_announcer import ZeroconfAnnouncer
-        ann = ZeroconfAnnouncer(web_port=WEB_PORT, on_address_change=_on_mdns_address_change)
+        ann = ZeroconfAnnouncer(web_port=WEB_PORT, on_address_change=_on_mdns_address_change,
+                                version=APP_VERSION)
         if ann.start():
             state.announcer = ann
 

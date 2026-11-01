@@ -15,6 +15,7 @@ from .. import __version__ as APP_VERSION
 from .. import paths
 from ..core.config import get_config
 from ..core.constants import WEB_PORT
+from ..version import UNKNOWN_VERSION
 from . import sources
 
 WORK_DIR = os.path.join(paths.BASE_DIR, '.upgrade')
@@ -32,25 +33,62 @@ ACTIVE_STAGES = {
     'deps', 'starting', 'health', 'rolling_back', 'uninstalling',
 }
 
+# 执行器接管之后才会写的阶段。状态文件一旦是其中之一，就说明执行器已经动手，
+# Web 侧不能再覆盖（会把 pid 盖掉，前端随即失去"执行器崩了"的判据）。
+_RUNNER_STAGES = {
+    'fetching', 'verifying', 'backing_up', 'stopping', 'applying',
+    'deps', 'starting', 'health', 'rolling_back', 'uninstalling',
+}
+
+# 执行器被拉起后迟迟没有写入 pid，超过这个时间就认为它没跑起来
+STALE_SEED_SECONDS = 90
+
 
 # ==================== 版本 ====================
+# 安装目录恰好是个 git 仓库时（开发机 / 手动 clone 后直接跑），用 HEAD 兜底。
+# 只探一次：升级后会重启进程，届时重新探测。
+_git_commit = {'done': False, 'value': ''}
+
+
+def local_git_commit():
+    if _git_commit['done']:
+        return _git_commit['value']
+    _git_commit['done'] = True
+    try:
+        p = subprocess.run(['git', '-C', paths.BASE_DIR, 'rev-parse', '--short', 'HEAD'],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+        if p.returncode == 0:
+            _git_commit['value'] = p.stdout.decode('utf-8', 'replace').strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return _git_commit['value']
+
+
 def current_version():
     """当前安装版本。.version 由 install.sh / update.sh / 升级执行器写入。
 
-    app 是代码包自报的语义化版本（rtkserver.__version__），commit 是实际装的提交。
+    app 是代码包自报的语义化版本（读 VERSION 文件），commit 是实际装的提交。
     两者都要给前端：只报 commit 时用户看不出「这版到底新不新」，
     只报版本号又无法确认装的是不是同一个提交。
     """
     info = {'app': APP_VERSION, 'commit': '', 'date': '', 'installed_at': '',
             'source': '', 'channel': ''}
+    recorded = ''
     try:
         with open(VERSION_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
         if isinstance(data, dict):
             for key in ('commit', 'date', 'installed_at', 'source', 'channel'):
                 info[key] = data.get(key, '') or ''
+            recorded = (data.get('app') or '').strip()
     except (OSError, ValueError):
         pass
+    # 代码这边连 VERSION 都没读到（打包漏了文件）时，用安装记录里的兜底，
+    # 总比在界面上写个 0.0.0 让人以为装了个上古版本强。
+    if info['app'] == UNKNOWN_VERSION and recorded:
+        info['app'] = recorded
+    if not info['commit']:
+        info['commit'] = local_git_commit()
     return info
 
 
@@ -60,6 +98,14 @@ def _pid_alive(pid):
         return True
     except (OSError, TypeError, ValueError):
         return False
+
+
+def _age_seconds(stamp):
+    """'2026-11-01 11:00:00' 距今多少秒；解析不了返回 0（当作刚发生）。"""
+    try:
+        return max(0.0, time.time() - time.mktime(time.strptime(str(stamp), '%Y-%m-%d %H:%M:%S')))
+    except (ValueError, TypeError, OverflowError):
+        return 0.0
 
 
 # ==================== 状态 ====================
@@ -81,6 +127,17 @@ def read_state():
         data['stage'] = 'failed'
         data['stage_text'] = '升级中断'
         data['message'] = '升级进程已退出但未写入最终状态，请查看 .upgrade/upgrade.log'
+        return data
+    # 更早的一种卡死：systemd-run 返回成功，但单元根本没跑起来（此时还没有 pid）。
+    # 不处理的话前端会一直转圈到 12 分钟超时，用户完全不知道发生了什么。
+    if (data['active'] and not data.get('pid')
+            and data.get('stage') in ('queued', 'uninstalling')
+            and _age_seconds(data.get('started_at')) > STALE_SEED_SECONDS):
+        data['active'] = False
+        data['stage'] = 'failed'
+        data['stage_text'] = '任务未能启动'
+        data['message'] = ('升级进程未启动（systemd-run 可能失败），服务仍在运行，'
+                           '请执行 journalctl -u 2rtk-upgrader -n 50 查看原因')
     return data
 
 
@@ -180,6 +237,9 @@ def check_updates():
         'branch': conf['branch'],
         'sources': results,
         'reachable': len(reachable) > 0,
+        # 本机没记录安装提交时无法判断"有没有更新"，前端不能显示「已是最新」，
+        # 那会让用户以为真的没事，实际只是不知道。
+        'local_commit_known': bool(cur_commit),
         'has_update': any(r['has_update'] for r in reachable),
     }
 
@@ -241,6 +301,38 @@ def _launch(plan, mode):
         return False, 'systemd-run 超时'
 
 
+def _seed_state(mode, message, progress, from_commit=''):
+    """拉起执行器之后立刻写一个过渡态，避免前端第一次轮询读到上一轮的终态。
+
+    两个必须堵住的坑：
+      1. 上一轮升级留下的 stage=success 会让前端以为这次也成功了；
+      2. 卸载时状态文件若是 idle，前端会当场显示"卸载完成"，而实际上一个字节都还没删。
+    但执行器是同时启动的，它可能已经写了 fetching / uninstalling（带自己的 pid）。
+    pid 一旦被覆盖，Web 侧就无法判断执行器是否崩溃，前端会永远卡在"升级中"。
+    所以只在状态文件还是上一轮的终态时才写 —— 执行器一旦动手就立刻让位。
+    """
+    stage = read_state().get('stage', 'idle')
+    if stage in _RUNNER_STAGES:
+        return
+    stage_name = 'uninstalling' if mode == 'uninstall' else 'queued'
+    stage_text = '正在卸载' if mode == 'uninstall' else '排队中'
+    payload = {
+        'mode': mode, 'stage': stage_name, 'stage_text': stage_text,
+        'progress': progress, 'message': message,
+        'error': '', 'rolled_back': False, 'finished_at': '',
+        'from_version': from_commit,
+        'started_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    try:
+        os.makedirs(WORK_DIR, exist_ok=True)
+        tmp = STATE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, STATE_FILE)
+    except OSError:
+        pass
+
+
 def start_upgrade(source_key=None):
     """发起升级。返回 (ok, message)。真正结果由前端轮询状态获得。"""
     st = read_state()
@@ -271,18 +363,7 @@ def start_upgrade(source_key=None):
     }
     ok, msg = _launch(plan, 'upgrade')
     if ok:
-        # 立刻写一个"排队中"状态，避免前端第一次轮询读到上一轮的 success
-        try:
-            with open(STATE_FILE, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'mode': 'upgrade', 'stage': 'queued', 'stage_text': '排队中',
-                    'progress': 2, 'message': '升级任务已受理，即将停止服务…',
-                    'error': '', 'rolled_back': False, 'finished_at': '',
-                    'from_version': cur.get('commit', ''),
-                    'started_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-                }, f, ensure_ascii=False, indent=1)
-        except OSError:
-            pass
+        _seed_state('upgrade', '升级任务已受理，即将停止服务…', 2, cur.get('commit', ''))
     return ok, msg
 
 
@@ -299,19 +380,25 @@ def start_uninstall(backup_db=True):
         'backup_db': bool(backup_db),
         'delay': 3,
     }
-    return _launch(plan, 'uninstall')
+    ok, msg = _launch(plan, 'uninstall')
+    if ok:
+        # 卸载也要先占位：否则前端第一次轮询读到的还是上一轮的 success / idle，
+        # 会立刻显示"升级完成"或"卸载完成"，而服务其实还活得好好的。
+        _seed_state('uninstall', '卸载任务已受理，即将停止服务…', 5)
+    return ok, msg
 
 
 def snapshot():
     """给前端的一揽子信息。"""
+    conf = sources.resolved()
     return {
         'version': current_version(),
         'state': read_state(),
         'ports': managed_ports(),
         'sources': [
             {'key': k, 'label': label, 'url': url}
-            for k, label, url in sources.resolved()['sources']
+            for k, label, url in conf['sources']
         ],
-        'branch': sources.resolved()['branch'],
+        'branch': conf['branch'],
         'log_tail': _tail_log(),
     }

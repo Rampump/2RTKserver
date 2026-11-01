@@ -54,7 +54,11 @@
     parts.push(v.commit || t('maint.ver_unknown'));
     setText('maint-version', parts.join(' · '));
     setText('maint-installed', v.installed_at || '—');
-    setText('maint-ports', (info.ports || []).join(' / ') || '5757');
+    // 端口只在明确传了数组时才更新。以前这里从已经渲染出来的文本里 split 回来，
+    // 元素一旦不存在就直接抛异常，把"检查更新"变成"检查失败"。
+    if (Array.isArray(info.ports)) {
+      setText('maint-ports', info.ports.join(' / ') || '—');
+    }
   }
 
   function renderSources(info) {
@@ -88,6 +92,10 @@
       box.appendChild(head);
     } else if (data.has_update) {
       head.innerHTML = '<span class="is-warn">' + t('maint.has_update') + '</span>';
+      box.appendChild(head);
+    } else if (data.local_commit_known === false) {
+      // 本机没记录安装提交：此时"没有更新"和"不知道"是两回事，不能骗用户说已是最新
+      head.innerHTML = '<span class="is-warn">' + t('maint.commit_unknown') + '</span>';
       box.appendChild(head);
     } else {
       head.innerHTML = '<span class="is-ok">' + t('maint.up_to_date') + '</span>';
@@ -146,8 +154,7 @@
 
   async function poll() {
     if (Date.now() - pollStart > POLL_MAX) {
-      setOverlay(t('maint.timed_out'), 100, t('maint.timed_out_msg'), undefined,
-        t('maint.foot_manual'));
+      showManualHint(t('maint.timed_out'), t('maint.timed_out_msg'), t('maint.foot_manual'));
       return;
     }
     try {
@@ -161,17 +168,25 @@
       failStreak = 0;
       const st = data.state || {};
 
+      // 卸载：服务会被彻底移除，最后一个状态文件也跟着安装目录一起消失，
+      // 所以永远读不到「已完成」，只能靠请求持续失败来判定。
+      // 这里绝不能因为 stage 是 idle / success 就提前收工 —— 那可能只是上一轮
+      // 留下的旧状态，此时一个字节都还没删，却对用户说"已卸载"。
+      if (jobMode === 'uninstall') {
+        // 只认本次卸载自己写下的失败状态：上一轮升级留下的 failed 不算
+        if (st.stage === 'failed' && st.mode === 'uninstall') {
+          finish(st);
+          return;
+        }
+        setOverlay(st.stage_text || t('maint.uninstalling'), st.progress || 10,
+          st.message || '', data.log_tail || '', buildFoot(st));
+        schedulePoll();
+        return;
+      }
+
       setOverlay(st.stage_text || st.stage || '', st.progress || 0,
         st.message || '', data.log_tail || '', buildFoot(st));
 
-      // 卸载模式下服务会被彻底移除，读不到终态，只能靠"请求持续失败"判断
-      if (jobMode === 'uninstall' && st.stage !== 'uninstalling') {
-        // 目录已经删掉、状态文件不存在 → 服务肯定已经没了
-        if (st.stage === 'idle') {
-          finishUninstall();
-          return;
-        }
-      }
       if (TERMINAL.has(st.stage) || (st.finished_at && st.finished_at !== '')) {
         finish(st);
         return;
@@ -180,14 +195,32 @@
     } catch (e) {
       // 服务正在重启，连接被拒是预期内的
       failStreak += 1;
-      if (jobMode === 'uninstall' && failStreak >= 8) {
+      const elapsed = Date.now() - pollStart;
+      // 卸载要"连续失败"且已经等够 15 秒才判定完成：单次失败可能只是服务
+      // 正在重启，太早下结论会把还在删文件的设备说成已卸载。
+      if (jobMode === 'uninstall' && failStreak >= 8 && elapsed > 15000) {
         finishUninstall();
         return;
       }
       setOverlay(t('maint.restarting'), null,
         t('maint.restarting_msg'), undefined,
-        t('maint.foot_wait', { n: Math.round((Date.now() - pollStart) / 1000) }));
+        t('maint.foot_wait', { n: Math.round(elapsed / 1000) }));
       schedulePoll();
+    }
+  }
+
+  // 等待超时 / 需要人工介入：给一个能刷新的出口，否则遮罩永远关不掉
+  function showManualHint(title, msg, foot) {
+    stopPoll();
+    setOverlay(title, 100, msg, undefined, foot);
+    const panel = document.querySelector('.maint-panel');
+    if (panel && !panel.querySelector('.maint-close')) {
+      const btn = document.createElement('button');
+      btn.className = 'btn btn-secondary maint-close';
+      btn.style.marginTop = '12px';
+      btn.textContent = t('maint.close');
+      btn.onclick = () => window.location.reload();
+      panel.appendChild(btn);
     }
   }
 
@@ -200,9 +233,15 @@
 
   function finish(st) {
     stopPoll();
+    if (st.stage === 'uninstalled') {
+      finishUninstall();
+      return;
+    }
     const ok = st.stage === 'success';
     const rolled = st.stage === 'rolled_back';
-    const title = ok ? t('maint.ok') : (rolled ? t('maint.rolled') : t('maint.failed'));
+    // 卸载失败要说"卸载失败"，不能说成"升级失败"
+    const failTitle = st.mode === 'uninstall' ? t('maint.uninstall_failed') : t('maint.failed');
+    const title = ok ? t('maint.ok') : (rolled ? t('maint.rolled') : failTitle);
     const msg = st.message || '';
     const bar = $('maint-bar');
     if (bar) bar.style.width = '100%';
@@ -256,8 +295,8 @@
     try {
       const data = await jsonFetch('/api/upgrade/check', { method: 'POST' });
       renderCheckResult(data);
-      // 只更新版本与端口，不重建整个面板状态
-      renderVersion({ version: data.current, ports: $('maint-ports').textContent.split(' / ') });
+      // 只更新版本，端口保持上一次渲染的结果（check 接口不下发端口列表）
+      renderVersion({ version: data.current });
     } catch (e) {
       const box = $('maint-result');
       box.className = 'field-hint is-bad';
@@ -325,6 +364,23 @@
   }
 
   // ---------- 初始化 ----------
+  // 上一次升级失败了，但用户已经刷新/重连过页面：不能再靠遮罩（那是任务进行中才有的），
+  // 必须把原因和"已退回原版本"再讲一遍，否则用户只看到一句"当前版本"，什么都不知道。
+  // 只回溯 30 分钟内的结果，避免几个月前的失败一直挂在页面上。
+  function renderLastResult(st) {
+    if (st.active) return;
+    if (st.stage !== 'failed' && st.stage !== 'rolled_back') return;
+    const when = Date.parse(String(st.finished_at || '').replace(' ', 'T'));
+    if (isNaN(when) || Date.now() - when > 30 * 60 * 1000) return;
+    const box = $('maint-result');
+    if (!box) return;
+    const from = st.from_version || st.old_commit || '';
+    let text = t('maint.reason', { msg: st.error || st.message || t('maint.unknown_reason') });
+    if (st.stage === 'rolled_back' && from) text += ' ' + t('maint.rolled_to', { v: from });
+    box.className = 'field-hint is-bad';
+    box.textContent = text;
+  }
+
   async function refreshStatus() {
     try {
       const data = await jsonFetch('/api/upgrade/status');
@@ -338,6 +394,8 @@
         setOverlay(st.stage_text || '', st.progress || 0, st.message || '',
           data.log_tail || '', '');
         schedulePoll();
+      } else {
+        renderLastResult(st);
       }
     } catch (e) {
       setText('maint-version', t('maint.load_fail'), 'mono is-bad');

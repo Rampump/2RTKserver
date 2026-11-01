@@ -229,6 +229,17 @@ printf 'y\ny\n' | sudo bash /opt/2RTKserver/uninstall.sh
 升级期间 Web 服务会停止几秒到几十秒，页面上的连接会断——这是正常的，页面会自己
 继续轮询并在结束后自动刷新；失败时会显示具体原因，并明确告知已退回升级前的版本。
 
+### 版本号只有一个来源
+
+版本号写在程序根目录的 `VERSION` 文件里（一行 `主.次.修`，例如 `2.2.2`）：
+
+- 网页「系统维护」显示 `v<版本> · <提交号>`：版本读 `VERSION`，提交号读 `.version`；
+- 控制台横幅、mDNS 广播的版本字段也都从这一份读，**代码里不再出现任何硬编码版本号**
+  （`tests/test_contract.py::TestVersionSingleSource` 会拦住写死的版本串）；
+- `install.sh` / `update.sh` / 升级执行器都会把 `VERSION` 一起复制，并把它记进 `.version`；
+- 发新版本时**只改 `VERSION` 这一行**再提交即可。万一打包漏了 `VERSION`，界面会显示
+  `v0.0.0`——看到它就是提醒"这包不完整"，而不是真有个上古版本。
+
 两个仓库地址（**仓库名不同，属正常**，代码里按地址区分，不要求同名）：
 
 - GitCode 镜像：`https://gitcode.com/rampump/NTRIPserver.git`（国内可达，优先）

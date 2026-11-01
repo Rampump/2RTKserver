@@ -112,10 +112,13 @@ class ZeroconfAnnouncer:
     """把本机以 `2rtk.local` 的名字广播到局域网。"""
 
     def __init__(self, hostname=DEFAULT_HOSTNAME, web_port=DEFAULT_WEB_PORT,
-                 on_address_change=None):
+                 on_address_change=None, version=''):
         self.hostname = (hostname or DEFAULT_HOSTNAME).strip().rstrip('.')
         self.web_port = int(web_port or DEFAULT_WEB_PORT)
         self.on_address_change = on_address_change
+        # 版本号由调用方传入（lifecycle 从 rtkserver.version 取），
+        # 本文件坚持「不 import 任何项目内模块」，不自己去读。
+        self.version = (version or '').strip()
 
         self._zc = None
         self._http_info = None
@@ -306,16 +309,18 @@ class ZeroconfAnnouncer:
 
     def _build_http_info(self, host, addresses):
         from zeroconf import ServiceInfo
+        properties = {
+            'path': '/',
+            'product': '2RTK NTRIP Server',
+        }
+        if self.version:
+            properties['version'] = self.version
         return ServiceInfo(
             MDNS_HTTP_TYPE,
             f"{host}.{MDNS_HTTP_TYPE}",
             addresses=[socket.inet_aton(ip) for ip in addresses],
             port=self.web_port,
-            properties={
-                'path': '/',
-                'product': '2RTK NTRIP Server',
-                'version': '2.1.8',
-            },
+            properties=properties,
             server=f"{host}.local.",
         )
 

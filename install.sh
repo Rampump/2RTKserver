@@ -73,7 +73,7 @@ if [ -f "$SRC_DIR/server.py" ]; then
     # rtkserver 是拆包后的代码包（server.py 只是入口壳），漏掉它 systemctl start
     # 会立刻 ModuleNotFoundError: No module named 'rtkserver'。
     for item in server.py rtkserver reset_config.py requirements.txt install.sh uninstall.sh update.sh \
-                README.md INSTALL.md INSTALL.en.md LICENSE templates static docs tests; do
+                VERSION README.md INSTALL.md INSTALL.en.md LICENSE templates static docs tests; do
         if [ -e "$SRC_DIR/$item" ]; then
             cp -r "$SRC_DIR/$item" "$INSTALL_DIR/"
         fi
@@ -83,12 +83,14 @@ if [ -f "$SRC_DIR/server.py" ]; then
 
     # 记录安装版本。网页上的「当前版本 / 检查更新」全靠这个文件：
     # 安装目录不带 .git，事后无法反查装的是哪一版。
+    # app 取自 VERSION（语义化版本，代码也读同一份），commit 是实际装的提交。
+    APP_VER="$(head -n1 "$SRC_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')"
     SRC_COMMIT="${SRC_COMMIT_OVERRIDE:-}"
     if [ -z "$SRC_COMMIT" ] && [ -d "$SRC_DIR/.git" ] && command -v git >/dev/null 2>&1; then
         SRC_COMMIT=$(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null || true)
     fi
-    printf '{"commit":"%s","date":"%s","installed_at":"%s","source":"install.sh","channel":"install"}\n' \
-        "${SRC_COMMIT}" "$(date '+%Y-%m-%d %H:%M:%S')" "$(date '+%Y-%m-%d %H:%M:%S')" \
+    printf '{"app":"%s","commit":"%s","date":"%s","installed_at":"%s","source":"install.sh","channel":"install"}\n' \
+        "${APP_VER}" "${SRC_COMMIT}" "$(date '+%Y-%m-%d %H:%M:%S')" "$(date '+%Y-%m-%d %H:%M:%S')" \
         > "$INSTALL_DIR/.version"
 else
     echo -e "${RED}未找到程序文件: $SRC_DIR/server.py${NC}"

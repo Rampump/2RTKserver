@@ -81,21 +81,15 @@ def get_db():
     return sqlite3.connect(CONFIG_DB, timeout=10)
 
 
-def get_config():
-    # 这里原先每次都调 init_db()：等于每个 HTTP 请求都新建一次连接、
-    # 执行一次 CREATE TABLE IF NOT EXISTS 和 COUNT(*)、再提交一次事务。
-    # 建表只在 main() 启动时做一次就够了。
-    config = {}
-    logging.debug("开始从数据库读取配置信息")
-    with contextlib.closing(get_db()) as conn:
-        cursor = conn.execute("SELECT key, value FROM settings")
-        for key, value in cursor.fetchall():
-            config[key.lower()] = value
-    # 会话密钥不能出现在配置接口/模板里，否则等于把密钥交给前端
-    config.pop('secret_key', None)
-    logging.debug("配置信息读取完成")
-    int_fields = ['caster_port', 'relay_port', 'baud_rate', 'local_caster_port', 'radio_baud']
-    for field in int_fields:
+# 读库失败只详细记一次：get_config() 是高频调用，每 2 秒的状态推送都会走到这里，
+# 每次都打完整堆栈会把日志刷满，真正的故障反而看不见。
+_db_error_logged = {'done': False}
+
+_INT_FIELDS = ['caster_port', 'relay_port', 'baud_rate', 'local_caster_port', 'radio_baud']
+
+
+def _normalize_int_fields(config):
+    for field in _INT_FIELDS:
         raw_val = config.get(field)
         if raw_val is None or raw_val == '':
             config[field] = 0
@@ -107,8 +101,41 @@ def get_config():
     return config
 
 
+def get_config():
+    # 这里原先每次都调 init_db()：等于每个 HTTP 请求都新建一次连接、
+    # 执行一次 CREATE TABLE IF NOT EXISTS 和 COUNT(*)、再提交一次事务。
+    # 建表只在 main() 启动时做一次就够了。
+    config = {}
+    logging.debug("开始从数据库读取配置信息")
+    try:
+        with contextlib.closing(get_db()) as conn:
+            cursor = conn.execute("SELECT key, value FROM settings")
+            for key, value in cursor.fetchall():
+                config[key.lower()] = value
+    except sqlite3.Error as e:
+        # 库文件被写成 0 字节 / 表丢了 / 磁盘满时，不能让配置页直接 500。
+        # 退回默认值：页面能打开、能看见问题，用户可以重新保存一次配置（save_config 会自愈建表）。
+        if not _db_error_logged['done']:
+            _db_error_logged['done'] = True
+            logging.error(f"读取配置库失败，暂时按默认配置处理：{e}")
+        config = dict(DEFAULT_CONFIG)
+    # 会话密钥不能出现在配置接口/模板里，否则等于把密钥交给前端
+    config.pop('secret_key', None)
+    logging.debug("配置信息读取完成")
+    return _normalize_int_fields(config)
+
+
 def save_config(config: dict):
-    """保存配置到数据库"""
+    """保存配置到数据库。表不存在时先自愈建表再重试一次。"""
+    try:
+        _save_config_once(config)
+    except sqlite3.OperationalError as e:
+        logging.warning(f"写配置库失败（{e}），尝试重建配置表后重试")
+        init_db()
+        _save_config_once(config)
+
+
+def _save_config_once(config: dict):
     with contextlib.closing(get_db()) as conn:
         existing = {}
         cursor = conn.execute("SELECT key, value FROM settings")

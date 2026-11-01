@@ -437,4 +437,6 @@ printf 'y\ny\n' | sudo bash /opt/2RTKserver/uninstall.sh
 
 **升级请用 `update.sh`，不要用 `install.sh`**：后者结尾是 `systemctl start`，对已在运行的服务是空操作，文件换了但进程还跑旧代码。
 
+**版本号只认根目录的 `VERSION` 文件**（一行 `主.次.修`）：网页「系统维护」、控制台横幅、mDNS 广播都从这一份读，代码里没有硬编码版本号。发新版本时只改这一行，`install.sh` / `update.sh` / 网页升级会自动带上它。
+
 **安卓手机 / 平板：系统不支持 .local 名字解析，请用首页显示的「本机 IP」访问（`http://设备IP:5757`）。**

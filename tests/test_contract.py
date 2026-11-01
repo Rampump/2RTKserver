@@ -527,3 +527,140 @@ class TestRadioLogThrottle(unittest.TestCase):
         st = bridge.status()
         self.assertFalse(st['connected'])
         self.assertTrue(st['last_error'])
+
+
+class TestVersionSingleSource(unittest.TestCase):
+    """版本号只能有一个来源：安装根目录的 VERSION。
+
+    背景：版本号原先散落在 server.py、rtkserver/__init__.py、控制台 LOGO 和
+    mDNS TXT 记录四处，发版漏改一处就会出现「网页 2.2.1、mDNS 2.1.8」这种
+    自相矛盾的信息。这组断言把"只改一个文件"锁死，谁再写死版本号会立刻红。
+    """
+
+    def setUp(self):
+        from rtkserver import version
+        self.version = version
+
+    def test_version_file_semver(self):
+        with open(self.version.VERSION_FILE, 'r', encoding='utf-8') as f:
+            text = f.read().strip()
+        self.assertRegex(text, r'^\d+\.\d+\.\d+$', 'VERSION 必须是 主.次.修 三段式')
+
+    def test_package_version_matches_file(self):
+        import rtkserver
+        with open(self.version.VERSION_FILE, 'r', encoding='utf-8') as f:
+            text = f.read().strip()
+        self.assertEqual(rtkserver.__version__, text)
+
+    def test_server_module_exports_same_version(self):
+        import server
+        import rtkserver
+        self.assertEqual(server.__version__, rtkserver.__version__)
+
+    def test_missing_file_falls_back_to_placeholder(self):
+        # 打包漏了 VERSION 时不能崩，也不能报一个"看起来像真版本"的号
+        self.assertEqual(self.version.read_version('/nonexistent/VERSION'),
+                         self.version.UNKNOWN_VERSION)
+
+    def test_bad_content_falls_back(self):
+        import tempfile
+        for bad in ('', 'abc', '2.2', '2.2.2.1'):
+            with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False,
+                                             encoding='utf-8') as f:
+                f.write(bad)
+                path = f.name
+            try:
+                self.assertEqual(self.version.read_version(path),
+                                 self.version.UNKNOWN_VERSION, bad)
+            finally:
+                os.unlink(path)
+
+    def test_version_tuple(self):
+        self.assertEqual(self.version.version_tuple('2.2.2'), (2, 2, 2))
+        self.assertEqual(self.version.version_tuple('2.2.2-rc1'), (2, 2, 2))
+        self.assertEqual(self.version.version_tuple('abc'), (0, 0, 0))
+
+    def test_no_semver_literals_in_code(self):
+        """代码里不许再出现 'x.y.z' 形式的硬编码版本号。
+
+        rtkserver/version.py 豁免：它是唯一允许出现版本字面量的地方（占位值
+        0.0.0），它的内容由 test_package_version_matches_file 单独核对。
+        """
+        import re
+        pattern = re.compile(r"""(['"])\d+\.\d+\.\d+\1""")
+        targets = [os.path.join(REPO_ROOT, 'server.py')]
+        for root, _dirs, files in os.walk(os.path.join(REPO_ROOT, 'rtkserver')):
+            if '__pycache__' in root:
+                continue
+            targets += [os.path.join(root, f) for f in files
+                        if f.endswith('.py') and f != 'version.py']
+        for path in targets:
+            with open(path, 'r', encoding='utf-8') as f:
+                for lineno, line in enumerate(f, 1):
+                    self.assertIsNone(
+                        pattern.search(line),
+                        f'{os.path.relpath(path, REPO_ROOT)}:{lineno} 写死了版本号: {line.strip()}')
+
+    def test_logo_and_announcer_use_shared_version(self):
+        from rtkserver import __version__
+        from rtkserver.core.constants import ART_LOGO
+        from rtkserver.discovery.zeroconf_announcer import ZeroconfAnnouncer
+        self.assertIn(__version__, ART_LOGO)
+        self.assertEqual(ZeroconfAnnouncer(version=__version__).version, __version__)
+        # 默认不猜版本：没有传入时宁可不写这条 TXT 记录
+        self.assertEqual(ZeroconfAnnouncer().version, '')
+
+    def test_installers_ship_version_file(self):
+        """安装/更新脚本必须把 VERSION 一起复制过去，否则装完版本号就是 0.0.0。"""
+        for name in ('install.sh', 'update.sh'):
+            with open(os.path.join(REPO_ROOT, name), 'r', encoding='utf-8') as f:
+                text = f.read()
+            self.assertIn('VERSION', text, f'{name} 的复制清单漏了 VERSION')
+            self.assertIn('"app"', text, f'{name} 写 .version 时没记录 app 版本')
+
+    def test_upgrade_runner_syncs_version_file(self):
+        from rtkserver.upgrade import service as svc
+        with open(svc.RUNNER_SRC, 'r', encoding='utf-8') as f:
+            src = f.read()
+        self.assertIn("'VERSION'", src, '升级执行器的 SYNC_ITEMS 漏了 VERSION')
+        self.assertIn("'app':", src, '升级执行器写 .version 时没记录 app 版本')
+
+
+class TestConfigDbResilience(unittest.TestCase):
+    """配置库被写成 0 字节 / 表丢了，不能让配置页直接 500。
+
+    .19 那台设备上真实出现过"多处 0 字节的空壳文件"，配置库就是其中之一：
+    当时的状态是网页能打开、一进配置页就崩，用户完全不知道该删哪个文件。
+    """
+
+    def setUp(self):
+        import tempfile
+        from rtkserver.core import config as cfgmod
+        self.cfgmod = cfgmod
+        self.tmpdir = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmpdir, '2RTKserver.db')
+        open(self.path, 'wb').close()          # 0 字节，等价于"表不存在"
+        self.old = cfgmod.CONFIG_DB
+        cfgmod.CONFIG_DB = self.path
+        cfgmod._db_error_logged['done'] = False
+
+    def tearDown(self):
+        import shutil
+        self.cfgmod.CONFIG_DB = self.old
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_read_falls_back_to_defaults(self):
+        from rtkserver.core.config import DEFAULT_CONFIG
+        cfg = self.cfgmod.get_config()
+        self.assertEqual(cfg['mode'], 'none')
+        self.assertEqual(cfg['caster_port'], 2101)      # 仍然做了 int 归一
+        # 退回的是完整默认值，不是一张空表
+        self.assertEqual(set(cfg) - {'secret_key'}, set(DEFAULT_CONFIG))
+
+    def test_save_self_heals_the_table(self):
+        self.cfgmod.save_config({'mode': 'relay', 'relay_host': 'caster.example.com'})
+        cfg = self.cfgmod.get_config()
+        self.assertEqual(cfg['mode'], 'relay')
+        self.assertEqual(cfg['relay_host'], 'caster.example.com')
+        # 自愈时会把缺失的默认键一并补齐，不留下半张表
+        self.assertEqual(cfg['local_caster_port'], 2102)

@@ -231,6 +231,21 @@ The web service stops for a few seconds while upgrading, so the page loses its
 connection — that is expected. The page keeps polling, refreshes itself on success,
 and on failure shows the reason plus a clear note that the previous version was restored.
 
+### One single source for the version number
+
+The version lives in the `VERSION` file at the program root (a single `major.minor.patch`
+line such as `2.2.2`):
+
+- Maintenance page shows `v<version> · <commit>`: the version comes from `VERSION`,
+  the commit from `.version`;
+- the console banner and the mDNS TXT record read the same file, and **no version
+  string is hard-coded in the code** (`tests/test_contract.py::TestVersionSingleSource`
+  fails on any hard-coded `x.y.z`);
+- `install.sh`, `update.sh` and the upgrade runner all copy `VERSION` and record it in
+  `.version`;
+- to cut a release, edit **only that one line** and commit. If a package ever ships
+  without `VERSION`, the UI shows `v0.0.0` — that is a packaging warning, not a real version.
+
 Two repositories are used, and **the repository names differ on purpose** — the code
 addresses them by URL, no renaming required:
 

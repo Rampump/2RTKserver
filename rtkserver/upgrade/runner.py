@@ -322,6 +322,10 @@ class Runner:
             if not os.path.exists(os.path.join(self.staging, item)):
                 self.log(f"新版本缺少必要文件: {item}", 'ERROR')
                 return False, f'新版本缺少必要文件: {item}'
+        # VERSION 是版本号的唯一来源（rtkserver/version.py 从它读）。
+        # 缺失不致命（会显示 0.0.0），但必须留下痕迹，否则发版漏打包没人发现。
+        if not self.staged_app_version():
+            self.log("新版本缺少 VERSION 文件，升级后版本号会显示为 0.0.0", 'WARN')
 
         # 1) 语法编译：整包编译一遍，语法错误在这里就拦住，绝不带上线
         py = self.python
@@ -339,7 +343,7 @@ class Runner:
         if rc != 0 or 'ok' not in out:
             return False, '新版本无法导入（依赖或包结构有问题）'
 
-        # 3) 契约测试：仓库自带 41 条断言，覆盖路由表/默认配置/解帧等
+        # 3) 契约测试：仓库自带的断言，覆盖路由表/默认配置/解帧等
         tests_dir = os.path.join(self.staging, 'tests')
         if os.path.isdir(tests_dir):
             rc, out = self.run(
@@ -436,14 +440,27 @@ class Runner:
         self.state['copied'] = copied
         return True, ''
 
+    def staged_app_version(self):
+        """读新版本自带的 VERSION（纯文本，标准库直读，绝不 import 项目模块）。"""
+        try:
+            with open(os.path.join(self.staging, 'VERSION'), 'r', encoding='utf-8') as f:
+                text = f.read().strip()
+            return text.splitlines()[0].strip() if text else ''
+        except (OSError, IndexError):
+            return ''
+
     def write_version(self):
         ver = {
+            # 语义化版本与提交号都记：只记 commit 用户看不出"这版新不新"，
+            # 只记版本号又无法确认装的是不是同一个提交。
+            'app': self.staged_app_version(),
             'commit': self.state.get('new_commit', ''),
             'date': self.state.get('new_date', ''),
             'source': self.state.get('source', ''),
             'installed_at': time.strftime('%Y-%m-%d %H:%M:%S'),
             'channel': 'upgrade',
         }
+        self.state['new_app'] = ver['app']
         try:
             with open(os.path.join(self.install_dir, '.version'), 'w', encoding='utf-8') as f:
                 json.dump(ver, f, ensure_ascii=False)
@@ -590,11 +607,19 @@ class Runner:
         if not self.health_check(self.web_port):
             return 0 if self.rollback('新版本启动后 Web 端口无响应') else 1
 
-        self.set_state('success', 100, f'升级完成：{commit}',
+        self.set_state('success', 100, f'升级完成：{self._version_label(commit)}',
                        finished_at=time.strftime('%Y-%m-%d %H:%M:%S'),
                        new_version=commit)
         self.log("=== 升级成功 ===")
         return 0
+
+    def _version_label(self, commit=''):
+        """给用户看的版本串：优先「2.2.2（abc1234）」，缺哪个就只显示另一个。"""
+        app = self.state.get('new_app') or self.staged_app_version()
+        commit = commit or self.state.get('new_commit', '')
+        if app and commit:
+            return f'{app}（{commit}）'
+        return app or commit or '新版本'
 
     def do_uninstall(self):
         self.state = {

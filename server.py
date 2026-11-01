@@ -46,11 +46,11 @@ from rtkserver.core.config import (DEFAULT_CONFIG, get_config, init_db,  # noqa:
 from rtkserver.security import (get_or_create_secret_key, hash_password,  # noqa: E402
                                  verify_password)
 from rtkserver.web.app import create_app  # noqa: E402
-
-__version__ = '2.1.8'
+# 版本号只从 VERSION 文件读（见 rtkserver/version.py），这里不要再写死。
+from rtkserver.version import __version__  # noqa: E402
 
 __all__ = [
-    'main', 'create_app',
+    'main', 'create_app', '__version__',
     'BASE_DIR', 'CONFIG_DB', 'SECRET_KEY_FILE', 'DEFAULT_CONFIG',
     'get_config', 'save_config', 'init_db', 'reset_config_to_default',
     'hash_password', 'verify_password', 'get_or_create_secret_key',
