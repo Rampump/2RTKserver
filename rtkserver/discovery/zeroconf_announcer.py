@@ -137,7 +137,7 @@ class ZeroconfAnnouncer:
     def start(self) -> bool:
         """注册 _http._tcp 服务（自带 A 记录）。失败只返回 False，不抛异常。"""
         try:
-            from zeroconf import IPVersion, NonUniqueNameException, ServiceInfo, Zeroconf
+            from zeroconf import IPVersion, Zeroconf
         except ImportError as e:
             # 老设备只更新代码、没更新依赖时走这里：其它功能完全不受影响
             self._state = 'unavailable'
@@ -154,42 +154,14 @@ class ZeroconfAnnouncer:
                 # 极老版本不接受 ip_version 关键字
                 self._zc = Zeroconf()
 
-            addresses = _local_ipv4_addresses()
-            if not addresses:
-                self._state = 'unavailable'
-                self._last_error = '未找到可用的 IPv4 地址'
-                logger.warning("mDNS 固定地址不可用：本机没有非回环 IPv4 地址（网络未连接？）")
-                self._close_zc()
-                return False
-
-            host = self._resolve_hostname(addresses)
-            info = None
-            # allow_name_change 只改「服务实例名」，A 记录用的 server 不会跟着改，
-            # 所以冲突必须由 _resolve_hostname 提前规避（它看的是真实的 server），
-            # 这里再用 allow_name_change=False 兜住"探测与注册之间"的竞态。
-            for suffix in range(0, MAX_NAME_SUFFIX + 1):
-                candidate_host = host if suffix == 0 else f'{self.hostname}-{suffix + 1}'
-                candidate = self._build_http_info(candidate_host, addresses)
-                try:
-                    self._zc.register_service(candidate, allow_name_change=False)
-                except NonUniqueNameException:
-                    logger.warning(f"mDNS 名称 {candidate_host}.local 注册时被占用，换下一个后缀重试")
-                    continue
-                info = candidate
-                self._server = f'{candidate_host}.local.'
-                break
-            if info is None:
-                raise RuntimeError('局域网内同名设备过多，未能取得可用的 mDNS 主机名')
-
-            with self._lock:
-                self._http_info = info
-                self._addresses = list(addresses)
-                self._state = 'running'
-                self._last_error = ''
-
+            ok = self._try_register()
+            # 不管这次成没成，只要 Zeroconf 对象建起来了就进入维护循环。
+            # 开机时网卡往往还没拿到 DHCP 地址（Wi-Fi 重连、交换机慢），
+            # 原先直接 return False 的后果是「整个进程生命周期内固定地址都不可用」，
+            # 用户只能重启服务才能恢复 —— 而重启恰好也是"网络已就绪"的时刻，
+            # 于是这个 bug 表现为"重启一下就好了"，极难归因。
             self._start_watchdog()
-            self._log_started(info)
-            return True
+            return ok
 
         except Exception as e:
             self._state = 'unavailable'
@@ -197,6 +169,55 @@ class ZeroconfAnnouncer:
             logger.warning(f"mDNS 固定地址启动失败（已忽略，不影响其它功能）：{e}")
             self._close_zc()
             return False
+
+    @property
+    def pending(self) -> bool:
+        """已进入维护循环、但还没广播成功（等网络就绪，稍后自动补上）。
+
+        lifecycle 靠它决定"要不要把这个对象留下来"：只要还有自愈的可能，
+        就得留着，否则退出时也没人发道别包。
+        """
+        return self._zc is not None and self._state != 'running'
+
+    def _try_register(self) -> bool:
+        """真正干活的注册动作。失败不抛异常（唯一例外是名字耗尽）。"""
+        from zeroconf import NonUniqueNameException
+
+        addresses = _local_ipv4_addresses()
+        if not addresses:
+            with self._lock:
+                self._state = 'unavailable'
+                self._last_error = '未找到可用的 IPv4 地址（网络未就绪，稍后自动重试）'
+            logger.warning("mDNS 固定地址暂不可用：本机还没有非回环 IPv4 地址，"
+                           f"{WATCH_INTERVAL} 秒后自动重试（不影响用 IP 访问）")
+            return False
+
+        host = self._resolve_hostname(addresses)
+        info = None
+        # allow_name_change 只改「服务实例名」，A 记录用的 server 不会跟着改，
+        # 所以冲突必须由 _resolve_hostname 提前规避（它看的是真实的 server），
+        # 这里再用 allow_name_change=False 兜住"探测与注册之间"的竞态。
+        for suffix in range(0, MAX_NAME_SUFFIX + 1):
+            candidate_host = host if suffix == 0 else f'{self.hostname}-{suffix + 1}'
+            candidate = self._build_http_info(candidate_host, addresses)
+            try:
+                self._zc.register_service(candidate, allow_name_change=False)
+            except NonUniqueNameException:
+                logger.warning(f"mDNS 名称 {candidate_host}.local 注册时被占用，换下一个后缀重试")
+                continue
+            info = candidate
+            self._server = f'{candidate_host}.local.'
+            break
+        if info is None:
+            raise RuntimeError('局域网内同名设备过多，未能取得可用的 mDNS 主机名')
+
+        with self._lock:
+            self._http_info = info
+            self._addresses = list(addresses)
+            self._state = 'running'
+            self._last_error = ''
+        self._log_started(info)
+        return True
 
     def set_ntrip(self, port, mountpoint='2RTK'):
         """广播本地 Caster 的端口（仅作展示）。port 为 None/0 时取消广播。"""
@@ -408,15 +429,34 @@ class ZeroconfAnnouncer:
         logger.info(f"固定地址已启用：http://{self._host_label()}.local:{self.web_port}"
                     f"（地址 {', '.join(self._addresses)}）")
         logger.info("提示：Windows / macOS / iPhone 可用固定地址访问；安卓系统不支持 .local，请用本机 IP")
+        # 现场最高频的"打不开"不是 mDNS 坏了，而是客户端装了代理/VPN：
+        # Chrome 把 2rtk.local:5757 交给代理，代理解析不了 .local 就回 502。
+        # 这条日志让用户第一眼就能排除掉"程序没起来"这种误判。
+        logger.info("提示：浏览器打不开固定地址但用 IP 正常时，多为代理/VPN 拦了 .local，"
+                    "把 *.local 加入直连（绕过代理）即可")
 
     def _start_watchdog(self):
         self._watch_stop.clear()
+        if self._watch_thread is not None and self._watch_thread.is_alive():
+            return
         self._watch_thread = threading.Thread(target=self._watch_loop, name='mdns-watch', daemon=True)
         self._watch_thread.start()
 
     def _watch_loop(self):
         while not self._watch_stop.wait(WATCH_INTERVAL):
             try:
+                with self._lock:
+                    running = self._state == 'running'
+                if not running:
+                    # 还没广播成功（启动时无地址 / 名字全被占）：这里补一次。
+                    # 只要网卡后来拿到地址，固定地址就能自己恢复，不必重启服务。
+                    if self._zc is not None:
+                        try:
+                            self._try_register()
+                        except Exception as e:
+                            logger.debug(f"mDNS 重试注册未成功（下个周期再试）：{e}")
+                    continue
+
                 current = _local_ipv4_addresses()
                 if not current:
                     continue

@@ -664,3 +664,95 @@ class TestConfigDbResilience(unittest.TestCase):
         self.assertEqual(cfg['relay_host'], 'caster.example.com')
         # 自愈时会把缺失的默认键一并补齐，不留下半张表
         self.assertEqual(cfg['local_caster_port'], 2102)
+
+
+class TestMdnsSelfHeal(unittest.TestCase):
+    """开机时网卡还没拿到地址，固定地址不能就此永久失效。
+
+    现场形态：设备上电早于 DHCP，`_local_ipv4_addresses()` 返回空，原实现直接
+    return False，于是整个进程生命周期内都不会再广播 —— 用户重启一次服务就好了，
+    于是这个问题一直被当成"偶发"。现在交给维护循环每个周期重试一次。
+    """
+
+    def test_pending_is_false_before_start(self):
+        from rtkserver.discovery.zeroconf_announcer import ZeroconfAnnouncer
+        self.assertFalse(ZeroconfAnnouncer().pending)
+
+    def test_pending_true_when_zc_open_but_not_running(self):
+        from rtkserver.discovery.zeroconf_announcer import ZeroconfAnnouncer
+        ann = ZeroconfAnnouncer()
+        ann._zc = object()          # 只看"有 zc 且没 running"，不碰真实网络
+        try:
+            self.assertTrue(ann.pending)
+        finally:
+            ann._zc = None
+
+    def test_no_address_keeps_watchdog_alive(self):
+        """没有 IPv4 时：start() 返回 False，但维护线程已经起来（pending=True）。"""
+        try:
+            import zeroconf  # noqa: F401
+        except ImportError:
+            self.skipTest('本机未安装 zeroconf')
+        from unittest.mock import patch
+        from rtkserver.discovery import zeroconf_announcer as mod
+        ann = mod.ZeroconfAnnouncer(web_port=5757)
+        try:
+            with patch.object(mod, '_local_ipv4_addresses', return_value=[]):
+                self.assertFalse(ann.start())
+                self.assertEqual(ann.snapshot()['state'], 'unavailable')
+                self.assertTrue(ann.pending, '没有地址时也必须保留维护循环，否则网络就绪后无人重试')
+                self.assertIn('重试', ann.snapshot()['last_error'])
+        finally:
+            ann.stop()
+        self.assertFalse(ann.pending)
+
+    def test_watchdog_retries_registration(self):
+        """维护循环必须真的调用 _try_register，而不只是看着地址变化。"""
+        from unittest.mock import patch
+        from rtkserver.discovery import zeroconf_announcer as mod
+        ann = mod.ZeroconfAnnouncer(web_port=5757)
+        calls = []
+
+        def fake_try():
+            calls.append(1)
+            return True
+
+        ann._zc = object()
+        ann._state = 'unavailable'
+        # 让 wait() 第一次返回 False（=周期到），第二次返回 True（=退出）
+        seq = iter([False, True])
+        with patch.object(ann._watch_stop, 'wait', side_effect=lambda _t: next(seq)), \
+             patch.object(ann, '_try_register', side_effect=fake_try):
+            ann._watch_loop()
+        ann._zc = None
+        self.assertEqual(len(calls), 1, '未广播成功时，每个周期都要重试一次')
+
+
+class TestProxyHint(unittest.TestCase):
+    """「固定地址打不开但 IP 正常」= 客户端代理拦了 .local（实测 502）。
+
+    这条排查结论写过一次就丢，新人/用户还是会当成程序坏了，所以锁进文档、
+    安装输出和前端提示里。
+    """
+
+    def test_frontend_hint_paired(self):
+        with open(os.path.join(REPO_ROOT, 'static', 'i18n.js'), 'r', encoding='utf-8') as f:
+            text = f.read()
+        self.assertEqual(text.count("'rs.mdns.hint'"), 2, 'rs.mdns.hint 必须中英文各一条')
+
+    def test_status_page_renders_hint(self):
+        with open(os.path.join(REPO_ROOT, 'templates', 'index.html'), 'r', encoding='utf-8') as f:
+            html = f.read()
+        self.assertIn('data-i18n="rs.mdns.hint"', html)
+
+    def test_installers_print_proxy_hint(self):
+        for name in ('install.sh', 'update.sh'):
+            with open(os.path.join(REPO_ROOT, name), 'r', encoding='utf-8') as f:
+                text = f.read()
+            self.assertIn('502', text, f'{name} 的访问提示没有说明 502 是代理导致的')
+
+    def test_announcer_logs_proxy_hint(self):
+        from rtkserver.discovery import zeroconf_announcer as mod
+        with open(mod.__file__, 'r', encoding='utf-8') as f:
+            text = f.read()
+        self.assertIn('代理', text.split('def _log_started')[1][:600])

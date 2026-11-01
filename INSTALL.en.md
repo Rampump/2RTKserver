@@ -130,6 +130,11 @@ sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone 
    names — use the device IP shown on the status page instead.** The fixed address
    depends on the `zeroconf` package; without it everything else still works.
 
+   If the browser reports **502 / "this page isn't working" while the IP works**, a
+   local proxy or VPN is forwarding `.local` to itself and cannot resolve it — add
+   `*.local` to the proxy bypass list or turn the proxy off. `ping 2rtk.local` returning
+   the device IP means the broadcast is healthy and the problem is on the proxy side.
+
 4. Default login (**change the password immediately after logging in**):
 
    ```

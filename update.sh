@@ -141,6 +141,7 @@ echo -e "2RTK NTRIP Server 已更新"
 echo -e "  本机 IP    : ${GREEN}http://$IP_ADDRESS:5757${NC}"
 echo -e "  固定地址   : ${GREEN}$MDNS_URL${NC}   （Windows / macOS / iPhone）"
 echo -e "  ${YELLOW}安卓 / 鸿蒙手机不解析 .local，请用上面的 IP 地址访问${NC}"
+echo -e "  ${YELLOW}固定地址打不开（浏览器报 502）时：把 *.local 加入代理直连，或临时关掉代理 / VPN${NC}"
 echo -e "${YELLOW}服务已重启，请检查状态:${NC}"
 systemctl status $SERVICE_NAME --no-pager
 

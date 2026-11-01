@@ -84,7 +84,10 @@ def _register_discovery_hooks():
         from ..discovery.zeroconf_announcer import ZeroconfAnnouncer
         ann = ZeroconfAnnouncer(web_port=WEB_PORT, on_address_change=_on_mdns_address_change,
                                 version=APP_VERSION)
-        if ann.start():
+        started = ann.start()
+        # start() 失败但维护循环已经起来了（开机时网卡还没拿到地址）也要留下：
+        # 否则网络就绪后没人重试，退出时也没人发道别包。
+        if started or ann.pending:
             state.announcer = ann
 
     def shutdown():
