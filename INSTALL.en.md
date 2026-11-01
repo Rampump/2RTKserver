@@ -113,11 +113,17 @@ sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone 
    The script installs system deps, creates a Python venv, installs requirements, configures
    the systemd service, enables boot autostart, and creates the management command.
 
-3. Open the web UI:
+3. Open the web UI — the installer prints both addresses when it finishes:
 
    ```
-   http://[device-ip]:5757
+   访问地址：
+     本机 IP    : http://192.168.1.71:5757
+     固定地址   : http://2rtk.local:5757   （Windows / macOS / iPhone）
+     安卓 / 鸿蒙手机不解析 .local，请用上面的 IP 地址访问
    ```
+
+   The fixed address is read back from the running service, so it already reflects a
+   rename to `2rtk-2.local` when another device on the LAN claimed `2rtk` first.
 
    On the same LAN you can also use the fixed address `http://2rtk.local:5757`
    (Windows, macOS, iPhone/iPad, Linux with avahi). **Android cannot resolve `.local`

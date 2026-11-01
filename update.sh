@@ -116,10 +116,30 @@ chmod +x $INSTALL_DIR/server.py
 
 # 启动服务
 echo -e "${YELLOW}启动服务...${NC}"
+LOG_BASE=$( [ -f "$INSTALL_DIR/server.log" ] && wc -l < "$INSTALL_DIR/server.log" | tr -d ' ' || echo 0 )
 systemctl start $SERVICE_NAME
 
+# 固定地址（mDNS）是程序启动后自己广播的，名字还可能因为局域网里已有同名设备
+# 而退让成 2rtk-2.local，所以不能在这里写死 2rtk.local —— 等它把实际地址
+# 写进日志再读出来；读不到（例如系统缺 zeroconf）就退回默认名。
+LOG_FILE="$INSTALL_DIR/server.log"
+LOG_BASE=${LOG_BASE:-0}
+echo -e "${YELLOW}读取固定地址（mDNS）...${NC}"
+MDNS_URL=""
+for _ in $(seq 1 30); do
+    MDNS_URL=$(tail -n +$((LOG_BASE + 1)) "$LOG_FILE" 2>/dev/null \
+        | grep -oE 'http://[A-Za-z0-9._-]+\.local:[0-9]+' | tail -1)
+    [ -n "$MDNS_URL" ] && break
+    sleep 0.5
+done
+[ -z "$MDNS_URL" ] && MDNS_URL="http://2rtk.local:5757"
+
+IP_ADDRESS=$(hostname -I | awk '{print $1}')
 echo -e "${GREEN}=== 更新完成! ===${NC}"
 echo -e "2RTK NTRIP Server 已更新"
+echo -e "  本机 IP    : ${GREEN}http://$IP_ADDRESS:5757${NC}"
+echo -e "  固定地址   : ${GREEN}$MDNS_URL${NC}   （Windows / macOS / iPhone）"
+echo -e "  ${YELLOW}安卓 / 鸿蒙手机不解析 .local，请用上面的 IP 地址访问${NC}"
 echo -e "${YELLOW}服务已重启，请检查状态:${NC}"
 systemctl status $SERVICE_NAME --no-pager
 

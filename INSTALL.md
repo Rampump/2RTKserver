@@ -106,11 +106,17 @@ sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone 
 
    脚本会自动完成：安装系统依赖 → 创建 Python 虚拟环境 → 安装依赖 → 配置 systemd 服务 → 设置开机自启 → 创建管理命令。
 
-3. 访问 Web 界面：
+3. 访问 Web 界面 —— 安装结束时会同时打印两个地址：
 
    ```
-   http://[设备IP]:5757
+   访问地址：
+     本机 IP    : http://192.168.1.71:5757
+     固定地址   : http://2rtk.local:5757   （Windows / macOS / iPhone，换网络也不用改）
+     安卓 / 鸿蒙手机不解析 .local，请用上面的 IP 地址访问
    ```
+
+   固定地址是从运行中的服务日志里读出来的实际值：如果局域网里已经有别的设备占了
+   `2rtk`，这里会直接显示退让后的 `http://2rtk-2.local:5757`，不会显示错的。
 
 4. 默认登录（**登录后请立即修改密码**）：
 

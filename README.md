@@ -147,8 +147,18 @@ missing, tries the GitCode mirror first and falls back to GitHub, then runs the 
 sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone --depth 1 https://gitcode.com/rampump/NTRIPserver.git /tmp/2rtk-install || (sudo rm -rf /tmp/2rtk-install && sudo git clone --depth 1 https://github.com/Rampump/2RTKserver.git /tmp/2rtk-install)) && sudo bash /tmp/2rtk-install/install.sh
 ```
 
-Then open `http://<device-ip>:5757` and log in with **`admin` / `admin`** — change the
-password immediately.
+When it finishes, the installer prints both ways in:
+
+```
+访问地址：
+  本机 IP    : http://192.168.1.71:5757
+  固定地址   : http://2rtk.local:5757   （Windows / macOS / iPhone，换网络也不用改）
+  安卓 / 鸿蒙手机不解析 .local，请用上面的 IP 地址访问
+```
+
+The fixed address is read back from the running service, so it already accounts for a
+rename to `2rtk-2.local` if another device on the LAN claimed `2rtk` first. Log in with
+**`admin` / `admin`** — change the password immediately.
 
 > **Copying from a Windows browser.** Paste it straight into the terminal; do not retype it.
 > The line is plain ASCII with no line breaks and no smart quotes, so it survives copy/paste
