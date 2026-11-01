@@ -67,8 +67,9 @@ if [ -f "$SRC_DIR/server.py" ]; then
     done
 
     # 同步版本号，否则网页上的「当前版本 / 检查更新」会永远停在装机那一版
-    SRC_COMMIT=""
-    if [ -d "$SRC_DIR/.git" ] && command -v git >/dev/null 2>&1; then
+    # 允许调用方显式指定（升级执行器/离线包没有 .git 时用）
+    SRC_COMMIT="${SRC_COMMIT_OVERRIDE:-}"
+    if [ -z "$SRC_COMMIT" ] && [ -d "$SRC_DIR/.git" ] && command -v git >/dev/null 2>&1; then
         SRC_COMMIT=$(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null || true)
     fi
     printf '{"commit":"%s","date":"%s","installed_at":"%s","source":"update.sh","channel":"update"}\n' \
@@ -79,6 +80,11 @@ if [ -f "$SRC_DIR/server.py" ]; then
     if [ -f "$INSTALL_DIR/2RTKserver.db.temp" ]; then
         mv $INSTALL_DIR/2RTKserver.db.temp $INSTALL_DIR/2RTKserver.db
     fi
+
+    # 必须切到安装目录：下面 `pip install -r requirements.txt` 用的是相对路径，
+    # 而本脚本可能在任意 cwd 下被调用（例如 systemd-run 或升级执行器），
+    # 不切目录就会报 "Could not open requirements file"，依赖静默不更新。
+    cd "$INSTALL_DIR" || exit 1
 else
     echo -e "${RED}未找到程序文件: $SRC_DIR/server.py${NC}"
     echo "请确保在包含更新文件的目录中运行此脚本"

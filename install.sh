@@ -83,8 +83,8 @@ if [ -f "$SRC_DIR/server.py" ]; then
 
     # 记录安装版本。网页上的「当前版本 / 检查更新」全靠这个文件：
     # 安装目录不带 .git，事后无法反查装的是哪一版。
-    SRC_COMMIT=""
-    if [ -d "$SRC_DIR/.git" ] && command -v git >/dev/null 2>&1; then
+    SRC_COMMIT="${SRC_COMMIT_OVERRIDE:-}"
+    if [ -z "$SRC_COMMIT" ] && [ -d "$SRC_DIR/.git" ] && command -v git >/dev/null 2>&1; then
         SRC_COMMIT=$(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null || true)
     fi
     printf '{"commit":"%s","date":"%s","installed_at":"%s","source":"install.sh","channel":"install"}\n' \
