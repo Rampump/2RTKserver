@@ -69,6 +69,10 @@
       'rs.target': '目标 Caster',
       'rs.sent': '发送数据量',
       'rs.runtime': '运行时间',
+      'rs.local_ip': '本机 IP',
+      'rs.mdns': '固定地址',
+      'rs.mdns.unavailable': '未启用（缺少 zeroconf）',
+      'rs.android_hint': '安卓手机 / 平板不支持 .local 名字解析，请用上面的「本机 IP」访问。',
       'rs.waiting': '等待数据…',
 
       // 卫星星座字段
@@ -229,6 +233,8 @@
       'cfg.local_host': '监听地址 Listen address',
       'cfg.local_port': '监听端口 Listen port',
       'cfg.local_port_hint': '「监听端口」是本机真实占用的端口，客户端连的就是它。中继 / 上传端填的端口是「对端端口」，本机只是出站去连对方（用内核临时端口），所以它们可以都用 2101、彼此不冲突；真正会冲突的只有本机已有程序（含上一个没退干净的进程）占着同一个端口。',
+      'cfg.fixed_addr_hint': '局域网固定地址：电脑（Windows）与苹果手机 / 平板可用 http://2rtk.local:5757 打开本配置页；NTRIP 客户端可用 2rtk.local:端口/2RTK 取流（端口即上面的「监听端口」）。',
+      'cfg.android_hint': '注意：安卓手机 / 平板系统不支持 .local 名字解析，请改用首页「运行状态」里显示的本机 IP 访问。',
       'cfg.port_conflict_upload': '本地 Caster 监听端口 {port} 与「① 上传到云端 NTRIP Caster」的端口相同。',
       'cfg.port_conflict_relay': '本地 Caster 监听端口 {port} 与「中继取流」的端口相同。',
       'cfg.port_conflict_fix': '本机监听端口要真实占用，请把本地 Caster 改成 {suggest} 这类未被占用的端口再保存。',
@@ -340,6 +346,10 @@
       'rs.target': 'Target Caster',
       'rs.sent': 'Data Sent',
       'rs.runtime': 'Uptime',
+      'rs.local_ip': 'Local IP',
+      'rs.mdns': 'Fixed Address',
+      'rs.mdns.unavailable': 'Disabled (zeroconf missing)',
+      'rs.android_hint': 'Android phones/tablets cannot resolve .local names — use the Local IP above.',
       'rs.waiting': 'Waiting for data…',
 
       // Satellites fields
@@ -500,6 +510,8 @@
       'cfg.local_host': 'Listen Address',
       'cfg.local_port': 'Listen Port',
       'cfg.local_port_hint': 'The listen port is really bound on this device — that is what clients connect to. The ports filled in for relay / upload are remote endpoints: this device only dials out to them using an ephemeral local port, so they may all be 2101 without conflict. A real conflict only happens when another program on this device (including a previous instance that has not exited) already holds that port.',
+      'cfg.fixed_addr_hint': 'Fixed LAN address: on Windows PCs, iPhones and iPads open http://2rtk.local:5757 for this page; NTRIP clients can use 2rtk.local:<port>/2RTK (the listen port above).',
+      'cfg.android_hint': 'Note: Android phones/tablets cannot resolve .local names — use the Local IP shown on the status page instead.',
       'cfg.port_conflict_upload': 'Local caster listen port {port} is the same as the "① Upload to remote NTRIP Caster" port.',
       'cfg.port_conflict_relay': 'Local caster listen port {port} is the same as the "Relay source" port.',
       'cfg.port_conflict_fix': 'The listen port is really bound on this device — change the local caster to an unused port such as {suggest} and save again.',

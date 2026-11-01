@@ -70,12 +70,16 @@ if [ -f "$SRC_DIR/server.py" ]; then
     # 只复制运行所需的文件，排除 .git / .secret_key / 数据库 / 日志 / __pycache__ 等
     # 开发机或本机运行产生的数据，不应带入干净的目标安装目录。
     # docs 是 README 里引用的截图目录，漏掉会让安装后的 README 图片全变成裂图。
-    for item in server.py reset_config.py requirements.txt install.sh uninstall.sh update.sh \
+    # rtkserver 是拆包后的代码包（server.py 只是入口壳），漏掉它 systemctl start
+    # 会立刻 ModuleNotFoundError: No module named 'rtkserver'。
+    for item in server.py rtkserver reset_config.py requirements.txt install.sh uninstall.sh update.sh \
                 README.md INSTALL.md INSTALL.en.md LICENSE templates static docs; do
         if [ -e "$SRC_DIR/$item" ]; then
             cp -r "$SRC_DIR/$item" "$INSTALL_DIR/"
         fi
     done
+    # 清掉源码目录可能带过来的字节码缓存，避免 .pyc 与源码不一致
+    find "$INSTALL_DIR/rtkserver" -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null
 else
     echo -e "${RED}未找到程序文件: $SRC_DIR/server.py${NC}"
     echo "请确保在包含 server.py 的目录中运行此脚本"

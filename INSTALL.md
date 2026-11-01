@@ -120,6 +120,13 @@ sudo PIP_BREAK_SYSTEM_PACKAGES=1 pip install -r requirements.txt
 python3 server.py
 ```
 
+启动后，同一内网里可以直接访问固定地址 `http://2rtk.local:5757`（Windows / macOS /
+iPhone / iPad / Linux+avahi 都支持）。**安卓手机 / 平板不支持 `.local`，请改用
+`http://设备IP:5757`，设备 IP 在首页「运行状态」卡里能看到。**
+
+固定地址依赖 `requirements.txt` 里的 `zeroconf`。没装上也不影响其它功能，
+只是少了这个别名；装好后重启服务即可生效。
+
 ---
 
 ## 配置基准站

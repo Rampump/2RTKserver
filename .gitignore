@@ -22,3 +22,6 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# 本地工作区数据（智能体日志、笔记等），不属于项目源码
+.workbuddy/

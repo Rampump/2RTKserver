@@ -174,6 +174,24 @@ the ports typed for relay/upload are *remote* endpoints and never occupy a local
 
 ![Local caster settings](docs/images/screenshot-local-caster.png)
 
+## Fixed LAN address (`2rtk.local`)
+
+The device announces itself over mDNS / DNS-SD, so you don't need to look up its IP first:
+
+```
+http://2rtk.local:5757
+```
+
+- Works on Windows 10/11, macOS, iPhone / iPad, and Linux with avahi installed.
+- Also usable for NTRIP clients when the local caster is on: `2rtk.local:<listen port>/2RTK`
+  (default `2rtk.local:2102/2RTK`).
+- If another device on the LAN already uses the name `2rtk`, this one automatically falls
+  back to `2rtk-2.local` (one line in the log — nothing to configure).
+- The advertised address follows the device when DHCP hands out a new IP; the name stays.
+- If the `zeroconf` package is missing, everything else keeps working — only this alias is gone.
+
+**Android phones and tablets cannot resolve `.local` names — use the local IP shown on the status page instead (`http://<device-ip>:5757`).**
+
 ## Configuration
 
 **Source** (pick one):
@@ -316,3 +334,15 @@ ECEF 坐标提前测好写进模块），模块插到刷了 Armbian 的机顶盒
 选 relay，从别的 Caster 拉流再分发。
 
 安装、天线相位中心定位方法、故障排除见 [INSTALL.md](INSTALL.md)，本文件上方为英文说明。
+
+### 用固定地址访问（不用记 IP）
+
+程序启动后会通过 mDNS / DNS-SD 把自己广播为 `2rtk.local`，同一内网里：
+
+- 电脑（Windows 10/11）、苹果手机 / 平板：直接打开 `http://2rtk.local:5757` 即可进配置页。
+- 开了本地 Caster 时，NTRIP 客户端可以用 `2rtk.local:<监听端口>/2RTK`（默认 `2rtk.local:2102/2RTK`）。
+- 换 Wi-Fi、路由器重新分配 IP 后名字不变，地址会自动跟着刷新。
+- 同网段已有一台叫 `2rtk` 的设备时，本机会自动退为 `2rtk-2.local`（日志里有一行提示）。
+- 首页「运行状态」卡里会同时显示 **本机 IP** 和 **固定地址**，第一次使用也能照着输。
+
+**安卓手机 / 平板：系统不支持 .local 名字解析，请用首页显示的「本机 IP」访问（`http://设备IP:5757`）。**

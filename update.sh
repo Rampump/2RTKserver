@@ -53,7 +53,13 @@ if [ -f "$SRC_DIR/server.py" ]; then
 
     # 只复制运行所需的文件，排除 .git / .secret_key / 数据库 / 日志 / __pycache__ / venv，
     # 避免把开发机的数据带入，也避免覆盖安装目录里已经建好的 venv 虚拟环境。
-    for item in server.py reset_config.py requirements.txt install.sh uninstall.sh update.sh \
+    #
+    # rtkserver/ 必须先删再复制：拆包后模块会增删改名，直接覆盖会让已删除的模块
+    # 留下 .pyc，import 时指向不存在的源码，表现为"改了代码不生效"或随机
+    # ModuleNotFoundError。
+    rm -rf "$INSTALL_DIR/rtkserver"
+    find "$INSTALL_DIR" -maxdepth 2 -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null
+    for item in server.py rtkserver reset_config.py requirements.txt install.sh uninstall.sh update.sh \
                 README.md INSTALL.md INSTALL.en.md LICENSE templates static docs; do
         if [ -e "$SRC_DIR/$item" ]; then
             cp -r "$SRC_DIR/$item" "$INSTALL_DIR/"

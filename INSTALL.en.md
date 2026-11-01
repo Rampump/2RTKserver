@@ -103,6 +103,11 @@ parses those messages for the map display and the NTRIP source table (STR).
    http://[device-ip]:5757
    ```
 
+   On the same LAN you can also use the fixed address `http://2rtk.local:5757`
+   (Windows, macOS, iPhone/iPad, Linux with avahi). **Android cannot resolve `.local`
+   names — use the device IP shown on the status page instead.** The fixed address
+   depends on the `zeroconf` package; without it everything else still works.
+
 4. Default login (**change the password immediately after logging in**):
 
    ```

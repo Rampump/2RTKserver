@@ -19,6 +19,10 @@ const dataSourceEl = document.getElementById("data-source");
 const targetCasterEl = document.getElementById("target-caster");
 const dataSentEl = document.getElementById("data-sent");
 const runTimeEl = document.getElementById("run-time");
+// 首次使用（还没配数据源）时首页唯一能指导用户的就是这两项：
+// 电脑/苹果用固定地址，安卓只能用本机 IP。
+const localIpEl = document.getElementById("local-ip");
+const mdnsUrlEl = document.getElementById("mdns-url");
 const deviceModelEl = document.getElementById('device-model');
 const firmwareVersionEl = document.getElementById('firmware-version');
 const antennaModelEl = document.getElementById('antenna-model');
@@ -948,6 +952,16 @@ function updateRunStatus(status) {
   if (status.local_caster) updateLocalCaster(status.local_caster);
   if (status.upload) updateUploadStatus(status.upload);
   if (status.radio) updateRadioStatus(status.radio);
+
+  // 本机 IP 与固定地址：空值不覆盖，避免一次空推送把已有内容抹掉
+  if (localIpEl && status.local_ip) localIpEl.textContent = status.local_ip;
+  if (mdnsUrlEl && status.mdns_url) {
+    const shortUrl = String(status.mdns_url).replace(/^https?:\/\//, '');
+    // zeroconf 缺失时仍然显示地址，但明确标注"未启用"，避免用户以为是自己网络的问题
+    mdnsUrlEl.textContent = (status.mdns_state === 'unavailable')
+      ? shortUrl + ' · ' + I18N.t('rs.mdns.unavailable')
+      : shortUrl;
+  }
 }
 
 // 上传端 NTRIP Caster 状态：显示往哪个地址/挂载点推、认证结果、已发送量、速率、重连次数。
