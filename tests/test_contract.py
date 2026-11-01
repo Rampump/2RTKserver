@@ -466,10 +466,14 @@ class TestUpgrade(unittest.TestCase):
         first_key = self.sources.resolved()['sources'][0][0]
         self.assertTrue(self.sources.source_by_key(first_key).startswith('http'))
 
-    def test_managed_ports_include_web_port(self):
+    def test_managed_ports_web_port_first(self):
+        # Web 端口必须排第一：健康检查取的是 managed_ports()[0]，
+        # 一旦顺序变成 [2102, 5757]，健康检查就会打到本地 Caster 上，
+        # 表现为「服务已起来却判定升级失败」。这条断言就是那次事故的护栏。
         from rtkserver.core.constants import WEB_PORT
         ports = self.service.managed_ports()
-        self.assertIn(WEB_PORT, ports)
+        self.assertEqual(ports[0], WEB_PORT)
+        self.assertEqual(len(ports), len(set(ports)))
 
     def test_state_shape_when_missing(self):
         st = self.service.read_state()

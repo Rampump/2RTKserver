@@ -97,22 +97,30 @@ def _tail_log(nbytes=6000):
 
 # ==================== 端口 ====================
 def managed_ports():
-    """升级前必须确认释放的端口。
+    """升级前必须确认释放的端口，Web 端口永远排第一。
 
     5757 是 Web 端口；本地 Caster 的端口是可配置的（默认 2102，有人会改成 2101）。
     升级时如果这些端口还被旧进程占着，新进程 bind 失败，页面就打不开了。
+
+    顺序很重要：调用方会拿返回值的第一项做健康检查。
+    这里**不能**用 sorted()，否则 {5757, 2102} 会排成 [2102, 5757]，
+    健康检查就被发到本地 Caster 上——那边把 /login 当成不存在的挂载点直接断开，
+    表现为「服务明明起来了，却判定升级失败并回滚」。
     """
-    ports = [int(WEB_PORT)]
+    web_port = int(WEB_PORT)
+    rest = set()
     try:
         cfg = get_config()
     except Exception:  # noqa: BLE001
-        return ports
+        return [web_port]
     if str(cfg.get('local_caster_enabled', '0')) == '1':
         try:
-            ports.append(int(cfg.get('local_caster_port') or 0))
+            rest.add(int(cfg.get('local_caster_port') or 0))
         except (TypeError, ValueError):
             pass
-    return sorted({p for p in ports if p})
+    rest.discard(web_port)
+    rest.discard(0)
+    return [web_port] + sorted(rest)
 
 
 # ==================== 远端检查 ====================
@@ -138,14 +146,22 @@ def _ls_remote(url, branch, timeout=25):
 
 
 def check_updates():
-    """依次探测各升级源，返回每个源的最新提交与「是否有更新」。"""
+    """并发探测各升级源，返回每个源的最新提交与「是否有更新」。
+
+    并发不是为了快，是为了别让用户干等：国内访问 GitHub 常常是"能连上但要等到超时"，
+    串行探测会让「检查更新」按钮转上半分钟才出结果。
+    """
+    import concurrent.futures
+
     conf = sources.resolved()
     cur = current_version()
     cur_commit = cur.get('commit', '')
-    results = []
-    for key, label, url in conf['sources']:
+    items = conf['sources']
+
+    def probe(item):
+        key, label, url = item
         ok, commit, err = _ls_remote(url, conf['branch'])
-        results.append({
+        return {
             'key': key,
             'label': label,
             'url': url,
@@ -154,7 +170,10 @@ def check_updates():
             'error': err,
             # 没有本地版本信息时不能断定"有更新"，宁可让用户自己决定
             'has_update': bool(ok and cur_commit and commit and commit != cur_commit),
-        })
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(items))) as ex:
+        results = list(ex.map(probe, items))
     reachable = [r for r in results if r['ok']]
     return {
         'current': cur,
@@ -241,6 +260,7 @@ def start_upgrade(source_key=None):
         'sources': src_list,
         'branch': conf['branch'],
         'ports': managed_ports(),
+        'web_port': int(WEB_PORT),
         'from_version': cur.get('commit', ''),
         'from_commit': cur.get('commit', ''),
         'delay': 3,
@@ -271,6 +291,7 @@ def start_uninstall(backup_db=True):
         'install_dir': paths.BASE_DIR,
         'service': SERVICE_NAME,
         'ports': managed_ports(),
+        'web_port': int(WEB_PORT),
         'backup_db': bool(backup_db),
         'delay': 3,
     }

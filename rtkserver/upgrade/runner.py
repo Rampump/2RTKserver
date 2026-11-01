@@ -85,6 +85,9 @@ class Runner:
         self.work_dir = os.path.join(self.install_dir, '.upgrade')
         self.state_path = os.path.join(self.work_dir, 'state.json')
         self.log_path = os.path.join(self.work_dir, 'upgrade.log')
+        # 健康检查固定打 Web 端口。不能拿 ports[0] 糊弄：
+        # 端口列表里还有本地 Caster（2102），一旦顺序变了就会去敲错端口。
+        self.web_port = int(self.plan.get('web_port') or 5757)
         self.staging = os.path.join(self.work_dir, 'staging')
         self.backup_dir = os.path.join(self.work_dir, 'backups')
         self.python = os.path.join(self.install_dir, 'venv', 'bin', 'python3')
@@ -490,8 +493,7 @@ class Runner:
 
         self.install_deps()
         self.start_service()
-        port = (self.plan.get('ports') or [5757])[0]
-        healthy = self.health_check(port, timeout=60)
+        healthy = self.health_check(self.web_port, timeout=60)
         stage = 'rolled_back' if (ok and healthy) else 'failed'
         old = self.state.get('from_version') or self.state.get('old_commit') or '升级前的版本'
         if healthy:
@@ -563,8 +565,7 @@ class Runner:
         self.set_state('starting', 85, '正在启动服务…')
         self.start_service()
         self.set_state('health', 92, '正在等待服务就绪…')
-        port = ports[0]
-        if not self.health_check(port):
+        if not self.health_check(self.web_port):
             return 0 if self.rollback('新版本启动后 Web 端口无响应') else 1
 
         self.set_state('success', 100, f'升级完成：{commit}',
