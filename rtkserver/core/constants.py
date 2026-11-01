@@ -64,6 +64,7 @@ LOCAL_CASTER_SERVER_NAME = '2RTK NTRIP Caster'
 # ==================== 无线电数传透传 ====================
 RADIO_QUEUE_SIZE = 512             # 待发帧上限，满了丢弃最旧（数传串口写慢时保护）
 RADIO_RECONNECT_INTERVAL = 3.0     # 串口断线后的重连间隔（秒）
+RADIO_FAIL_LOG_INTERVAL = 600      # 串口打不开时 ERROR 日志的最小间隔（秒）
 RADIO_VALID_BAUDS = [115200, 921600, 460800, 230400, 57600, 38400, 19200, 9600]
 
 # ==================== 上传出口（云端 Caster） ====================

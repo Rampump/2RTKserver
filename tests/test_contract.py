@@ -479,3 +479,51 @@ class TestUpgrade(unittest.TestCase):
         st = self.service.read_state()
         self.assertIn('stage', st)
         self.assertIn('progress', st)
+
+
+
+class TestRadioLogThrottle(unittest.TestCase):
+    """数传串口打不开时的重试日志必须收敛。
+
+    真机实测：模块拔掉后每 3 秒重试一次，每次都打 ERROR，几个晚上就能把
+    server.log 刷到几百 MB，真正的故障反而被淹没。这里锁死"首次 ERROR、
+    之后抑制"的行为，避免以后被改回无脑打日志。
+    """
+
+    def setUp(self):
+        try:
+            from rtkserver.outlets import radio_bridge
+        except Exception as exc:  # 没装 pyserial 的环境跳过，不算失败
+            self.skipTest(f'跳过（无法导入 radio_bridge：{exc}）')
+        self.mod = radio_bridge
+
+    def test_failures_logged_once(self):
+        import logging
+
+        records = []
+
+        class Collect(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = Collect()
+        handler.setLevel(logging.DEBUG)
+        root = logging.getLogger()
+        old_level = root.level
+        root.addHandler(handler)
+        root.setLevel(logging.DEBUG)
+        try:
+            bridge = self.mod.SerialBridge('/dev/definitely-not-a-port', 57600)
+            for _ in range(5):
+                self.assertFalse(bridge._open())
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(old_level)
+
+        errors = [r for r in records if r.levelno >= logging.ERROR]
+        self.assertEqual(len(errors), 1, f'连续 5 次失败应只打 1 条 ERROR，实际 {len(errors)} 条')
+        self.assertIn('数传串口打开失败', errors[0].getMessage())
+        # 状态里仍要能看到失败信息，抑制的只是日志而不是状态
+        st = bridge.status()
+        self.assertFalse(st['connected'])
+        self.assertTrue(st['last_error'])

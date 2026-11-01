@@ -25,7 +25,8 @@ import serial
 
 from ..core import state
 from ..core.config import get_config
-from ..core.constants import RADIO_QUEUE_SIZE, RADIO_RECONNECT_INTERVAL
+from ..core.constants import (RADIO_FAIL_LOG_INTERVAL, RADIO_QUEUE_SIZE,
+                              RADIO_RECONNECT_INTERVAL)
 
 
 class SerialBridge:
@@ -42,6 +43,11 @@ class SerialBridge:
         self._sent_bytes = 0
         self._reconnects = 0
         self._last_error = ''
+        # 打开失败的连续计数与上次打 ERROR 的时间。
+        # 数传模块被拔掉时每 3 秒重试一次，若每次都打 ERROR，
+        # 一晚上就能把 server.log 刷到几百 MB，真正的故障反而被淹掉。
+        self._fail_count = 0
+        self._fail_log_ts = 0.0
         self._rate_last_time = 0.0
         self._rate_last_bytes = 0
         self._rate_bps = 0.0
@@ -125,12 +131,29 @@ class SerialBridge:
                 self._ser = new_ser
                 self._connected = True
                 self._last_error = ''
+                recovered = self._fail_count
+                self._fail_count = 0
+                self._fail_log_ts = 0.0
+            if recovered:
+                logging.info(f"数传串口已恢复连接 {self.port} @ {self.baud}"
+                             f"（此前连续失败 {recovered} 次）")
             return True
         except (serial.SerialException, OSError, ValueError) as e:
             with self._lock:
                 self._connected = False
                 self._last_error = str(e)
-            logging.error(f"数传串口打开失败 {self.port} @ {self.baud}: {e}")
+                self._fail_count += 1
+                count = self._fail_count
+                now = time.time()
+                should_log = count == 1 or (now - self._fail_log_ts) >= RADIO_FAIL_LOG_INTERVAL
+                if should_log:
+                    self._fail_log_ts = now
+            if should_log:
+                extra = '' if count == 1 else f'（已连续失败 {count} 次，期间日志已抑制）'
+                logging.error(f"数传串口打开失败 {self.port} @ {self.baud}: {e}{extra}")
+            else:
+                logging.debug(f"数传串口打开失败 {self.port} @ {self.baud}: {e}"
+                              f"（第 {count} 次，已抑制）")
             return False
 
     def _close_serial(self):

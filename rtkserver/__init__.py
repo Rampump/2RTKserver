@@ -5,4 +5,4 @@
 server.py 只是入口壳，保证 systemd 的 ExecStart 不用改。
 """
 
-__version__ = '2.2.0'
+__version__ = '2.2.1'
