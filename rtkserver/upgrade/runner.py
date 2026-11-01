@@ -326,7 +326,7 @@ class Runner:
                             os.path.join(self.staging, 'rtkserver'),
                             os.path.join(self.staging, 'server.py')], timeout=180)
         if rc != 0:
-            return False, '新版本存在语法错误，已中止（当前版本未受影响）'
+            return False, '新版本存在语法错误'
 
         # 2) 冒烟测试：能 import 出 Flask app 工厂，说明依赖关系没断
         rc, out = self.run(
@@ -334,7 +334,7 @@ class Runner:
             timeout=120, cwd=self.staging,
             env={'PYTHONPATH': self.staging})
         if rc != 0 or 'ok' not in out:
-            return False, '新版本无法导入（依赖或包结构有问题），已中止'
+            return False, '新版本无法导入（依赖或包结构有问题）'
 
         # 3) 契约测试：仓库自带 41 条断言，覆盖路由表/默认配置/解帧等
         tests_dir = os.path.join(self.staging, 'tests')
@@ -344,7 +344,7 @@ class Runner:
                 timeout=300, cwd=self.staging,
                 env={'PYTHONPATH': self.staging})
             if rc != 0:
-                return False, '新版本未通过自带测试，已中止（当前版本未受影响）'
+                return False, '新版本未通过自带测试'
         return True, ''
 
     # ---------- 备份 ----------
@@ -532,7 +532,7 @@ class Runner:
 
         ok, err = self.verify()
         if not ok:
-            self.set_state('failed', 100, err + '（当前版本未受影响，服务仍在运行）',
+            self.set_state('failed', 100, f'{err}，已中止升级（当前版本未受影响，服务仍在运行）',
                            error=err, finished_at=time.strftime('%Y-%m-%d %H:%M:%S'))
             return 1
 

@@ -214,6 +214,10 @@ def _launch(plan, mode):
 
     cmd = [
         'systemd-run',
+        # --no-block 必须加：不加时 systemd-run 会一直阻塞到 oneshot 单元跑完才返回，
+        # 于是这个 HTTP 请求要挂满整个升级时长（几十秒到几分钟），
+        # 而且执行器返回非零会让我们误判成"启动失败"，前端连进度都看不到。
+        '--no-block',
         f'--unit={UNIT_NAME}',
         '--collect',
         '--property=Type=oneshot',
