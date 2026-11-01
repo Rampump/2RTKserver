@@ -251,6 +251,33 @@ sudo ./update.sh      # backs up the DB, copies new files, reinstalls deps, rest
 sudo ./uninstall.sh   # prompts to back up the DB, then removes service + install dir
 ```
 
+### In-browser upgrade & uninstall
+
+Both are also available from **Config → Maintenance**, no SSH needed:
+
+- **Check for updates** probes both repositories at once and shows the commit of each.
+- **Upgrade now** pulls the newest code, verifies it (syntax compile, import smoke test,
+  the repo's own unit tests), stops the service, waits for the listening ports to be
+  really released, swaps the files, updates dependencies, starts the service and waits
+  for the web port to answer. Any failure at any step rolls back automatically to the
+  version you were running.
+- The page loses connection while the service restarts — that is expected. It keeps
+  polling and reports the outcome by itself; on failure it shows the reason and states
+  that the previous version was restored.
+- **Uninstall** requires the admin password plus typing `DELETE`. The config DB is backed
+  up to `/root/2RTKserver-<timestamp>.db` before anything is removed.
+
+Two download sources are used, and they are **not** the same repository name:
+
+| Source | URL | Notes |
+| --- | --- | --- |
+| GitCode mirror | `https://gitcode.com/rampump/NTRIPserver.git` | reachable from mainland China |
+| GitHub | `https://github.com/Rampump/2RTKserver.git` | official source |
+
+They are probed in parallel and the first reachable one wins, so a device that cannot
+reach GitHub still upgrades from the mirror. Override them per-device without touching
+code by writing `/opt/2RTKserver/.upgrade/sources.json` (see `rtkserver/upgrade/sources.py`).
+
 Forgot the admin password? There is deliberately no web reset endpoint:
 
 ```bash

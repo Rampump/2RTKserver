@@ -176,19 +176,49 @@ WARNING，首页「固定地址」那行显示的也是实际名字。
 
 ## 更新与卸载
 
-更新：
+命令行方式：
 
 ```bash
 chmod +x update.sh
 sudo ./update.sh     # 自动备份配置、更新文件、重启服务
 ```
 
-卸载：
-
 ```bash
 chmod +x uninstall.sh
 sudo ./uninstall.sh  # 停止并删除服务与安装目录
 ```
+
+网页方式（不用 SSH，登录后进 **运行设置 → 系统维护**）：
+
+| 按钮 | 行为 |
+| --- | --- |
+| 检查更新 | 同时探测两个仓库，列出各自的提交号与是否有更新 |
+| 一键升级 | 拉取新版本 → 校验（语法编译 + 导入冒烟 + 仓库自带测试）→ 备份 → 停服并等端口真正释放 → 替换文件 → 装依赖 → 启动 → 健康检查；任何一步失败自动回退到原版本 |
+| 卸载程序 | 需再次输入管理员口令并输入 `DELETE`，配置库先备份到 `/root/2RTKserver-<时间>.db` |
+
+升级期间 Web 服务会停止几秒到几十秒，页面上的连接会断——这是正常的，页面会自己
+继续轮询并在结束后自动刷新；失败时会显示具体原因，并明确告知已退回升级前的版本。
+
+两个仓库地址（**仓库名不同，属正常**，代码里按地址区分，不要求同名）：
+
+- GitCode 镜像：`https://gitcode.com/rampump/NTRIPserver.git`（国内可达，优先）
+- GitHub 官方：`https://github.com/Rampump/2RTKserver.git`
+
+升级时两个源**并发探测**，哪个先通就用哪个，所以访问不了 GitHub 的国内设备也能升级。
+如需换成自己的镜像，写 `/opt/2RTKserver/.upgrade/sources.json` 即可，不必改代码：
+
+```json
+{
+  "gitcode": "https://gitcode.com/your-name/your-repo.git",
+  "github":  "https://github.com/your-name/your-repo.git",
+  "branch":  "main",
+  "order":   ["gitcode", "github"]
+}
+```
+
+升级备份放在 `/opt/2RTKserver/.upgrade/backups/`（保留最近 3 份），升级日志在
+`/opt/2RTKserver/.upgrade/upgrade.log`，执行器本身的日志用
+`journalctl -u 2rtk-upgrader -n 100` 查看。
 
 ---
 

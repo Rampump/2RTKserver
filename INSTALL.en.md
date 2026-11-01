@@ -185,19 +185,52 @@ After installation:
 
 ## Update & Uninstall
 
-Update:
+From the command line:
 
 ```bash
 chmod +x update.sh
 sudo ./update.sh     # backs up config, updates files, restarts service
 ```
 
-Uninstall:
-
 ```bash
 chmod +x uninstall.sh
 sudo ./uninstall.sh  # stops and removes the service and install directory
 ```
+
+From the web UI (**Settings → Maintenance**, no SSH needed):
+
+| Button | What it does |
+| --- | --- |
+| Check for updates | Probes both repositories in parallel and lists each commit |
+| Upgrade now | Fetch → verify (compile, import smoke test, bundled unit tests) → backup → stop service and wait for ports to be released → swap files → install deps → start → health check. Rolls back automatically if any step fails |
+| Uninstall | Requires the admin password plus typing `DELETE`; the config DB is backed up to `/root/2RTKserver-<timestamp>.db` first |
+
+The web service stops for a few seconds while upgrading, so the page loses its
+connection — that is expected. The page keeps polling, refreshes itself on success,
+and on failure shows the reason plus a clear note that the previous version was restored.
+
+Two repositories are used, and **the repository names differ on purpose** — the code
+addresses them by URL, no renaming required:
+
+- GitCode mirror: `https://gitcode.com/rampump/NTRIPserver.git` (reachable in mainland China, tried first)
+- GitHub: `https://github.com/Rampump/2RTKserver.git`
+
+Both are probed concurrently and the first reachable one is used, so devices that cannot
+reach GitHub still upgrade. To point at your own mirror, write
+`/opt/2RTKserver/.upgrade/sources.json` instead of editing code:
+
+```json
+{
+  "gitcode": "https://gitcode.com/your-name/your-repo.git",
+  "github":  "https://github.com/your-name/your-repo.git",
+  "branch":  "main",
+  "order":   ["gitcode", "github"]
+}
+```
+
+Backups live in `/opt/2RTKserver/.upgrade/backups/` (last 3 kept), the upgrade log is
+`/opt/2RTKserver/.upgrade/upgrade.log`, and the runner's own output is in
+`journalctl -u 2rtk-upgrader -n 100`.
 
 ---
 
