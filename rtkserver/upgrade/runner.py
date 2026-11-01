@@ -94,11 +94,14 @@ class Runner:
         if not os.path.exists(self.python):
             self.python = sys.executable
         self.state = {}
+        self._log_to_file = True
 
     # ---------- 状态与日志 ----------
     def log(self, msg, level='INFO'):
         line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{level}] {msg}"
         print(line, flush=True)
+        if not self._log_to_file:
+            return
         try:
             os.makedirs(self.work_dir, exist_ok=True)
             with open(self.log_path, 'a', encoding='utf-8') as f:
@@ -632,9 +635,14 @@ class Runner:
         # 所以这里可以安全地整目录删除。
         self.state['progress'] = 80
         self.save_state()
+        # 关键：删目录之前必须关掉文件日志。
+        # log() 每次都会 makedirs + open(append)，删完之后再写一条，
+        # 就会把刚删掉的 .upgrade/ 和 upgrade.log 原地重建出来，
+        # 真机实测卸载完目录里还剩 .upgrade/upgrade.log 就是这么来的。
+        self._log_to_file = False
         self.run(['rm', '-rf', self.install_dir], timeout=120)
         removed = not os.path.exists(self.install_dir)
-        self.log(f"安装目录已删除: {removed}")
+        self.log(f"安装目录已删除: {removed}（此后日志只输出到 journal）")
         # 状态文件随目录一起没了，这就是"最后一个状态"——前端看到 404 即代表卸载完成
         return 0 if removed else 1
 
