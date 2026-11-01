@@ -511,11 +511,14 @@ class Runner:
         self.start_service()
         healthy = self.health_check(self.web_port, timeout=60)
         stage = 'rolled_back' if (ok and healthy) else 'failed'
-        old = self.state.get('from_version') or self.state.get('old_commit') or '升级前的版本'
+        # 版本号可能为空（离线包/未记录安装提交），空值时不要拼出"退回 升级前的版本"
+        old = self.state.get('from_version') or self.state.get('old_commit') or ''
         if healthy:
-            msg = f'升级失败，已自动退回 {old}，服务运行正常。'
+            msg = (f'升级失败，已自动退回 {old}，服务运行正常。' if old
+                   else '升级失败，已自动退回升级前的版本，服务运行正常。')
         else:
-            msg = f'升级失败，回退后服务仍未就绪（{old}），请 SSH 登录检查。'
+            msg = (f'升级失败，回退后服务仍未就绪（{old}），请 SSH 登录检查。' if old
+                   else '升级失败，回退后服务仍未就绪，请 SSH 登录检查。')
         self.set_state(stage, 100, msg, rolled_back=ok,
                        finished_at=time.strftime('%Y-%m-%d %H:%M:%S'))
         self.log(f"回退结束: stage={stage}, healthy={healthy}")
