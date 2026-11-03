@@ -84,7 +84,7 @@ permanent antenna.
 
 | Report | What it covers |
 | --- | --- |
-| [Real-device full-chain test, 2026-11-03](docs/lg290p-realdevice-fullchain-2026-11-03.en.md) ([中文](docs/lg290p-realdevice-fullchain-2026-11-03.zh.md)) | Full lifecycle on an Armbian box with a Quectel LG290P: one-click upgrade 2.2.3 → 3.x, mDNS access, CORS calibration that reached **RTK fixed**, and the stream pushed to a public caster. Also records the six defects that only surface on hardware. |
+| [Real-device full-chain test, 2026-11-03](docs/lg290p-realdevice-fullchain-2026-11-03.en.md) ([中文](docs/lg290p-realdevice-fullchain-2026-11-03.zh.md)) | Two sessions in one document. **First pass** (LG290P): one-click upgrade 2.2.3 → 3.x, mDNS access, CORS calibration that reached **RTK fixed**, and the stream pushed to a public caster — six defects found on hardware. **Second pass** (§12, LG290P swapped for an LC29H(BS) on a different USB port): five more, all of them contract gaps between the workflow layer and the drivers. |
 | [LG290P CORS field test, 2026-11-02](docs/lg290p-cors-field-test-2026-11-02.zh.md) | First outdoor attempt: why the receiver never left DGPS quality, what was wrongly blamed on the sky view, and the command that actually fixed it. |
 
 The short version of the 2026-11-03 run:
@@ -101,6 +101,14 @@ The short version of the 2026-11-03 run:
   check, one bogus noise warning caused by mixing bytes with line counts, a stage timestamp
   that showed the task start time on all 13 rows, and a dropdown that opened anywhere but
   under its input. All fixed in 3.1, each with a regression test.
+- **What the second pass added** — an `AttributeError` instead of module info, because the
+  workflow calls 19 driver methods unconditionally while nothing forced a driver to implement
+  them; a port scan that looked dead after a USB swap (candidates went into a `<datalist>`,
+  failures into a footer box); a base-only module still being offered *CORS measure*; a stored
+  antenna coordinate that a newly plugged module was not allowed to reuse; and records that kept
+  only the coordinate form the module happened to output. All fixed in 3.1.1, with contract tests
+  that now fail if any registered driver is missing part of the protocol surface.
+
 
 ## Release highlights
 

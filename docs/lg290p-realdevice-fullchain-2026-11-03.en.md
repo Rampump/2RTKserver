@@ -488,8 +488,17 @@ one height, with the footnote pinned to the bottom edge so the three explanation
 
 ### 8.4 The baud rate was guessed, not read
 
-The vendor documents list five rates and no fixed factory default, so the previous flow climbed the
-candidate list and paid a 2-second timeout on every wrong step. The module can simply be asked.
+One correction up front, because it is a common misremembering: the `<BaudRate>` parameter table in
+the LG290P manual (§2.3.10 `PQTMCFGUART`) lists the **accepted values** — 9600 / 115200 / 230400 /
+460800 / 921600 — and **does not state a factory default**. The NOTE in the text says only that a
+parameter with no documented default must be read back with the corresponding Get command. Every
+example in the manual uses 115200, but an example is not a promise; 921600 is merely the highest
+optional rate, not the default. Another revision of the spec (LG290P(03)/LG580P(03)) widens the
+range to a continuous 9600~4000000, which means legal non-standard rates exist outside those five
+steps — **enumeration can never cover them all, so reading the module back is the only reliable
+path.** Read back from this device: `UART1 115200 8N1`.
+
+The previous flow climbed the candidate list and paid a 2-second timeout on every wrong step.
 
 - Drivers now implement `read_uart()`: LG290P sends `$PQTMCFGUART,R` (reply
   `$PQTMCFGUART,OK,<Index>,<BaudRate>,<DataBit>,<Parity>,<StopBit>,<FlowCtrl>`), Unicore N4 sends
