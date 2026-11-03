@@ -734,3 +734,96 @@ places stitched into one row.
 - The bidirectional conversion is regression-tested against the **values measured on the device**:
   `25.20352374°,110.27748337°,138.316 m` converts to `-2001277.3805, 5416696.8658, 2699549.3066`,
   0.6 mm away from the value read back from the module (four-decimal rounding).
+
+---
+
+## 13. Third pass: the dropdown that froze the browser (fixed in 3.1.2)
+
+This one is not a serial-port defect. It surfaced while operating the page: **clicking the
+"Module" dropdown on the calibration page hangs the browser.**
+
+### 13.1 What it was not
+
+The first suspect was a loop in the `change` handler — switching a model runs
+`applyCapabilities()`, `refreshBaudOptions()` and `refreshModuleHint()`, which in turn touch the
+capability locks, the plan step bar, the history list and the baud candidates. Driving it
+programmatically through every model:
+
+```
+lg290p     ok  0.01s      um960      ok  0.01s
+um960l     ok  0.01s      um980      ok  0.01s
+lc29hbs    ok  0.01s      __auto__   ok  0.01s
+```
+
+All in the 10 ms range, no `pageerror`. **The JavaScript path is fine**; the stall is elsewhere.
+
+### 13.2 The actual variable: whether the animation is still running
+
+A native `<select>` popup is drawn by the browser's UI thread, not by page script. Measuring
+"click" together with "the style state at that moment" exposed the dividing line:
+
+| When you click | Time to open |
+| --- | --- |
+| animation finished (click 1.2 s after load) | 50 – 56 ms |
+| during the 0.35 s animation | **454 ms / 972 ms** |
+
+Same machine, same page, same code; the only variable is whether the card is animating
+`transform` at that instant. A `transform` animation promotes the card to a **compositing layer**,
+and the popup has to be positioned and painted inside that layer while the offset changes every
+frame, so the list is recomputed frame by frame. Under a second here — on a phone or a low-end
+machine that is exactly the "browser froze" report.
+
+### 13.3 Two plausible fixes that do not work
+
+Both were tried before the real one. Recorded so nobody repeats them:
+
+1. **`transform: none` in the end keyframe.** The computed style is still
+   `matrix(1, 0, 0, 1, 0, 0)`: once `transform` appears in a keyframe it takes part in
+   interpolation, and `none` is treated as the identity matrix.
+2. **Switching `both` to `backwards`.** This does remove the residue (all seven cards read
+   `none`), but the element is still a compositing layer *while animating*. A/B measurement:
+   both variants click at ~50 ms, and both are slow when clicked mid-animation.
+
+Conclusion: **as long as `transform` participates in the animation, the problem remains.** The
+only fix is not to animate it.
+
+### 13.4 Fix and measurements
+
+The entrance animation is now opacity-only (`0.35s` → `0.22s`, no offset):
+
+| | before | after |
+| --- | --- | --- |
+| click during the animation | 454 – 972 ms | **62 – 85 ms** |
+| click after it finishes | 50 – 56 ms | 50 – 56 ms |
+| main-thread round-trip afterwards | 2 – 3 ms | 1.5 – 3 ms |
+
+This also settles an older question: the 3.1 "datalist popup opens across the screen" defect had
+the same root cause (end keyframe `translateY(0)` plus `both` left every card a containing block).
+The body-level panel worked around the symptom; the cause stayed. The cause is gone now, but the
+panel stays — it does not depend on ancestor layout, which is more reliable than hoping no ancestor
+ever carries a transform.
+
+Contract test added: `@keyframes fade-in` fails if it contains `transform`. **Verified in
+reverse** — putting `transform: translateY(6px)` back makes the test fail, rather than passing
+vacuously.
+
+### 13.5 Fixed in the same pass
+
+- **First baud candidate.** `DEFAULT_BAUD` was declared but never entered the ordering;
+  `bauds()` sorted descending only. A fresh 115200 module burned three 2-second timeouts on
+  921600 / 460800 / 230400 first — the "climbing the candidate list" complaint had only changed
+  direction, not gone away. The default rate now leads: `115200, 921600, 460800, 230400, 9600`.
+- **The self-check assertion** in `driver_manager._selftest()` that asserted pure descending order
+  was the thing freezing the wrong order into an invariant; it now asserts "default first, rest
+  descending".
+- **Copy that no longer matched the code**: the reuse card still said "this module was calibrated
+  before" long after the logic stopped filtering by module.
+
+### 13.6 Verification
+
+- **242 contract tests pass** (238 before, +4); the driver offline self-check passes all 15 steps.
+- Reproduced and quantified with Playwright driving the system Chrome; the probe scripts stay in
+  the local workspace and are not shipped.
+- No assertion was loosened between 238 and 242: one old assertion (a descending-order snapshot)
+  was updated with the behaviour change, and its docstring now explains why it was wrong to begin
+  with.

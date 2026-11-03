@@ -85,7 +85,7 @@ permanent antenna.
 
 | Report | What it covers |
 | --- | --- |
-| [Real-device full-chain test, 2026-11-03](docs/lg290p-realdevice-fullchain-2026-11-03.en.md) ([中文](docs/lg290p-realdevice-fullchain-2026-11-03.zh.md)) | Two sessions in one document. **First pass** (LG290P): one-click upgrade 2.2.3 → 3.x, mDNS access, CORS calibration that reached **RTK fixed**, and the stream pushed to a public caster — six defects found on hardware. **Second pass** (§12, LG290P swapped for an LC29H(BS) on a different USB port): five more, all of them contract gaps between the workflow layer and the drivers. |
+| [Real-device full-chain test, 2026-11-03](docs/lg290p-realdevice-fullchain-2026-11-03.en.md) ([中文](docs/lg290p-realdevice-fullchain-2026-11-03.zh.md)) | Three passes in one document. **First pass** (LG290P): one-click upgrade 2.2.3 → 3.x, mDNS access, CORS calibration that reached **RTK fixed**, and the stream pushed to a public caster — six defects found on hardware. **Second pass** (§12, LG290P swapped for an LC29H(BS) on a different USB port): five more, all contract gaps between the workflow layer and the drivers. **Third pass** (§13, browser): clicking the module dropdown froze the page — measured 972 ms against 50 ms depending on whether a `transform` animation was still running. |
 | [LG290P CORS field test, 2026-11-02](docs/lg290p-cors-field-test-2026-11-02.zh.md) | First outdoor attempt: why the receiver never left DGPS quality, what was wrongly blamed on the sky view, and the command that actually fixed it. |
 
 The short version of the 2026-11-03 run:
@@ -109,15 +109,21 @@ The short version of the 2026-11-03 run:
   antenna coordinate that a newly plugged module was not allowed to reuse; and records that kept
   only the coordinate form the module happened to output. All fixed in 3.1.1, with contract tests
   that now fail if any registered driver is missing part of the protocol surface.
+- **What the third pass added** — a dropdown that froze the browser. Not a script loop (switching
+  models programmatically is a 10 ms operation); the card entrance animation was animating
+  `transform`, which makes every card a compositing layer, and a native `<select>` popup has to be
+  laid out inside that layer while it moves. Same click, same page: **50 ms** with the animation
+  finished, **972 ms** while it was still running. The animation is opacity-only now; a contract
+  test fails if `transform` comes back.
 
 ## Test suite
 
-`tests/test_contract.py` ships with the repository: **241 assertions**, standard library and this
+`tests/test_contract.py` ships with the repository: **242 assertions**, standard library and this
 project's own modules only — nothing to `pip install` beyond what the app already needs. Run it
 on the device or on your laptop:
 
 ```bash
-python -m unittest discover -s tests -t . -q     # 241 tests, ~3 s, 1 skipped when not on Linux
+python -m unittest discover -s tests -t . -q     # 242 tests, ~3 s, 1 skipped when not on Linux
 ```
 
 These are not "does the function return what it returned yesterday" tests. Each one pins a defect
@@ -189,6 +195,40 @@ LC29H(BS) on a different USB port:
   converting in either direction (whatever the module or the operator supplied), and a pair that
   disagrees by more than 5 cm is corrected from ECEF with a warning, because ECEF is what actually
   goes out in the 1005 message.
+
+**3.1.2** — one defect reported from the browser, one that had been hiding behind a stale comment:
+
+- **Clicking the module-model dropdown no longer hangs the browser.** The card entrance animation
+  used to animate `transform`, which promotes every card to its own compositing layer. A native
+  `<select>` popup is laid out by the browser's UI thread *inside* that layer, and with the layer
+  still moving the list is recomputed frame by frame. Measured on one machine, same page, the only
+  variable being whether the animation was running:
+
+  | When you click the dropdown | Time to open |
+  | --- | --- |
+  | animation finished | 50 – 56 ms |
+  | within the 0.35 s animation | **454 – 972 ms** |
+
+  Nearly a second here; on a phone or a low-end machine that is the "browser froze" people report.
+  The animation is now opacity-only (0.22 s) and the click costs 62 – 85 ms. Two plausible-looking
+  non-fixes are documented in the CSS so nobody retries them: writing `transform: none` in the end
+  keyframe (it still interpolates and computes to `matrix(1,0,0,1,0,0)`), and switching `both` to
+  `backwards` (removes the residue, but the element is still a compositing layer *while* animating).
+  A contract test now fails if `transform` reappears in that keyframe.
+
+- **Baud rate: the first candidate is now the model's most likely rate.** `DEFAULT_BAUD` had been
+  declared for a while but never entered the ordering — `bauds()` sorted descending only, so a
+  factory-fresh 115200 module burned three 2-second timeouts on 921600 / 460800 / 230400 first.
+  The complaint about "climbing the candidate list" was never actually fixed; it had only changed
+  direction. Order is now `115200, 921600, 460800, 230400, 9600` — a bet backed by the manual's
+  examples and the measured device, not a claim about a documented factory default (the protocol
+  spec states none and tells you to read the value back).
+
+- **The test suite ships in the repository again.** 3.0.0 had moved `tests/` into `.gitignore`, which
+  quietly falsified two claims: the README's "each fix ships with a regression test", and the upgrade
+  executor's own "contract tests from the repository" step. A clone had no tests, so that gate never
+  ran. It runs now: 242 assertions, standard library only, and `verify()` refuses to install a
+  release that fails them.
 
 **3.0** — the calibration subsystem:
 
@@ -722,13 +762,42 @@ RTCM 1005 校验「写进去的 == 播出去的」。精度如实标注（固定
 - **坐标两种形态都落库**：一条记录必定同时有 ECEF 与经纬高，两个方向都能换算（取决于模块
   或人工给的是哪一种）；两者相差超过 5 cm 时以 ECEF 为准重算并告警，因为真正播进 1005 的是 ECEF。
 
+**3.1.2 修的是一个"点一下浏览器就卡死"**：
+
+- **点「模块型号」下拉时页面卡死**。卡片入场动画当时在动 `transform`，而 `transform` 动画会把
+  卡片提升为**合成层**；原生 `<select>` 的下拉列表由浏览器 UI 线程展开，要在这个还在移动的层里
+  定位并绘制，位移每帧都变，列表就跟着逐帧重算。同一台机器、同一页面，唯一变量是"点的时候
+  动画在不在跑"：
+
+  | 点击时机 | 展开耗时 |
+  | --- | --- |
+  | 动画已结束 | 50 ~ 56 ms |
+  | 动画进行中（0.35 s 内） | **454 ~ 972 ms** |
+
+  本机就是慢了近 1 秒，拿到手机或低配设备上就是"卡死"。现在入场动画只做透明度（0.22 s），
+  点击降到 62 ~ 85 ms。两种"看起来能修好"的写法都试过并否掉了，写进 CSS 注释免得后人再试：
+  末帧写 `transform: none` 没用（照样参与插值，计算值仍是单位矩阵），只把 `both` 换成
+  `backwards` 也没用（残留消了，但动画进行中仍是合成层）。契约测试会在这个 keyframe 里
+  重新出现 `transform` 时失败。
+
+- **波特率：第一个候选改成该型号最可能命中的那一档**。`DEFAULT_BAUD` 早就声明了却从没参与
+  排序，`bauds()` 只做纯降序 —— 一块出厂跑 115200 的模块要先在 921600 / 460800 / 230400 上
+  各等 2 秒。用户抱怨的"一档档试"其实一直没修好，只是从低往高试变成了从高往低试。
+  现在顺序是 `115200, 921600, 460800, 230400, 9600`：押注手册示例与实测结果，不是"官方默认值"
+  （手册没写出厂值，正文只要求用 Get 命令回读）。
+
+- **测试套件回到仓库里**。3.0.0 把 `tests/` 加进了 `.gitignore`，于是两处说法同时变成空话：
+  README 的"每个修复都带回归测试"、升级执行器自己那句"契约测试：仓库自带的断言"。clone 下来
+  根本没有 tests 目录，那道门禁从未生效。现在 242 条断言随仓库分发，`verify()` 会在安装前跑，
+  失败就拒绝升级。
+
 ### 测试套件
 
-`tests/test_contract.py` 随仓库分发，**241 条断言**，只依赖标准库和本项目自己的模块，
+`tests/test_contract.py` 随仓库分发，**242 条断言**，只依赖标准库和本项目自己的模块，
 不需要额外 `pip install` 任何东西。设备上和电脑上都能直接跑：
 
 ```bash
-python -m unittest discover -s tests -t . -q     # 241 项，约 3 秒，非 Linux 跳过 1 项
+python -m unittest discover -s tests -t . -q     # 242 项，约 3 秒，非 Linux 跳过 1 项
 ```
 
 这些测试不验证"函数今天和昨天返回值一样"，每一条都钉住一个**只在真机上才会出现**的缺陷：
@@ -773,7 +842,7 @@ sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone 
 sudo rm -rf /tmp/2rtk-update && (sudo git clone --depth 1 https://gitcode.com/rampump/NTRIPserver.git /tmp/2rtk-update || (sudo rm -rf /tmp/2rtk-update && sudo git clone --depth 1 https://github.com/Rampump/2RTKserver.git /tmp/2rtk-update)) && sudo bash /tmp/2rtk-update/update.sh
 ```
 
-升级完成后浏览器里「系统维护」显示的版本应为 `3.1.1`。也可以在网页上点「检查更新 → 立即升级」，
+升级完成后浏览器里「系统维护」显示的版本应为 `3.1.2`。也可以在网页上点「检查更新 → 立即升级」，
 效果一致：它会先备份、换文件、装依赖、启动服务，任何一步失败自动回滚到原版本。
 
 > **从 2.x 升级特别注意**：3.0 首次启动会自动建 `calibration.db`（标定库）。旧的
