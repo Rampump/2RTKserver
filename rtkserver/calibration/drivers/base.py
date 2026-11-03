@@ -738,7 +738,18 @@ class BaseDriver:
 
     # ---------- 波特率 ----------
     def bauds(self):
-        """该型号官方支持的波特率档位（去重、降序——先用高的试，高的能通说明线材好）。
+        """该型号该先试哪些波特率（`DEFAULT_BAUD` 打头，其余降序）。
+
+        为什么 `DEFAULT_BAUD` 必须排第一 —— 曾经这里是纯降序，注释的理由是
+        "先用高的试，高的能通说明线材好"。听起来合理，但把顺序搞反了：
+        **首次插上一块全新模块时，唯一已知的信息就是厂商示例里那个值**
+        （LG290P 手册 §2.3.10 的全部示例都是 115200）。纯降序会让 921600 先试，
+        错一档白等 2 秒，一块 115200 的模块要错 3 档才命中，正好是用户抱怨的
+        "一档档试"——只是从低往高试换成了从高往低试，总等待没变少。
+
+        `DEFAULT_BAUD` 的语义因此被钉死为"厂商示例/实测最可能命中的那一档"，
+        不是"出厂默认值"（手册并没有承诺出厂值，见 LG290P 驱动的注释）。
+        它排在**最前**只是押注，押错照旧往下走，代价为零。
 
         驱动没声明 BAUDS 时返回空元组，由调用方决定退回全局兜底表。
         """
@@ -750,7 +761,18 @@ class BaseDriver:
                 continue
             if n > 0 and n not in seen:
                 seen.append(n)
-        return tuple(sorted(seen, reverse=True))
+        if not seen:
+            return ()
+
+        # 最可能的那一档提到最前，其余保持降序（高档位通常意味着更好的线材与更小的采样延迟）
+        likely = []
+        try:
+            default = int(self.DEFAULT_BAUD or 0)
+        except (TypeError, ValueError):
+            default = 0
+        if default > 0:
+            likely = [default]
+        return tuple(likely + [n for n in sorted(seen, reverse=True) if n not in likely])
 
     def supports_baud(self, baud):
         """该型号是否声明支持这个波特率（未声明 BAUDS 时一律返回 True，不做限制）。"""

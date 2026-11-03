@@ -632,7 +632,9 @@ DEFAULT_BAUDS = (115200, 460800, 921600, 230400, 38400, 9600)
 def detect_bauds(model_key=None):
     """采集/识别该用的波特率候选顺序。
 
-    传了 model_key 且该驱动声明了 BAUDS → 用厂商文档里的清单（降序）；
+    传了 model_key 且该驱动声明了 BAUDS → 用厂商文档里的清单，
+    `DEFAULT_BAUD` 打头、其余降序（见 `BaseDriver.bauds()` 的说明：
+    首轮先押最常见的 115200，而不是先拿最高档试）；
     否则退回全局 DEFAULT_BAUDS。
     """
     if model_key:
