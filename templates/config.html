@@ -21,6 +21,10 @@
       <nav class="nav">
         <a href="/" class="nav-link" data-i18n="nav.status">状态信息</a>
         <a href="/config" class="nav-link is-active" data-i18n="nav.config">运行设置</a>
+        {% if calibration_available %}
+          <a href="/calibrate" class="nav-link" data-i18n="nav.calibrate">一键标定</a>
+        {% endif %}
+        <a href="/upgrade" class="nav-link" data-i18n="nav.upgrade">检查更新</a>
         {% if session.get('logged_in') %}
           <a href="/change_password" class="nav-link" data-i18n="nav.password">修改密码</a>
           <form method="post" action="/logout" class="nav-form">
@@ -97,6 +101,19 @@
                   </datalist>
                 </div>
               </div>
+
+              {% if calibration_available %}
+                {# 一键标定入口：放在串口卡片下方，用户配完串口顺手就能去标定 #}
+                <div class="field" id="calibration-entry">
+                  <a href="/calibrate" class="btn btn-secondary" style="text-decoration:none;">
+                    <i class="fa fa-crosshairs" aria-hidden="true"></i>
+                    <span data-i18n="cfg.open_calibration">打开一键标定</span>
+                  </a>
+                  <div class="field-hint" data-i18n="cfg.open_calibration_hint">
+                    自动切流动站、连 CORS、进固定解后采集坐标，再写回基准站。标定期间数据面会暂停，下游会短暂断流。
+                  </div>
+                </div>
+              {% endif %}
 
               <div class="form-row field-relay">
                 <div class="field">
@@ -289,79 +306,11 @@
           </div>
         </section>
 
-        <!-- 系统维护：版本、升级、卸载。
-             升级会重启服务，页面会短暂断开，因此交互是「发起 → 轮询」两段式，
-             不依赖 WebSocket。 -->
-        <section class="card mt-20 fade-in" id="maint-card">
-          <div class="card-pad">
-            <div class="card-hd">
-              <h1 class="card-title"><i class="fa fa-cogs" aria-hidden="true"></i><span data-i18n="maint.title">系统维护</span></h1>
-            </div>
-
-            <dl class="kv kv--compact">
-              <dt data-i18n="maint.version">当前版本</dt>
-              <dd class="mono" id="maint-version">—</dd>
-              <dt data-i18n="maint.installed">最近升级</dt>
-              <dd id="maint-installed">—</dd>
-              <dt data-i18n="maint.ports">升级前需释放端口</dt>
-              <dd class="mono" id="maint-ports">—</dd>
-            </dl>
-
-            <div class="form-row">
-              <div class="field">
-                <label class="form-label" for="maint-source" data-i18n="maint.source">升级源</label>
-                <select id="maint-source" class="form-input"></select>
-              </div>
-              <div class="field">
-                <label class="form-label" style="visibility: hidden;">actions</label>
-                <div class="input-row">
-                  <button type="button" id="maint-check" class="btn btn-secondary">
-                    <i class="fa fa-refresh" aria-hidden="true"></i><span data-i18n="maint.check">检查更新</span>
-                  </button>
-                  <button type="button" id="maint-upgrade" class="btn btn-primary">
-                    <i class="fa fa-cloud-upload" aria-hidden="true"></i><span data-i18n="maint.upgrade">一键升级</span>
-                  </button>
-                </div>
-              </div>
-            </div>
-            <div class="field-hint" id="maint-result" data-i18n="maint.hint">
-              升级会停止服务以替换文件，页面会短暂断开，完成后自动恢复。升级失败会自动回退到当前版本。
-            </div>
-
-            <div class="section-sep"></div>
-            <h2 class="sub-title"><i class="fa fa-trash" aria-hidden="true"></i><span data-i18n="maint.uninstall_title">卸载本程序</span></h2>
-            <div class="field-hint" data-i18n="maint.uninstall_hint">
-              卸载会停止服务、删除 systemd 单元与整个安装目录（配置库先备份到 /root）。卸载后本页面将无法再访问，需要重新安装才能恢复。
-            </div>
-            <div class="form-row">
-              <div class="field">
-                <label class="form-label" for="maint-pwd" data-i18n="maint.password">管理员口令</label>
-                <input type="password" id="maint-pwd" class="form-input" autocomplete="current-password">
-              </div>
-              <div class="field">
-                <label class="form-label" for="maint-confirm" data-i18n="maint.confirm">输入 DELETE 以确认</label>
-                <input type="text" id="maint-confirm" class="form-input" placeholder="DELETE" autocomplete="off">
-              </div>
-            </div>
-            <div class="form-actions">
-              <button type="button" id="maint-uninstall" class="btn btn-danger">
-                <i class="fa fa-trash" aria-hidden="true"></i><span data-i18n="maint.uninstall">卸载程序</span>
-              </button>
-            </div>
-          </div>
-        </section>
-
-        <!-- 彻底恢复默认配置：不提供网页入口，走 SSH 命令行 -->
-        <section class="note mt-20 fade-in">
-          <div class="note-title" data-i18n="cfg.reset_title">需要彻底恢复默认配置？</div>
-          <div data-i18n="cfg.reset_text">网页不提供该入口——重置接口无法可靠区分本机与远程请求，容易成为攻击面。请 SSH 登录设备后执行：</div>
-          <pre>sudo systemctl stop 2rtkserver
-sudo /opt/2RTKserver/venv/bin/python /opt/2RTKserver/reset_config.py --yes
-sudo systemctl start 2rtkserver</pre>
-          <div class="dim" style="margin-top: 8px;" data-i18n="cfg.reset_after">
-            该操作会把管理员恢复为 <span class="mono">admin / admin</span> 并清空全部连接设置。路径请按实际安装目录调整。
-          </div>
-        </section>
+        <!-- 升级/卸载/恢复默认配置都不在这个页面：
+               升级      → /upgrade「检查更新」（会停服务换文件，和"改配置"不是一类操作）
+               卸载      → 只走 SSH 命令行，网页不提供入口（误触会删掉整个安装目录）
+               恢复默认  → 同样只走 SSH，重置接口无法可靠区分本机与远程请求
+             这一页只负责"设置基准站"，把危险动作挪走，误点的概率就降下来了。 -->
       </div>
     </div>
   </main>
@@ -374,23 +323,7 @@ sudo systemctl start 2rtkserver</pre>
     </div>
   </footer>
 
-  <!-- 升级/卸载进度遮罩：服务重启期间轮询会短暂失败，这里始终显示当前阶段，
-       让用户知道"页面断了是正常的、别关" -->
-  <div class="maint-overlay hidden" id="maint-overlay">
-    <div class="maint-panel">
-      <div class="maint-title">
-        <i class="fa fa-cog fa-spin" aria-hidden="true"></i>
-        <span id="maint-stage">…</span>
-      </div>
-      <div class="maint-bar"><div class="maint-bar-fill" id="maint-bar"></div></div>
-      <div class="maint-msg" id="maint-msg"></div>
-      <pre class="maint-log" id="maint-log"></pre>
-      <div class="maint-foot dim" id="maint-foot"></div>
-    </div>
-  </div>
-
   <script src="/static/i18n.js"></script>
-  <script src="/static/maintenance.js"></script>
   <script>
     document.getElementById('year').textContent = new Date().getFullYear();
 

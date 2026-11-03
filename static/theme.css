@@ -468,6 +468,32 @@ button.nav-link {
   gap: 16px;
 }
 
+/* 出口三件套：上传端 / 本地 Caster / 无线数传，桌面横向一排，窄屏竖排 */
+.grid-outlets {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+  margin-bottom: 16px;
+}
+
+/* 三列时标题右侧的说明文字会被挤成一词一行，这里允许换行并按右侧对齐 */
+.grid-outlets .card-hd {
+  flex-wrap: wrap;
+  align-items: flex-start;
+  row-gap: 4px;
+}
+
+.grid-outlets .card-hint {
+  flex: 1 1 100%;
+  line-height: 1.45;
+  /* 英文文案更长，允许折成两行，不要省略号截断 */
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  word-break: break-word;
+}
+
 .stack {
   display: grid;
   gap: 16px;
@@ -1134,6 +1160,15 @@ details[open].note > summary::before {
 @media (max-width: 960px) {
   .grid-stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .grid-outlets {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* 单列时恢复标题与说明同一行 */
+  .grid-outlets .card-hint {
+    flex: 0 1 auto;
   }
 }
 

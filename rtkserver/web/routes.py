@@ -168,6 +168,13 @@ def config_page():
     return render_template('config.html', config=config, message=message, message_type=message_type)
 
 
+# 检查更新：版本信息、升级源、一键升级。单独成页而不是塞进「运行设置」，
+# 因为这一页的动作会停服务、换文件，和"改端口号保存"完全不是一类操作。
+@login_required
+def upgrade_page():
+    return render_template('upgrade.html')
+
+
 # ==================== 配置重置（不提供 HTTP 接口） ====================
 # 历史沿革：
 #   1. 原实现 /reset_config 完全没有鉴权，局域网内任何人都能把管理员重置成 admin/admin。
@@ -219,5 +226,6 @@ def register(app):
     app.add_url_rule('/login', 'login', login, methods=['GET', 'POST'])
     app.add_url_rule('/logout', 'logout', logout, methods=['POST'])
     app.add_url_rule('/config', 'config_page', config_page, methods=['GET', 'POST'])
+    app.add_url_rule('/upgrade', 'upgrade_page', upgrade_page, methods=['GET'])
     app.add_url_rule('/restart_program', 'restart_program', restart_program, methods=['POST'])
     app.add_url_rule('/change_password', 'change_password', change_password, methods=['GET', 'POST'])

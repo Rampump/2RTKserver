@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>2RTK NTRIP server · 一键标定</title>
+  <link rel="icon" href="/static/favicon.ico">
+  <link rel="stylesheet" href="/static/theme.css">
+  <link href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700&display=swap" rel="stylesheet">
+  <style>
+    /* 本页专用。页面结构按「标定方式」分区：切换方式后，
+       只有这一种方式真正会用到的字段会出现，其余整套 DOM 留在页面上但隐藏。
+       这样切回来时用户填过的值还在（不想用 JS 反复重建表单）。 */
+    .cal-wrap { max-width: 1100px; margin: 0 auto; }
+    .cal-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .cal-grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    @media (max-width: 860px) {
+      .cal-grid, .cal-grid-3 { grid-template-columns: 1fr; }
+    }
+
+    .cal-progress { height: 8px; border-radius: 999px; background: var(--border, #e2e8f0); overflow: hidden; }
+    .cal-progress > i { display: block; height: 100%; width: 0; background: var(--accent, #2563eb); transition: width .4s ease; }
+
+    .cal-status-hd { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    .cal-stage { font-weight: 600; font-size: 15px; }
+
+    /* 指标卡：只有 CORS 类方式才显示（Survey-in / 只写坐标没有采集过程） */
+    .cal-metrics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+    @media (max-width: 860px) { .cal-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+    .cal-metric { border: 1px solid var(--border, #e2e8f0); border-radius: 10px; padding: 10px 12px; }
+    .cal-metric .k { font-size: 11px; opacity: .7; letter-spacing: .04em; text-transform: uppercase; }
+    .cal-metric .v { font-size: 18px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
+    .cal-metric .v.is-ok { color: var(--success, #16a34a); }
+    .cal-metric .v.is-warn { color: var(--warning, #d97706); }
+    .cal-metric .v.is-bad { color: var(--danger, #dc2626); }
+
+    .cal-timeline { list-style: none; margin: 12px 0 0; padding: 0 0 0 14px; border-left: 2px solid var(--border, #e2e8f0); max-height: 240px; overflow: auto; }
+    .cal-timeline li { position: relative; padding: 0 0 10px 14px; font-size: 13px; }
+    .cal-timeline li::before { content: ''; position: absolute; left: -21px; top: 5px; width: 8px; height: 8px; border-radius: 50%; background: var(--accent, #2563eb); }
+    .cal-timeline li.is-fail::before { background: var(--danger, #dc2626); }
+    .cal-timeline li.is-ok::before { background: var(--success, #16a34a); }
+    .cal-timeline time { opacity: .6; margin-right: 8px; font-variant-numeric: tabular-nums; }
+
+    .cal-log { margin-top: 12px; background: rgba(15, 23, 42, .04); border-radius: 8px; padding: 10px 12px; max-height: 180px; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.7; white-space: pre-wrap; }
+    .cal-log .lv-error { color: var(--danger, #dc2626); }
+
+    .cal-actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 16px; }
+
+    .cal-modal-mask { position: fixed; inset: 0; background: rgba(15, 23, 42, .45); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 50; }
+    .cal-modal-mask.is-open { display: flex; }
+    .cal-modal { background: var(--card-bg, #fff); color: inherit; border-radius: 14px; max-width: 560px; width: 100%; padding: 20px 22px; box-shadow: 0 20px 60px rgba(15, 23, 42, .3); max-height: 86vh; overflow: auto; }
+    .cal-modal h3 { margin: 0 0 10px; font-size: 17px; }
+    .cal-modal ul { margin: 10px 0 0 18px; padding: 0; font-size: 13px; line-height: 1.9; }
+    .cal-modal .cal-actions { justify-content: flex-end; }
+
+    .cal-muted { opacity: .68; font-size: 12px; line-height: 1.7; }
+    .is-hidden { display: none !important; }
+    .cal-inline { display: flex; gap: 8px; align-items: center; }
+    .cal-inline .form-input { flex: 1; min-width: 0; }
+    /* 行内按钮不参与压缩、文字不折行：窄屏时宁可让输入框变短 */
+    .cal-inline .btn { flex: 0 0 auto; white-space: nowrap; }
+
+    .cal-notice { border-left: 3px solid var(--warning, #d97706); background: rgba(217, 119, 6, .08);
+                  border-radius: 0 8px 8px 0; padding: 12px 14px; margin-bottom: 16px;
+                  font-size: 13px; line-height: 1.85; }
+    .cal-notice b { font-weight: 600; }
+    .cal-notice .cal-notice-hd { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-weight: 600; }
+    .cal-notice.is-info { border-left-color: var(--accent, #2563eb); background: rgba(37, 99, 235, .07); }
+
+    /* GGA 防抖护栏常驻提示：护栏生效期间一直亮着，用强调色而不是警告色——
+       它表达的是"正在受保护"，不是"出错了"。注意这里**不锁定位置**：
+       上报给 CORS 的 GGA 是模块真实定位，锁死反而让 VRS 虚拟参考站偏离真实天线。 */
+    .cal-freeze { display: flex; align-items: center; gap: 8px; margin-top: 12px;
+                  padding: 9px 12px; border-radius: 8px; font-size: 13px;
+                  border: 1px solid var(--accent, #2563eb);
+                  background: rgba(37, 99, 235, .08); color: var(--accent, #2563eb); }
+    /* 拦下过跳变行：位置已经出现过异常，要按警告色，不能让人以为一切正常 */
+    .cal-freeze.is-warn { border-color: var(--warning, #d97706);
+                          background: rgba(217, 119, 6, .1); color: var(--warning, #d97706); }
+    /* 连续跳变已停发：CORS 那边现在收不到位置，VRS 会停更，这次标定基本废了 */
+    .cal-freeze.is-stop { border-color: var(--danger, #dc2626);
+                          background: rgba(220, 38, 38, .1); color: var(--danger, #dc2626); }
+
+    /* 上次被硬中断的警告横幅。必须常驻不可自动消失：它描述的是
+       "模块可能停在中间配置上"，用户不看这条就直接拿它当基准站用，下游会拿到一套错坐标。 */
+    .cal-banner { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 16px;
+                  padding: 12px 14px; border-radius: 10px; font-size: 13px; line-height: 1.8;
+                  border: 1px solid var(--warning, #d97706);
+                  background: rgba(217, 119, 6, .1); }
+    .cal-banner .cal-banner-hd { font-weight: 600; margin-bottom: 2px; }
+    .cal-banner .cal-banner-close { margin-left: auto; background: none; border: 0;
+                                    cursor: pointer; font-size: 16px; line-height: 1;
+                                    color: inherit; opacity: .7; padding: 0 2px; }
+
+    /* 硬件信息：固件 / SN / 当前模式。只在点过"读取模块信息"后出现。 */
+    .cal-hw { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+    @media (max-width: 860px) { .cal-hw { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    .cal-hw > div { border: 1px solid var(--border, #e2e8f0); border-radius: 8px; padding: 8px 10px; }
+    .cal-hw .k { font-size: 11px; opacity: .68; }
+    .cal-hw .v { font-size: 13px; font-weight: 600; margin-top: 2px; word-break: break-all; }
+
+    /* ---------- 标定方式选择（大按钮卡片，不是 radio） ---------- */
+    .cal-methods { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    @media (max-width: 720px) { .cal-methods { grid-template-columns: 1fr; } }
+    .cal-method {
+      position: relative; display: block; cursor: pointer; text-align: left;
+      border: 1px solid var(--border, #e2e8f0); border-radius: 12px;
+      padding: 13px 15px 13px 15px; background: var(--card-bg, #fff);
+      transition: border-color .15s ease, box-shadow .15s ease, background-color .15s ease;
+    }
+    .cal-method:hover:not(.is-disabled) { border-color: var(--accent, #2563eb); }
+    .cal-method.is-active {
+      border-color: var(--accent, #2563eb);
+      box-shadow: 0 0 0 1px var(--accent, #2563eb) inset;
+      background: rgba(37, 99, 235, .05);
+    }
+    .cal-method.is-disabled { opacity: .45; cursor: not-allowed; }
+    .cal-method input { position: absolute; opacity: 0; pointer-events: none; }
+    .cal-method .m-hd { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; }
+    .cal-method .m-hd i { color: var(--accent, #2563eb); width: 16px; text-align: center; }
+    .cal-method .m-tag { margin-left: auto; font-size: 11px; font-weight: 600; padding: 2px 7px;
+                         border-radius: 999px; background: var(--surface-3, #eef2f7); opacity: .9; }
+    .cal-method .m-body { margin-top: 6px; font-size: 12px; line-height: 1.7; opacity: .75; }
+    .cal-method .m-warn { margin-top: 5px; font-size: 12px; line-height: 1.6;
+                          color: var(--warning, #d97706); }
+    .cal-method .m-lock { margin-top: 5px; font-size: 12px; line-height: 1.6;
+                          color: var(--danger, #dc2626); }
+
+    /* 阶段流程条：让用户在开始之前就知道"这次会按哪几步走" */
+    .cal-plan { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+    .cal-plan span { font-size: 12px; padding: 3px 9px; border-radius: 999px;
+                     border: 1px solid var(--border, #e2e8f0); opacity: .8; white-space: nowrap; }
+    .cal-plan span.is-key { border-color: var(--accent, #2563eb); color: var(--accent, #2563eb); opacity: 1; }
+    .cal-plan span.is-skip { text-decoration: line-through; opacity: .45; }
+
+    /* 历史坐标选择：列表 + 单条详情（不是"勾一个复选框"） */
+    .cal-hist-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+    .cal-hist-item {
+      display: flex; align-items: flex-start; gap: 10px; cursor: pointer;
+      border: 1px solid var(--border, #e2e8f0); border-radius: 10px; padding: 9px 12px;
+    }
+    .cal-hist-item.is-active { border-color: var(--accent, #2563eb); background: rgba(37, 99, 235, .05); }
+    .cal-hist-item .h-main { flex: 1; min-width: 0; }
+    .cal-hist-item .h-when { font-size: 13px; font-weight: 600; }
+    .cal-hist-item .h-meta { font-size: 12px; opacity: .7; margin-top: 2px; }
+    .cal-hist-item .h-sn { font-size: 12px; opacity: .7; font-family: ui-monospace, Menlo, monospace; }
+
+    /* 坐标选择方式（手写 / 历史 / 先测后写）也是三选一，用同样的可点卡片 */
+    .cal-coord-src { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    @media (max-width: 860px) { .cal-coord-src { grid-template-columns: 1fr; } }
+    .cal-coord-src .cal-method { padding: 11px 13px; }
+    .cal-coord-src .cal-method .m-hd { font-size: 13px; }
+
+    /* 结果摘要：任务结束后"这次到底做了什么"要能一眼扫完 */
+    .cal-summary { margin-top: 12px; border-radius: 10px; padding: 12px 14px;
+                   border: 1px solid var(--border, #e2e8f0); font-size: 13px; line-height: 1.8; }
+    .cal-summary.is-ok { border-color: var(--success, #16a34a); background: rgba(22, 163, 74, .07); }
+    .cal-summary.is-warn { border-color: var(--warning, #d97706); background: rgba(217, 119, 6, .08); }
+    .cal-summary.is-bad { border-color: var(--danger, #dc2626); background: rgba(220, 38, 38, .07); }
+    .cal-summary .s-hd { font-weight: 600; margin-bottom: 4px; }
+
+    /* 错误提示必须"出现在用户正在看的地方"。「开始」按钮在页面底部，
+       提示条在最顶部 —— 点完按钮什么都没变，用户只会以为按钮坏了。
+       选吸顶而不是自动滚回顶部：自动滚动会把刚填好、正要核对的内容顶出视口。 */
+    #cal-global-error {
+      position: sticky;
+      top: 10px;
+      z-index: 60;
+      box-shadow: 0 6px 18px rgba(15, 23, 42, .12);
+    }
+  </style>
+</head>
+<body>
+  <header class="site-header">
+    <div class="page">
+      <div class="brand">
+        <i class="fa fa-satellite" aria-hidden="true"></i>
+        <span class="brand-name">2RTK NTRIP</span>
+        <span class="brand-sub" data-i18n="cal.subtitle">一键标定</span>
+      </div>
+
+      <nav class="nav">
+        <a href="/" class="nav-link" data-i18n="nav.status">状态信息</a>
+        <a href="/config" class="nav-link" data-i18n="nav.config">运行设置</a>
+        {% if calibration_available %}
+          <a href="/calibrate" class="nav-link is-active" data-i18n="nav.calibrate">一键标定</a>
+        {% endif %}
+        <a href="/upgrade" class="nav-link" data-i18n="nav.upgrade">检查更新</a>
+        {% if session.get('logged_in') %}
+          <a href="/change_password" class="nav-link" data-i18n="nav.password">修改密码</a>
+          <form method="post" action="/logout" class="nav-form">
+            <button type="submit" class="nav-link" data-i18n="nav.logout">退出登录</button>
+          </form>
+        {% else %}
+          <a href="/login" class="nav-link" data-i18n="nav.login">登录</a>
+        {% endif %}
+        <button type="button" id="lang-toggle" class="nav-link lang-toggle" aria-label="Switch language">EN</button>
+      </nav>
+
+      <div class="header-meta">
+        <span>{% if session.get('logged_in') %}<span data-i18n="header.logged_in">管理员已登录</span>{% else %}<span data-i18n="header.logged_out">未登录</span>{% endif %}</span>
+        <span class="status-dot" title="服务运行中"></span>
+      </div>
+    </div>
+  </header>
+
+  <main class="main">
+    <div class="page">
+      <div class="cal-wrap">
+
+        <div class="alert alert-error is-hidden" id="cal-global-error"></div>
+
+        <!-- 启动钩子：上次标定被中断。默认隐藏，由 status 驱动 -->
+        <div class="cal-banner is-hidden" id="cal-banner" role="alert">
+          <i class="fa fa-exclamation-triangle" aria-hidden="true"></i>
+          <div>
+            <div class="cal-banner-hd" data-i18n="cal.interrupted.title">上次标定被中断</div>
+            <div id="cal-banner-body"></div>
+          </div>
+          <button type="button" class="cal-banner-close" id="cal-banner-close"
+                  aria-label="close">&times;</button>
+        </div>
+
+        <!-- ============ ① 设备 ============ -->
+        <section class="card fade-in">
+          <div class="card-pad">
+            <div class="card-hd">
+              <h2 class="card-title"><i class="fa fa-plug" aria-hidden="true"></i><span data-i18n="cal.sec.device">设备</span></h2>
+              <button type="button" class="btn btn-secondary" id="cal-rescan">
+                <i class="fa fa-refresh" aria-hidden="true"></i><span data-i18n="cal.rescan">重新读取</span>
+              </button>
+            </div>
+
+            <div class="cal-grid">
+              <div class="field">
+                <label class="form-label" for="cal-port" data-i18n="cal.port">串口 Serial port</label>
+                <div class="cal-inline">
+                  <input type="text" id="cal-port" class="form-input" list="cal-port-list"
+                         autocomplete="off" placeholder="COM3 / /dev/ttyUSB0">
+                  <button type="button" class="btn btn-secondary" id="cal-scan">
+                    <i class="fa fa-usb" aria-hidden="true"></i><span data-i18n="cfg.scan_ports">扫描串口</span>
+                  </button>
+                </div>
+                <datalist id="cal-port-list"></datalist>
+              </div>
+
+              <div class="cal-grid">
+                <div class="field">
+                  <label class="form-label" for="cal-baud" data-i18n="cfg.baud">波特率 Baud rate</label>
+                  <!-- 留空 = 自动：识别不到模块时按该型号的官方档位依次重试。
+                       填了具体值 = 用户明确指定，后端不会再擅自改（也不做波特率枚举）。
+                       用 input+datalist 而不是 select：厂商文档里没有的档位
+                       （比如 LC29H 的 3000000、UM980 的 19200）也必须能填。 -->
+                  <input type="text" id="cal-baud" class="form-input" list="cal-baud-list"
+                         autocomplete="off" inputmode="numeric" placeholder="自动（留空）">
+                  <datalist id="cal-baud-list"></datalist>
+                  <p class="field-hint" id="cal-baud-hint"></p>
+                </div>
+                <div class="field">
+                  <label class="form-label" for="cal-module" data-i18n="cal.module">模块型号</label>
+                  <select id="cal-module" class="form-input"></select>
+                </div>
+              </div>
+            </div>
+
+            <div class="cal-actions" style="margin-top:10px;">
+              <button type="button" class="btn btn-secondary" id="cal-detect">
+                <i class="fa fa-microchip" aria-hidden="true"></i><span data-i18n="cal.detect">读取模块信息</span>
+              </button>
+              <span class="cal-muted" data-i18n="cal.detect_hint">读固件版本、硬件编号与当前工作模式，不改动任何配置。</span>
+            </div>
+
+            <div class="cal-hw is-hidden" id="cal-hw"></div>
+          </div>
+        </section>
+
+        <!-- 标定须知：常驻，不可折叠。天线一动，之前标的坐标就全废了，
+             而"废了"在数据上完全看不出来——播发照常、下游照常固定，只是整体偏了。 -->
+        <div class="cal-notice">
+          <div class="cal-notice-hd">
+            <i class="fa fa-exclamation-triangle" aria-hidden="true"></i>
+            <span data-i18n="cal.notice.title">标定前请先读完这段</span>
+          </div>
+          <div data-i18n="cal.notice.p1">
+            标定测出来的是「天线相位中心」的坐标——不是机柜、不是标石、也不是天线底座。
+          </div>
+          <div data-i18n="cal.notice.p2">
+            请先把天线「永久固定」再开始：标定过程中、以及标定完成之后，都严禁移动或转动天线。
+          </div>
+          <div data-i18n="cal.notice.p3">
+            天线一旦动过，之前写进模块的坐标就整体偏了，而设备本身不会报任何错——必须重新标定。
+          </div>
+        </div>
+
+        <!-- ============ ② 标定方式 ============ -->
+        <section class="card fade-in">
+          <div class="card-pad">
+            <div class="card-hd">
+              <h2 class="card-title"><i class="fa fa-crosshairs" aria-hidden="true"></i><span data-i18n="cal.sec.method">标定方式</span></h2>
+            </div>
+            <div class="cal-muted" data-i18n="cal.method.intro">
+              方式由「这块模块能做什么」决定：下面四种是互斥的四条路径，选哪种，页面就只显示这条路真正会用到的设置。
+            </div>
+
+            <div class="cal-methods" style="margin-top:12px;">
+
+              <!-- A：CORS 差分标定 -->
+              <label class="cal-method" id="m-cors" data-method="cors">
+                <input type="radio" name="cal-method" value="cors">
+                <div class="m-hd">
+                  <i class="fa fa-cloud-download" aria-hidden="true"></i>
+                  <span data-i18n="cal.method.cors">CORS 差分标定</span>
+                  <span class="m-tag" data-i18n="cal.tag.cm">厘米级</span>
+                </div>
+                <div class="m-body" data-i18n="cal.method.cors_full">
+                  模块临时切成流动站 → 连 CORS 取差分 → 稳定固定解后采集过滤 → 写回基准站坐标。
+                  需要 CORS 账号，模块必须支持基准站/流动站双模切换。
+                </div>
+                <div class="m-lock is-hidden" id="m-cors-lock"></div>
+                <!-- 复用/无历史记录的动态提示：CORS 方式下"这次到底连不连网"必须写在卡片上 -->
+                <div class="is-hidden" id="m-cors-hint"></div>
+              </label>
+
+              <!-- B：Survey-in 自收敛 -->
+              <label class="cal-method" id="m-svin" data-method="survey_in">
+                <input type="radio" name="cal-method" value="survey_in">
+                <div class="m-hd">
+                  <i class="fa fa-hourglass-half" aria-hidden="true"></i>
+                  <span data-i18n="cal.method.svin">Survey-in 自收敛</span>
+                  <span class="m-tag" data-i18n="cal.tag.dm">亚米级</span>
+                </div>
+                <div class="m-body" data-i18n="cal.method.svin_full">
+                  模块固件自己长时间平均出坐标，不连 CORS、不占账号。耗时从十几分钟到一小时，
+                  全程不能动天线，精度一般为亚米级，达不到厘米级。
+                </div>
+                <div class="m-lock is-hidden" id="m-svin-lock"></div>
+              </label>
+
+              <!-- C：写入已知坐标 -->
+              <label class="cal-method" id="m-manual" data-method="manual">
+                <input type="radio" name="cal-method" value="manual">
+                <div class="m-hd">
+                  <i class="fa fa-keyboard-o" aria-hidden="true"></i>
+                  <span data-i18n="cal.method.manual">写入已知坐标</span>
+                  <span class="m-tag" data-i18n="cal.tag.trust">取决于来源</span>
+                </div>
+                <div class="m-body" data-i18n="cal.method.manual_full">
+                  不测量，把手上已有的坐标直接写进模块并设为基准站。坐标可以是手动输入、
+                  本机历史记录，或先用「只测坐标」测出来再回来写。
+                </div>
+                <div class="m-lock is-hidden" id="m-manual-lock"></div>
+              </label>
+
+              <!-- D：只测坐标 -->
+              <label class="cal-method" id="m-measure" data-method="external_rover">
+                <input type="radio" name="cal-method" value="external_rover">
+                <div class="m-hd">
+                  <i class="fa fa-location-arrow" aria-hidden="true"></i>
+                  <span data-i18n="cal.method.measure">只测坐标（不改模块）</span>
+                  <span class="m-tag" data-i18n="cal.tag.ro">只读</span>
+                </div>
+                <div class="m-body" data-i18n="cal.method.measure_full">
+                  连 CORS 测出天线坐标就结束，不写坐标、不保存 NVM。用于外接流动站、
+                  或没有命令集的未知模块。测完给你一组坐标，再由你手动配进基准站。
+                </div>
+                <div class="m-lock is-hidden" id="m-measure-lock"></div>
+              </label>
+            </div>
+
+            <!-- 这次会怎么走：把后端真正要跑的步骤提前摆出来，避免"选了一种方式，
+                 跑起来才知道它会动我的模块" -->
+            <div class="cal-plan" id="cal-plan"></div>
+          </div>
+        </section>
+
+        <!-- ============ ③ CORS 接入（cors / external_rover，且不复用历史坐标） ============ -->
+        <section class="card fade-in is-hidden" id="cal-cors-card">
+          <div class="card-pad">
+            <div class="card-hd">
+              <h2 class="card-title"><i class="fa fa-cloud-download" aria-hidden="true"></i><span data-i18n="cal.sec.cors">CORS 接入</span></h2>
+            </div>
+
+            <div class="cal-grid">
+              <div class="cal-grid">
+                <div class="field">
+                  <label class="form-label" for="cal-cors-host" data-i18n="cal.cors.host">服务器地址</label>
+                  <!-- 只给 placeholder 不给 value：灰字看着"像已经填好了"，
+                       用户直接点开始会得到"请填写服务器地址"，与眼前所见矛盾。 -->
+                  <input type="text" id="cal-cors-host" class="form-input"
+                         placeholder="例如 120.253.239.161"
+                         data-i18n-placeholder="cal.cors.host_ph">
+                </div>
+                <div class="field">
+                  <label class="form-label" for="cal-cors-port" data-i18n="cal.cors.port">端口</label>
+                  <input type="number" id="cal-cors-port" class="form-input" value="8002" list="cal-cors-port-list">
+                  <datalist id="cal-cors-port-list">
+                    <option value="8002"></option>
+                    <option value="8001"></option>
+                    <option value="2101"></option>
+                  </datalist>
+                </div>
+              </div>
+              <div class="cal-muted" data-i18n="cal.cors.port_hint">
+                移动 CORS 常用 8002（WGS84）/ 8001（CGCS2000）；2101 是通用 NTRIP 端口。
+              </div>
+              <div class="cal-grid">
+                <div class="field">
+                  <label class="form-label" for="cal-cors-user" data-i18n="cal.cors.user">用户名</label>
+                  <input type="text" id="cal-cors-user" class="form-input" autocomplete="off">
+                </div>
+                <div class="field">
+                  <label class="form-label" for="cal-cors-password" data-i18n="cal.cors.password">密码</label>
+                  <input type="password" id="cal-cors-password" class="form-input" autocomplete="new-password" placeholder="******">
+                </div>
+              </div>
+            </div>
+
+            <div class="field" style="margin-top:12px;">
+              <label class="form-label" for="cal-cors-mount" data-i18n="cal.cors.mountpoint">挂载点</label>
+              <!-- 必须是**可输入**的控件。写成 <select> 时，一旦「读取挂载点」失败
+                   （端口错、网络不通、Caster 不给 Sourcetable），用户就再没有任何
+                   办法指定挂载点，整个 CORS 标定直接卡死。
+                   读取成功时把候选项塞进 datalist：能下拉选，也能手打。
+                   「读取挂载点」按钮就贴在这个输入框右边 —— 它读出来的东西只填进这一格。 -->
+              <div class="cal-inline">
+                <input type="text" id="cal-cors-mount" class="form-input"
+                       list="cal-cors-mount-list" autocomplete="off"
+                       placeholder="先点「读取挂载点」，或直接填写"
+                       data-i18n-placeholder="cal.cors.mountpoint_empty">
+                <button type="button" class="btn btn-secondary" id="cal-load-mounts">
+                  <i class="fa fa-list" aria-hidden="true"></i><span data-i18n="cal.load_mounts">读取挂载点</span>
+                </button>
+              </div>
+              <datalist id="cal-cors-mount-list"></datalist>
+              <div class="cal-muted" style="margin-top:6px;" data-i18n="cal.cors.hint">
+                VRS 类挂载点在收到有效 GGA 之前不会下发差分，所以连上但暂时没数据是正常的。
+                标定期间本机会持续把模块的定位（GGA）逐条原样上报给服务器。
+              </div>
+            </div>
+
+            <!-- 采集参数：只属于 CORS 类方式 -->
+            <div class="cal-grid" style="margin-top:14px;">
+              <div class="field">
+                <label class="form-label" for="cal-duration" data-i18n="cal.duration">采集时长</label>
+                <select id="cal-duration" class="form-input">
+                  <option value="short" data-i18n="cal.duration.short">3 分钟（快速验证链路）</option>
+                  <option value="standard" selected data-i18n="cal.duration.standard">5 分钟（推荐）</option>
+                  <option value="long" data-i18n="cal.duration.long">10 分钟（信号差时用）</option>
+                </select>
+                <div class="cal-muted" data-i18n="cal.duration_hint">
+                  提前收敛会自动停，所以选长档不会白等满时长。信号差时选长档。
+                </div>
+              </div>
+              <div class="field">
+                <label class="form-label" for="cal-fix-timeout" data-i18n="cal.fix_timeout">等待固定解上限（秒）</label>
+                <input type="number" id="cal-fix-timeout" class="form-input" value="180" min="60" max="900">
+                <div class="cal-muted" data-i18n="cal.fix_timeout_hint">
+                  天线有遮挡时固定解会很慢，建议给到 300 秒以上；超时会带回最后一次观测值。
+                </div>
+              </div>
+            </div>
+
+            <!-- 未收敛策略：只有"会写坐标"的 CORS 标定才有意义 -->
+            <div class="field is-hidden" id="cal-on-slow-field">
+              <label class="form-label" for="cal-on-slow" data-i18n="cal.on_slow">未收敛时（σ &gt; 2 cm）</label>
+              <select id="cal-on-slow" class="form-input">
+                <option value="adopt" selected data-i18n="cal.on_slow.adopt">采用当前值（记录里标注未收敛）</option>
+                <option value="fail" data-i18n="cal.on_slow.fail">判失败，不写任何坐标</option>
+              </select>
+              <div class="cal-muted" data-i18n="cal.on_slow_hint">
+                到采集时长仍未收敛时怎么办。选「采用」会写入当前均值，精度如实记录；
+                选「判失败」宁可不写，避免把一组没把握的坐标当成站点坐标。
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ ④ Survey-in 设置（仅 survey_in） ============ -->
+        <section class="card fade-in is-hidden" id="cal-svin-card">
+          <div class="card-pad">
+            <div class="card-hd">
+              <h2 class="card-title"><i class="fa fa-hourglass-half" aria-hidden="true"></i><span data-i18n="cal.sec.svin">Survey-in 设置</span></h2>
+            </div>
+
+            <div class="cal-grid">
+              <div class="field">
+                <label class="form-label" for="cal-svin-profile" data-i18n="cal.svin_profile">自收敛档位</label>
+                <select id="cal-svin-profile" class="form-input">
+                  <option value="fast" data-i18n="cal.svin.fast">快速（600 次 / 3.0 m，约 10 分钟）</option>
+                  <option value="standard" selected data-i18n="cal.svin.standard">标准（1800 次 / 1.5 m，约 30 分钟）</option>
+                  <option value="high" data-i18n="cal.svin.high">高精度（3600 次 / 0.8 m，约 60 分钟）</option>
+                </select>
+                <div class="cal-muted" data-i18n="cal.svin_hint">
+                  1 Hz 定位下次数约等于秒数，收敛期间同样不能移动天线。
+                </div>
+              </div>
+              <div class="field">
+                <label class="cal-inline" style="gap:10px;">
+                  <input type="checkbox" id="cal-svin-resume" checked>
+                  <span data-i18n="cal.svin_resume">模块已收敛过就直接复用，不重新收敛</span>
+                </label>
+                <div class="cal-muted" data-i18n="cal.svin_resume_hint">
+                  模块里已经有一组收敛好的均值时，直接拿它往下走，省掉几十分钟。
+                  如果天线动过，这里必须先取消勾选，让它重新收敛。
+                </div>
+              </div>
+            </div>
+
+            <!-- 文档约束 7：Survey-in 不解析、不读取模块算出的坐标，完全交给固件。
+                 这句话必须在页面上，否则用户会以为我们也在解算，出错时无从判断责任。 -->
+            <div class="cal-notice is-info" style="margin:14px 0 0;">
+              <div class="cal-notice-hd">
+                <i class="fa fa-info-circle" aria-hidden="true"></i>
+                <span data-i18n="cal.svin.notice_title">Survey-in 是怎么算出来的</span>
+              </div>
+              <div data-i18n="cal.svin.notice_body">
+                观测与解算 100% 由模块固件完成，本机不参与解算、也不会修改它的结果。
+                我们只做两件事：把它收敛出的均值「钉死」成固定坐标配置写回模块，
+                然后校验配置真的落进了 NVM。
+              </div>
+              <div data-i18n="cal.svin.notice_warn">
+                因此这里的坐标精度上限就是固件的 Survey-in 精度（亚米级），
+                达不到 CORS 的厘米级。要厘米级请用「CORS 差分标定」。
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ ⑤ 坐标来源（仅 manual / 复用历史坐标的 CORS） ============ -->
+        <section class="card fade-in is-hidden" id="cal-coord-card">
+          <div class="card-pad">
+            <div class="card-hd">
+              <h2 class="card-title"><i class="fa fa-map-marker" aria-hidden="true"></i><span data-i18n="cal.sec.coord">坐标来源</span></h2>
+            </div>
+            <div class="cal-muted" data-i18n="cal.coord.intro">
+              三个来源只能选一个。无论选哪个，写进模块的都是同一组 ECEF，最终都会走「写入 → 切基准站 → 配 RTCM → 保存 → 重启 → 校验」这条链。
+            </div>
+
+            <div class="cal-coord-src" style="margin-top:12px;">
+              <label class="cal-method" id="src-typing" data-src="typing">
+                <input type="radio" name="cal-coord-src" value="typing">
+                <div class="m-hd"><i class="fa fa-keyboard-o" aria-hidden="true"></i><span data-i18n="cal.coord.src_typing">手动输入</span></div>
+                <div class="m-body" data-i18n="cal.coord.src_typing_hint">手上有精确坐标时用（控制点成果表、测绘报告）。</div>
+              </label>
+              <label class="cal-method" id="src-history" data-src="history">
+                <input type="radio" name="cal-coord-src" value="history">
+                <div class="m-hd"><i class="fa fa-history" aria-hidden="true"></i><span data-i18n="cal.coord.src_history">复用本机历史</span></div>
+                <div class="m-body" data-i18n="cal.coord.src_history_hint">天线没动过，只是换了模块 / 重刷固件 / 参数被清过。</div>
+                <div class="m-lock is-hidden" id="src-history-lock"></div>
+              </label>
+              <label class="cal-method" id="src-measure" data-src="measure_first">
+                <input type="radio" name="cal-coord-src" value="measure_first">
+                <div class="m-hd"><i class="fa fa-location-arrow" aria-hidden="true"></i><span data-i18n="cal.coord.src_measure">先测再写</span></div>
+                <div class="m-body" data-i18n="cal.coord.src_measure_hint">手上没有坐标。先用「只测坐标」测出来，再回来粘贴到这里。</div>
+              </label>
+            </div>
+
+            <!-- 手动输入：ECEF 或经纬高，二选一填 -->
+            <div class="is-hidden" id="cal-coord-typing" style="margin-top:14px;">
+              <div class="cal-grid">
+                <div class="field">
+                  <label class="form-label" data-i18n="cal.manual.ecef">ECEF（米）</label>
+                  <div class="cal-inline">
+                    <input type="number" step="0.0001" id="cal-x" class="form-input" placeholder="X" data-i18n-placeholder="cal.manual.ph_x">
+                    <input type="number" step="0.0001" id="cal-y" class="form-input" placeholder="Y" data-i18n-placeholder="cal.manual.ph_y">
+                    <input type="number" step="0.0001" id="cal-z" class="form-input" placeholder="Z" data-i18n-placeholder="cal.manual.ph_z">
+                  </div>
+                </div>
+                <div class="field">
+                  <label class="form-label" data-i18n="cal.manual.llh">或经纬高（度 / 米）</label>
+                  <div class="cal-inline">
+                    <input type="number" step="0.00000001" id="cal-lat" class="form-input" placeholder="Lat" data-i18n-placeholder="cal.manual.ph_lat">
+                    <input type="number" step="0.00000001" id="cal-lon" class="form-input" placeholder="Lon" data-i18n-placeholder="cal.manual.ph_lon">
+                    <input type="number" step="0.001" id="cal-h" class="form-input" placeholder="H" data-i18n-placeholder="cal.manual.ph_h">
+                  </div>
+                </div>
+              </div>
+              <div class="cal-muted" data-i18n="cal.manual.hint">
+                ECEF 三项填全就用 ECEF；只填经纬高就用经纬高。两组都填时以 ECEF 为准。
+              </div>
+            </div>
+
+            <!-- 复用历史：列出本机记录，让用户看清楚是哪一次、多久以前 -->
+            <div class="is-hidden" id="cal-coord-history" style="margin-top:14px;">
+              <div class="cal-hist-list" id="cal-hist-list"></div>
+              <div class="cal-muted" id="cal-hist-hint" style="margin-top:8px;"></div>
+              <!-- 一旦进了复用分支，「坐标来源」三选一就被藏起来了：
+                   改了就等于退出复用，页面上必须留一条明确的回头路，
+                   否则用户只能靠"重新点一遍方式卡"才能回到正常测量。 -->
+              <div class="cal-actions" style="margin-top:10px;">
+                <button type="button" class="btn btn-secondary is-hidden" id="cal-exit-reuse"
+                        data-i18n="cal.coord.exit_reuse">不复用，重新跑一次测量</button>
+              </div>
+            </div>
+
+            <!-- 先测再写：给出明确的操作路径，而不是把用户丢回去 -->
+            <div class="is-hidden" id="cal-coord-measure" style="margin-top:14px;">
+              <div class="cal-notice is-info" style="margin:0;">
+                <div class="cal-notice-hd">
+                  <i class="fa fa-info-circle" aria-hidden="true"></i>
+                  <span data-i18n="cal.coord.measure_title">先测坐标，再回来写</span>
+                </div>
+                <div data-i18n="cal.coord.measure_body">
+                  把上面的标定方式切成「只测坐标（不改模块）」，连 CORS 测出一组坐标。测完结果里会直接给出可复制的 ECEF，
+                  你再回来把标定方式切回「写入已知坐标」，粘进「手动输入」。
+                </div>
+                <div class="cal-actions" style="margin-top:10px;">
+                  <button type="button" class="btn btn-secondary" id="cal-goto-measure" data-i18n="cal.coord.goto_measure">直接切到「只测坐标」</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ ⑥ RTCM 输出（只要这次会写模块、且模块能配报文） ============ -->
+        <section class="card fade-in is-hidden" id="cal-rtcm-card">
+          <div class="card-pad">
+            <div class="card-hd">
+              <h2 class="card-title"><i class="fa fa-broadcast-tower" aria-hidden="true"></i><span data-i18n="cal.sec.rtcm">RTCM 输出</span></h2>
+            </div>
+
+            <div class="cal-grid">
+              <div class="field">
+                <label class="form-label" for="cal-coord-msg" data-i18n="cal.rtcm.coord">坐标报文</label>
+                <select id="cal-coord-msg" class="form-input">
+                  <option value="1005" selected data-i18n="cal.rtcm.coord_1005">1005（默认，基准站坐标）</option>
+                  <option value="1006" data-i18n="cal.rtcm.coord_1006">1006（坐标 + 天线高度）</option>
+                  <option value="keep" data-i18n="cal.rtcm.coord_keep">沿用模块当前配置</option>
+                </select>
+              </div>
+              <div class="field">
+                <label class="form-label" for="cal-msm" data-i18n="cal.rtcm.msm">观测值档位</label>
+                <select id="cal-msm" class="form-input">
+                  <option value="4" selected data-i18n="cal.rtcm.msm4">MSM4（带宽小，推荐）</option>
+                  <option value="7" data-i18n="cal.rtcm.msm7">MSM7（精度高，带宽约 3~5 倍）</option>
+                  <option value="keep" data-i18n="cal.rtcm.msm_keep">沿用模块当前配置</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="cal-muted" data-i18n="cal.rtcm.hint">
+              两项都选「沿用」时，整个报文配置一步都不下发，模块保持原样（此时收尾只能确认"有在播坐标"，无法比对你是不是刚写进去的那个值）。
+              下游只认 1005 的场合不要选 1006；MSM7 的带宽明显更大，数传链路吃紧时用 MSM4。
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ ⑦ 执行 ============ -->
+        <section class="card fade-in">
+          <div class="card-pad">
+            <div class="card-hd">
+              <h2 class="card-title"><i class="fa fa-play-circle" aria-hidden="true"></i><span data-i18n="cal.sec.run">执行</span></h2>
+              <span class="badge" id="cal-run-badge" data-i18n="cal.state.idle">空闲</span>
+            </div>
+
+            <!-- 开始前：一句话说清"这次要做什么" -->
+            <div class="cal-muted" id="cal-run-preview"></div>
+
+            <div class="cal-progress" style="margin-top:10px;"><i id="cal-progress-bar"></i></div>
+
+            <!-- GGA 防抖护栏提示：标定阶段 GGA 是原样透传给 CORS 的（VRS 靠它定位
+                 虚拟参考站，锁死反而固定不了），这里只提示"护栏开着 + 有没有丢弃过
+                 跳变行"。出现过跳变就转告警色，提醒用户检查天线与模块模式。 -->
+            <div class="cal-freeze is-hidden" id="cal-freeze">
+              <i class="fa fa-shield" aria-hidden="true"></i>
+              <span data-i18n="cal.guard.active">GGA 防抖护栏已启用：位置原样上报给 CORS，仅丢弃单次跳变超过 500 m 的异常定位。</span>
+            </div>
+
+            <div class="cal-status-hd" style="margin-top:12px;">
+              <div class="cal-stage" id="cal-stage" data-i18n="cal.stage.idle">未开始</div>
+              <div class="cal-muted" id="cal-elapsed"></div>
+            </div>
+            <div class="cal-muted" id="cal-stage-msg" style="margin-top:6px;"></div>
+
+            <!-- 指标卡：只有 CORS 类方式有采集过程，其余方式不出现 -->
+            <div class="cal-metrics is-hidden" id="cal-metrics">
+              <div class="cal-metric"><div class="k" data-i18n="cal.metric.sats">卫星</div><div class="v" id="m-sats">—</div></div>
+              <div class="cal-metric"><div class="k" data-i18n="cal.metric.pdop">PDOP</div><div class="v" id="m-pdop">—</div></div>
+              <div class="cal-metric"><div class="k" data-i18n="cal.metric.fix">解状态</div><div class="v" id="m-fix">—</div></div>
+              <div class="cal-metric"><div class="k" data-i18n="cal.metric.samples">采样点</div><div class="v" id="m-samples">—</div></div>
+              <div class="cal-metric"><div class="k" data-i18n="cal.metric.sigma">当前 σ</div><div class="v" id="m-sigma">—</div></div>
+              <div class="cal-metric"><div class="k" data-i18n="cal.metric.gga">GGA 上报</div><div class="v" id="m-gga">—</div></div>
+            </div>
+
+            <ul class="cal-timeline" id="cal-timeline"></ul>
+
+            <!-- 结果摘要：结束后这一段是用户唯一会认真读的东西 -->
+            <div class="cal-summary is-hidden" id="cal-summary">
+              <div class="s-hd" id="cal-summary-hd"></div>
+              <div id="cal-summary-body"></div>
+              <div class="cal-inline" style="margin-top:8px;">
+                <button type="button" class="btn btn-secondary is-hidden" id="cal-copy-ecef">
+                  <i class="fa fa-copy" aria-hidden="true"></i><span data-i18n="cal.result.copy_ecef">复制这组 ECEF</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="cal-log is-hidden" id="cal-log"></div>
+
+            <div class="cal-actions">
+              <button type="button" class="btn btn-primary" id="cal-start">
+                <i class="fa fa-play" aria-hidden="true"></i><span id="cal-start-label" data-i18n="cal.start">开始一键标定</span>
+              </button>
+              <button type="button" class="btn btn-danger" id="cal-abort" disabled>
+                <i class="fa fa-stop" aria-hidden="true"></i><span data-i18n="cal.abort">终止标定</span>
+              </button>
+              <button type="button" class="btn btn-secondary is-hidden" id="cal-apply">
+                <i class="fa fa-check" aria-hidden="true"></i><span data-i18n="cal.apply_source">把这个口设为数据源</span>
+              </button>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </div>
+  </main>
+
+  <!-- 二次确认弹窗 -->
+  <div class="cal-modal-mask" id="cal-confirm-mask">
+    <div class="cal-modal">
+      <h3 id="cal-confirm-title">确认开始标定？</h3>
+      <div class="cal-muted" data-i18n="cal.confirm.body">标定期间数据面会暂停，下游客户端会短暂断流。</div>
+      <ul id="cal-confirm-list"></ul>
+      <div class="cal-actions">
+        <button type="button" class="btn btn-secondary" id="cal-confirm-cancel" data-i18n="cal.confirm.cancel">取消</button>
+        <button type="button" class="btn btn-primary" id="cal-confirm-ok" data-i18n="cal.confirm.ok">确认开始</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/i18n.js"></script>
+  <script src="/static/calibration.js"></script>
+</body>
+</html>

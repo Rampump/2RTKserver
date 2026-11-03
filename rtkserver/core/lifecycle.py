@@ -292,6 +292,54 @@ def _start_web_thread():
     return web_thread
 
 
+# ==================== 标定租约门闸（方案 §2.4 / §3.4） ====================
+# 标定线程每 2 秒喂一次心跳；30 秒不动就说明它已经死了（未捕获异常、被强杀等），
+# 此时必须强制放开，否则主程序会永久停在"数据面不启动"：网页能开、设备不转发、
+# 日志里还一句报错都没有 —— 这是整个标定功能里后果最严重的一种故障。
+#
+# 为什么是 30 秒而不是 5 秒：Survey-in 单次等待就是秒级，CORS 的 recv 也可能
+# 卡 20 秒（NTRIP 读超时），阈值太紧会误杀正常任务。
+CALIBRATION_BEAT_TIMEOUT = 30.0
+
+
+def _calibration_gate():
+    """有人独占串口时返回 True，主循环据此跳过本轮数据面。
+
+    为什么是"跳过这一轮"而不是"停掉已有数据面"：
+    `run_once()` 的 finally 本来就会 join 数据源线程并关掉串口，标定方等到
+    `worker_thread` 为 None 才去 open()，天然避开了抢同一个 fd。
+    这里只要保证**不再起新一轮**，串口就一直空着。
+    """
+    if not state.calibration_hold.is_set():
+        # 租约归还时 release() 会置 restart_event（用来"立刻恢复"）。但主循环此刻
+        # 正睡在下面的 interruptible_sleep 里，最快也要 1 秒才醒 —— 这个信号对被
+        # 睡着的循环没用，反而会被即将启动的 run_once 在入口读到，让它"起来一秒又
+        # 自己拆掉"（串口重开、Caster 重连各白做一次）。
+        # 所以这里把它吃掉：数据面马上就会重新读一遍配置，配置改动一样会生效。
+        if state.restart_event.is_set():
+            state.restart_event.clear()
+        return False
+
+    beat = state.calibration_beat
+    if not beat:
+        # 置了 gate 却没写心跳（正常路径不会发生）。按"从此刻开始计时"处理：
+        # 30 秒后照样能兜底，而不是因为一个 0.0 就永远等下去。
+        state.calibration_beat = time.time()
+        beat = state.calibration_beat
+    if time.time() - beat > CALIBRATION_BEAT_TIMEOUT:
+        logging.error(f"标定租约 {CALIBRATION_BEAT_TIMEOUT:.0f} 秒无心跳，"
+                      f"判定标定线程已死，强制解除以恢复数据面")
+        state.calibration_hold.clear()
+        state.calibration_beat = 0.0
+        # 只清不置：若这里 set(restart_event)，紧接着起来的 run_once 会在
+        # 入口就发现"要重启"，起来一秒又退出，变成无休止的抖动。
+        state.restart_event.clear()
+        return False
+
+    interruptible_sleep(1, state.shutdown_event)
+    return True
+
+
 def main():
     setup_logging()
     print("2RTK Server 启动")
@@ -322,6 +370,10 @@ def main():
 
     # 重构：前置配置检查，仅在配置有效时执行主流程
     while not state.shutdown_event.is_set():
+        # 0. 标定租约门闸：有人独占串口时，这轮绝不起数据面（方案 §2.4）
+        if _calibration_gate():
+            continue
+
         # 1. 先检查配置是否有效
         cfg = get_config()
         if not validate_config(cfg):

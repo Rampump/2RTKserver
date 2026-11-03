@@ -1,5 +1,5 @@
 /* ============================================================================
- * 2RTK NTRIP Server — 系统维护（升级 / 卸载）
+ * 2RTK NTRIP Server — 检查更新 / 一键升级
  *
  * 这里是整个前端里唯一「必须假设后端会消失一段时间」的模块：
  * 升级流程第一步就是停掉 Web 服务，页面上的 fetch 会被拒绝连接。
@@ -7,6 +7,9 @@
  *     1) 发起任务 → 后端立刻返回（不等待结果）
  *     2) 每 2 秒轮询 /api/upgrade/status，直到读到终态
  * 轮询期间连接失败属于预期现象，不弹错误、不中断，只在界面上写"正在重启"。
+ *
+ * 卸载**不在**这里：它会删掉整个安装目录，误触不可逆，所以从网页上彻底移除，
+ * 只保留命令行 `uninstall.sh`（见 README 与页面上的指路说明）。
  * ========================================================================== */
 (function () {
   'use strict';
@@ -16,12 +19,10 @@
 
   const POLL_INTERVAL = 2000;
   const POLL_MAX = 12 * 60 * 1000;      // 升级最长等 12 分钟
-  const TERMINAL = new Set(['success', 'failed', 'rolled_back', 'uninstalled']);
+  const TERMINAL = new Set(['success', 'failed', 'rolled_back']);
 
   let pollTimer = null;
   let pollStart = 0;
-  let failStreak = 0;
-  let jobMode = 'upgrade';              // upgrade | uninstall
 
   // ---------- 小工具 ----------
   async function jsonFetch(url, opts) {
@@ -165,24 +166,7 @@
       }
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
-      failStreak = 0;
       const st = data.state || {};
-
-      // 卸载：服务会被彻底移除，最后一个状态文件也跟着安装目录一起消失，
-      // 所以永远读不到「已完成」，只能靠请求持续失败来判定。
-      // 这里绝不能因为 stage 是 idle / success 就提前收工 —— 那可能只是上一轮
-      // 留下的旧状态，此时一个字节都还没删，却对用户说"已卸载"。
-      if (jobMode === 'uninstall') {
-        // 只认本次卸载自己写下的失败状态：上一轮升级留下的 failed 不算
-        if (st.stage === 'failed' && st.mode === 'uninstall') {
-          finish(st);
-          return;
-        }
-        setOverlay(st.stage_text || t('maint.uninstalling'), st.progress || 10,
-          st.message || '', data.log_tail || '', buildFoot(st));
-        schedulePoll();
-        return;
-      }
 
       setOverlay(st.stage_text || st.stage || '', st.progress || 0,
         st.message || '', data.log_tail || '', buildFoot(st));
@@ -193,18 +177,10 @@
       }
       schedulePoll();
     } catch (e) {
-      // 服务正在重启，连接被拒是预期内的
-      failStreak += 1;
-      const elapsed = Date.now() - pollStart;
-      // 卸载要"连续失败"且已经等够 15 秒才判定完成：单次失败可能只是服务
-      // 正在重启，太早下结论会把还在删文件的设备说成已卸载。
-      if (jobMode === 'uninstall' && failStreak >= 8 && elapsed > 15000) {
-        finishUninstall();
-        return;
-      }
+      // 服务正在重启，连接被拒是预期内的：不报错，只把阶段写清楚继续等。
       setOverlay(t('maint.restarting'), null,
         t('maint.restarting_msg'), undefined,
-        t('maint.foot_wait', { n: Math.round(elapsed / 1000) }));
+        t('maint.foot_wait', { n: Math.round((Date.now() - pollStart) / 1000) }));
       schedulePoll();
     }
   }
@@ -233,15 +209,9 @@
 
   function finish(st) {
     stopPoll();
-    if (st.stage === 'uninstalled') {
-      finishUninstall();
-      return;
-    }
     const ok = st.stage === 'success';
     const rolled = st.stage === 'rolled_back';
-    // 卸载失败要说"卸载失败"，不能说成"升级失败"
-    const failTitle = st.mode === 'uninstall' ? t('maint.uninstall_failed') : t('maint.failed');
-    const title = ok ? t('maint.ok') : (rolled ? t('maint.rolled') : failTitle);
+    const title = ok ? t('maint.ok') : (rolled ? t('maint.rolled') : t('maint.failed'));
     const msg = st.message || '';
     const bar = $('maint-bar');
     if (bar) bar.style.width = '100%';
@@ -279,13 +249,6 @@
     }
   }
 
-  function finishUninstall() {
-    stopPoll();
-    setOverlay(t('maint.uninstalled'), 100, t('maint.uninstalled_msg'), undefined, '');
-    const bar = $('maint-bar');
-    if (bar) bar.style.width = '100%';
-  }
-
   // ---------- 动作 ----------
   async function doCheck() {
     const btn = $('maint-check');
@@ -311,7 +274,6 @@
     if (!window.confirm(t('maint.confirm_upgrade'))) return;
     const btn = $('maint-upgrade');
     btn.disabled = true;
-    jobMode = 'upgrade';
     try {
       const data = await jsonFetch('/api/upgrade/start', {
         method: 'POST',
@@ -319,7 +281,6 @@
         body: JSON.stringify({ source: $('maint-source').value || 'auto' }),
       });
       pollStart = Date.now();
-      failStreak = 0;
       setOverlay(t('maint.starting'), 3, data.message || t('maint.starting_msg'), '', '');
       schedulePoll();
     } catch (e) {
@@ -327,39 +288,6 @@
       const box = $('maint-result');
       box.className = 'field-hint is-bad';
       box.textContent = t('maint.start_fail', { msg: e.message });
-    }
-  }
-
-  async function doUninstall() {
-    const pwd = $('maint-pwd').value;
-    const confirmText = ($('maint-confirm').value || '').trim().toUpperCase();
-    if (confirmText !== 'DELETE') {
-      alert(t('maint.need_confirm'));
-      return;
-    }
-    if (!pwd) {
-      alert(t('maint.need_pwd'));
-      return;
-    }
-    if (!window.confirm(t('maint.confirm_uninstall'))) return;
-    const btn = $('maint-uninstall');
-    btn.disabled = true;
-    jobMode = 'uninstall';
-    try {
-      const data = await jsonFetch('/api/upgrade/uninstall', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: pwd, confirm: true }),
-      });
-      pollStart = Date.now();
-      failStreak = 0;
-      setOverlay(t('maint.uninstalling'), 10, data.message || '', '', '');
-      schedulePoll();
-    } catch (e) {
-      btn.disabled = false;
-      const box = $('maint-result');
-      box.className = 'field-hint is-bad';
-      box.textContent = t('maint.uninstall_fail', { msg: e.message });
     }
   }
 
@@ -389,7 +317,6 @@
       const st = data.state || {};
       if (st.active) {
         // 上一次升级没结束（比如刷新了页面），直接接管进度显示
-        jobMode = st.mode === 'uninstall' ? 'uninstall' : 'upgrade';
         pollStart = Date.now();
         setOverlay(st.stage_text || '', st.progress || 0, st.message || '',
           data.log_tail || '', '');
@@ -402,11 +329,14 @@
     }
   }
 
+  // 给页头的「重新读取」按钮用：不刷新整页，只重拉一次状态，
+  // 免得用户刚打开的升级进度遮罩被刷新冲掉。
+  window.Maintenance = { refresh: refreshStatus };
+
   document.addEventListener('DOMContentLoaded', function () {
     if (!$('maint-card')) return;
     $('maint-check').addEventListener('click', doCheck);
     $('maint-upgrade').addEventListener('click', doUpgrade);
-    $('maint-uninstall').addEventListener('click', doUninstall);
     document.addEventListener('langchange', refreshStatus);
     refreshStatus();
   });

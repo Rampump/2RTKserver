@@ -72,10 +72,16 @@ def api_serial_ports():
 def api_sourcetable():
     """读取指定 NTRIP Caster 的挂载点列表，供中继模式下拉选择。"""
     payload = request.get_json(silent=True) or request.form
-    host = (payload.get('host') or '').strip()
-    port_raw = (payload.get('port') or '').strip()
-    user = (payload.get('user') or '').strip()
+    # 不假设字段类型：JSON 里端口通常是数字（`8002`），表单里是字符串（`"8002"`）。
+    # 之前直接对 `payload.get('port')` 调 `.strip()`，数字端口一来就 AttributeError 500，
+    # 前端只要把端口当 number 传就必挂。统一走 str() 再判。
+    host = str(payload.get('host') or '').strip()
+    port_raw = str(payload.get('port') or '').strip()
+    user = str(payload.get('user') or '').strip()
     password = payload.get('password') or ''
+    # form 提交的密码也可能是非 str（少见但一律兜住）
+    if not isinstance(password, str):
+        password = str(password)
 
     if not _SOURCETABLE_HOST_RE.match(host):
         return jsonify({'ok': False, 'error': '中继地址格式不正确，请填写域名或 IP'}), 400

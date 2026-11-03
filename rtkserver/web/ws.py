@@ -152,12 +152,16 @@ def websocket(ws):
         return
 
     try:
-        # 首帧历史也走队列，保证这个连接自始至终只有一个线程在 send
-        all_history = list(state.log_history['log']) + list(state.log_history['print'])
-        client.enqueue(json.dumps({
-            "type": "history",
-            "messages": all_history
-        }))
+        # 首帧历史也走队列，保证这个连接自始至终只有一个线程在 send。
+        # **只回放给已登录连接**：日志行是原始文本，无法像 station_info 那样
+        # 逐字段脱敏，而它可能带上配置值、串口路径、标定坐标——未登录访问者
+        # 只看实时脱敏帧就够了，历史日志属于内部信息。
+        if client.authenticated:
+            all_history = list(state.log_history['log']) + list(state.log_history['print'])
+            client.enqueue(json.dumps({
+                "type": "history",
+                "messages": all_history
+            }))
         # 首帧补一条本地 Caster 状态：正常情况下 run_status 每 2 秒刷一次就够了，
         # 但 mode=none 时根本没有数据循环在推，首页会一直空着，所以连接时先给一次。
         from ..outlets.local_caster import local_caster_snapshot

@@ -66,8 +66,15 @@ SYNC_ITEMS = [
 ]
 
 # 升级时绝对不能被覆盖的东西：虚拟环境、配置库、会话密钥、升级工作目录、日志
+# `calibration.db` 是**用户的标定资产**（天线相位中心坐标），升级一次弄丢就等于
+# 让所有下游流动站失去基准。它和 `.calibration/`（租约/备份/状态）都必须显式列出，
+# 否则哪天 SYNC_ITEMS 里多一个通配就会把它覆盖掉（方案 §12.1.1）。
 KEEP_NAMES = {'venv', '2RTKserver.db', '2RTKserver.db.bak', '2RTKserver.db.temp',
-              '.secret_key', '.upgrade', 'server.log', '__pycache__'}
+              '.secret_key', '.upgrade', 'server.log', '__pycache__',
+              'calibration.db', 'calibration.db-wal', 'calibration.db-shm',
+              '.calibration'}
+
+CALIBRATION_DB = 'calibration.db'
 
 BACKUP_KEEP = 3          # 最多保留几份备份
 PROBE_TIMEOUT = 15       # 单个升级源探活超时（并发探测，取最先可用的源）
@@ -355,6 +362,113 @@ class Runner:
         return True, ''
 
     # ---------- 备份 ----------
+    def _safe_extract(self, tar, dest):
+        """把 tar 解到 dest，拒绝任何会跑出 dest 的成员。
+
+        `tarfile.extractall` 在 Python 3.12 之前不做路径校验：一个名为
+        `../../etc/passwd` 的成员会直接写到安装目录之外。这里解的是我们自己
+        生成的备份，正常不会有这种条目——但备份目录和 state.json 都在可写的
+        `.upgrade/` 下，一旦被替换，回滚就是一次任意文件写入。
+        只跳过越界成员、不抛异常：回滚是救命路径，宁可少还原一个文件，
+        也不能让整个回滚在这里中断。
+        """
+        root = os.path.realpath(dest)
+        for member in tar.getmembers():
+            target = os.path.realpath(os.path.join(root, member.name))
+            if target != root and not target.startswith(root + os.sep):
+                self.log(f"备份含越界路径，已跳过: {member.name}", 'ERROR')
+                continue
+            try:
+                tar.extract(member, root)
+            except (OSError, tarfile.TarError) as e:
+                self.log(f"还原 {member.name} 失败: {e}", 'WARN')
+
+    # ---------- 标定库（calibration.db）：备份 / 还原 / 迁移 ----------
+    def _copy_calibration_db(self, dst_base):
+        """把 calibration.db 连同 `-wal` / `-shm` 一起复制到 `dst_base`。
+
+        为什么必须带上这两个附属文件：库跑在 WAL 模式，最近的标定记录**可能还只在
+        `-wal` 里**（checkpoint 不是每条事务都做）。只拷主库文件，等于把用户
+        最后一两次标定丢掉——而那条恰恰是"刚测完还没用"的那条。
+
+        返回实际复制成功的主库路径，失败或不存在返回 ''。
+        """
+        src = os.path.join(self.install_dir, CALIBRATION_DB)
+        if not os.path.exists(src):
+            return ''
+        try:
+            shutil.copy2(src, dst_base)
+            for suffix in ('-wal', '-shm'):
+                extra = src + suffix
+                if os.path.exists(extra):
+                    shutil.copy2(extra, dst_base + suffix)
+        except OSError as e:
+            self.log(f"标定库备份失败: {e}", 'WARN')
+            return ''
+        return dst_base
+
+    def _restore_calibration_db(self, backup_base):
+        """回滚时把标定库还原回去（升级期间服务已停，不存在并发写入）。"""
+        if not backup_base or not os.path.exists(backup_base):
+            return False
+        target = os.path.join(self.install_dir, CALIBRATION_DB)
+        try:
+            # 先删附属文件：留着旧 -wal 会让 sqlite 认为"主库内容还没合并"，
+            # 打开后看到的是旧库里的一半数据，比不还原更难查。
+            for suffix in ('-wal', '-shm'):
+                stale = target + suffix
+                if os.path.exists(stale):
+                    os.remove(stale)
+            shutil.copy2(backup_base, target)
+            for suffix in ('-wal', '-shm'):
+                extra = backup_base + suffix
+                if os.path.exists(extra):
+                    shutil.copy2(extra, target + suffix)
+            self.log("已还原标定库（calibration.db）")
+            return True
+        except OSError as e:
+            self.log(f"还原标定库失败: {e}", 'WARN')
+            return False
+
+    def migrate_calibration_db(self):
+        """升级后按 `PRAGMA user_version` 做增量迁移（方案 §12.1.1）。
+
+        必须在**新代码就位之后**跑，否则用的是旧版本的迁移函数。
+        失败只记 WARN：迁移会在下次进程启动时由 `service.on_startup()` 重试，
+        这里失败不该把一次成功的升级判成失败。
+        """
+        db = os.path.join(self.install_dir, CALIBRATION_DB)
+        if not os.path.exists(db):
+            return True
+        rc, out = self.run(
+            [self.python, '-c',
+             'import sys; sys.path.insert(0, ".");'
+             'store = __import__("rtkserver.calibration.store", fromlist=["store"]);'
+             'store.init_db(); print("schema ok")'],
+            timeout=60, cwd=self.install_dir,
+            env={'PYTHONPATH': self.install_dir})
+        if rc != 0 or 'schema ok' not in out:
+            self.log(f"标定库结构迁移未完成（下次启动会自动重试）: {out[-200:]}", 'WARN')
+            return False
+        self.log("标定库结构已校验/迁移")
+        return True
+
+    def _calibration_db_rows(self):
+        """读标定记录条数，用于卸载提示"已备份多少条"（失败返回 -1）。"""
+        db = os.path.join(self.install_dir, CALIBRATION_DB)
+        if not os.path.exists(db):
+            return -1
+        try:
+            import sqlite3
+            conn = sqlite3.connect(f'file:{db}?mode=ro', uri=True, timeout=5)
+            try:
+                return int(conn.execute('SELECT COUNT(*) FROM calibration_records')
+                           .fetchone()[0])
+            finally:
+                conn.close()
+        except Exception:                            # noqa: BLE001 - 只是提示信息
+            return -1
+
     def backup(self):
         self.set_state('backing_up', 30, '正在备份当前版本…')
         os.makedirs(self.backup_dir, exist_ok=True)
@@ -384,7 +498,13 @@ class Runner:
 
         size = os.path.getsize(tar_path) if os.path.exists(tar_path) else 0
         self.log(f"备份完成: {tar_path} ({size} 字节)")
-        self.state.update({'backup_tar': tar_path, 'backup_db': db_bak})
+
+        # 标定库单独留一份（与配置库同款时间戳命名，避免两次备份互相覆盖）。
+        # 它不在 tar 里（tar 会跳过 KEEP_NAMES），所以必须在这里显式复制。
+        calib_bak = self._copy_calibration_db(
+            os.path.join(self.backup_dir, f'calibration-{stamp}.db'))
+        self.state.update({'backup_tar': tar_path, 'backup_db': db_bak,
+                           'backup_calibration': calib_bak})
         self.save_state()
 
         # 只保留最近 N 份，避免反复升级把 1.9G 的根分区塞满
@@ -502,7 +622,7 @@ class Runner:
         if tar_path and os.path.exists(tar_path):
             try:
                 with tarfile.open(tar_path, 'r:gz') as tar:
-                    tar.extractall(self.install_dir)
+                    self._safe_extract(tar, self.install_dir)
                 self.log("已从备份还原程序文件")
             except Exception as e:  # noqa: BLE001
                 self.log(f"还原备份失败: {e}", 'ERROR')
@@ -526,6 +646,10 @@ class Runner:
                 self.log("已还原配置库")
             except OSError as e:
                 self.log(f"还原配置库失败: {e}", 'WARN')
+
+        # 标定库也要还原：坏版本可能已经把 schema 迁移到新版本，
+        # 退回旧代码后旧代码读不了新列（"no such column"），标定页会整页报错。
+        self._restore_calibration_db(self.state.get('backup_calibration'))
 
         self.install_deps()
         self.start_service()
@@ -597,6 +721,11 @@ class Runner:
 
         self.write_version()
 
+        # 标定库按 user_version 增量迁移（方案 §12.1.1）。放在"文件已换、服务未起"
+        # 这个窗口里：迁移用的就是刚复制进来的新代码；失败也不回滚——库结构
+        # 不兼容时新版本的 on_startup 还会再试一次，把升级整体判失败代价太大。
+        self.migrate_calibration_db()
+
         ok, err = self.install_deps()
         if not ok:
             return 0 if self.rollback(err) else 1
@@ -642,6 +771,18 @@ class Runner:
                 self.state['db_backup'] = dst
             except OSError as e:
                 self.log(f"配置库备份失败: {e}", 'WARN')
+
+        # 标定库是**资产**，与配置库同级对待：备份到 /root 并明确告诉用户有多少条。
+        # 站点坐标丢了，下游所有流动站都得重新去现场测一次——这比丢配置严重得多。
+        rows = self._calibration_db_rows()
+        calib_dst = f"/root/2RTKserver-calibration-{time.strftime('%Y%m%d-%H%M')}.db"
+        calib_bak = self._copy_calibration_db(calib_dst)
+        if calib_bak:
+            self.state['calibration_backup'] = calib_bak
+            detail = f'（含标定记录 {rows} 条）' if rows >= 0 else ''
+            self.log(f"标定库已备份到 {calib_bak}{detail}")
+        elif os.path.exists(os.path.join(self.install_dir, CALIBRATION_DB)):
+            self.log("标定库备份失败——卸载后这份坐标将无法恢复", 'ERROR')
 
         self.run(['systemctl', 'stop', self.service], timeout=120)
         self.run(['systemctl', 'disable', self.service], timeout=60)

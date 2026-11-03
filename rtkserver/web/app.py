@@ -70,6 +70,18 @@ def create_app() -> Flask:
     api_upgrade.register(app)
     ws.register(sock)
 
+    # 标定 Web 层（阶段 6）：唯一一处 web → calibration 的依赖，且**必须是可选的**。
+    # 契约要求"删掉标定包主程序照跑"，所以这里用 try/except 兜住 ImportError：
+    # 没有标定包时只是不注册 /calibrate 与 /api/calibration/*，其它功能不受影响。
+    calibration_available = False
+    try:
+        from . import api_calibration
+        api_calibration.register(app)
+        calibration_available = True
+    except ImportError as e:                    # pragma: no cover - 仅裁剪包时触发
+        logging.info('标定模块不可用，跳过 /calibrate 与 /api/calibration/*：%s', e)
+    app.jinja_env.globals.update(calibration_available=calibration_available)
+
     logging.info("Web 应用已创建（模板 %s，静态 %s）", paths.TEMPLATES_DIR, paths.STATIC_DIR)
     return app
 

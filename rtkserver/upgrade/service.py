@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Web 侧的升级/卸载封装。
+"""Web 侧的升级封装。
 
 这里只做三件事：准备计划、把执行器拉起来、读执行器留下的状态。
 真正的升级动作一行都不在本进程里做——否则 `systemctl stop` 会先把 Web 自己杀掉。
+
+卸载不在这里：网页入口已移除，统一走 `uninstall.sh`（见文末说明）。
 """
 import json
 import logging
@@ -367,25 +369,14 @@ def start_upgrade(source_key=None):
     return ok, msg
 
 
-def start_uninstall(backup_db=True):
-    st = read_state()
-    if st.get('active'):
-        return False, '有任务正在执行，请稍后再试'
-    plan = {
-        'mode': 'uninstall',
-        'install_dir': paths.BASE_DIR,
-        'service': SERVICE_NAME,
-        'ports': managed_ports(),
-        'web_port': int(WEB_PORT),
-        'backup_db': bool(backup_db),
-        'delay': 3,
-    }
-    ok, msg = _launch(plan, 'uninstall')
-    if ok:
-        # 卸载也要先占位：否则前端第一次轮询读到的还是上一轮的 success / idle，
-        # 会立刻显示"升级完成"或"卸载完成"，而服务其实还活得好好的。
-        _seed_state('uninstall', '卸载任务已受理，即将停止服务…', 5)
-    return ok, msg
+# ==================== 卸载（只保留命令行） ====================
+# 这里原本有 `start_uninstall()`，用来给网页那个"卸载程序"按钮下发计划。
+# 现在网页入口已彻底移除（误触会删掉整个安装目录），卸载统一走安装目录下的
+# `uninstall.sh`，直接用 bash 操作 systemd 与文件，不经过本进程。
+#
+# 因此**不要**在这里加回 `start_uninstall()`：只要它存在，就意味着还有一条
+# 网络可达的路径能删掉整个安装目录。`runner.py` 里的 `do_uninstall()` 仍保留，
+# 但已没有任何调用方能生成 `mode='uninstall'` 的计划，属于历史路径。
 
 
 def snapshot():

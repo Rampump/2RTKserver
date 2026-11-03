@@ -24,6 +24,10 @@
       <nav class="nav">
         <a href="/" class="nav-link is-active" data-i18n="nav.status">状态信息</a>
         <a href="/config" class="nav-link" data-i18n="nav.config">运行设置</a>
+        {% if calibration_available %}
+          <a href="/calibrate" class="nav-link" data-i18n="nav.calibrate">一键标定</a>
+        {% endif %}
+        <a href="/upgrade" class="nav-link" data-i18n="nav.upgrade">检查更新</a>
         {# 登录后必须能看见"改密码"和"退出登录"；未登录才显示"登录" #}
         {% if session.get('logged_in') %}
           <a href="/change_password" class="nav-link" data-i18n="nav.password">修改密码</a>
@@ -125,69 +129,71 @@
         </section>
       </div>
 
-      <section class="card card-pad mb-16 fade-in">
-        <div class="card-hd">
-          <h2 class="card-title"><i class="fa fa-cloud-upload" aria-hidden="true"></i><span data-i18n="card.upload">上传端 NTRIP Caster</span></h2>
-          <span class="card-hint" data-i18n="card.hint.upload">本机向上游基站服务器推送差分</span>
-        </div>
-        <dl class="kv kv--compact">
-          <dt data-i18n="up.status">上传状态</dt>
-          <dd id="up-status" class="kv-value" data-i18n="up.reading">读取中…</dd>
-          <dt data-i18n="up.target">上传地址</dt>
-          <dd id="up-target" class="kv-value mono">--</dd>
-          <dt data-i18n="up.mountpoint">挂载点</dt>
-          <dd id="up-mountpoint" class="kv-value mono">--</dd>
-          <dt data-i18n="up.sent">已发送</dt>
-          <dd id="up-sent" class="kv-value">--</dd>
-          <dt data-i18n="up.rate">实测速率</dt>
-          <dd id="up-rate" class="kv-value">--</dd>
-          <dt data-i18n="up.reconnects">重连次数</dt>
-          <dd id="up-reconnects" class="kv-value">--</dd>
-          <dt data-i18n="up.session">本次会话时长</dt>
-          <dd id="up-session" class="kv-value">--</dd>
-        </dl>
-        <div class="field-hint" id="up-hint"></div>
-      </section>
+      <div class="grid-outlets">
+        <section class="card card-pad fade-in">
+          <div class="card-hd">
+            <h2 class="card-title"><i class="fa fa-cloud-upload" aria-hidden="true"></i><span data-i18n="card.upload">上传端 NTRIP Caster</span></h2>
+            <span class="card-hint" data-i18n="card.hint.upload">本机向上游基站服务器推送差分</span>
+          </div>
+          <dl class="kv kv--compact">
+            <dt data-i18n="up.status">上传状态</dt>
+            <dd id="up-status" class="kv-value" data-i18n="up.reading">读取中…</dd>
+            <dt data-i18n="up.target">上传地址</dt>
+            <dd id="up-target" class="kv-value mono">--</dd>
+            <dt data-i18n="up.mountpoint">挂载点</dt>
+            <dd id="up-mountpoint" class="kv-value mono">--</dd>
+            <dt data-i18n="up.sent">已发送</dt>
+            <dd id="up-sent" class="kv-value">--</dd>
+            <dt data-i18n="up.rate">实测速率</dt>
+            <dd id="up-rate" class="kv-value">--</dd>
+            <dt data-i18n="up.reconnects">重连次数</dt>
+            <dd id="up-reconnects" class="kv-value">--</dd>
+            <dt data-i18n="up.session">本次会话时长</dt>
+            <dd id="up-session" class="kv-value">--</dd>
+          </dl>
+          <div class="field-hint" id="up-hint"></div>
+        </section>
 
-      <section class="card card-pad mb-16 fade-in">
-        <div class="card-hd">
-          <h2 class="card-title"><i class="fa fa-server" aria-hidden="true"></i><span data-i18n="card.local_caster">本地 NTRIP Caster</span></h2>
-          <span class="card-hint" data-i18n="card.hint.local_caster">内网移动站直连本机取差分</span>
-        </div>
-        <dl class="kv kv--compact">
-          <dt data-i18n="lc.status">运行状态</dt>
-          <dd id="lc-status" class="kv-value" data-i18n="lc.reading">读取中…</dd>
-          <dt data-i18n="lc.address">接入地址</dt>
-          <dd id="lc-address" class="kv-value mono">--</dd>
-          <dt data-i18n="lc.mount">挂载点 / 账号</dt>
-          <dd id="lc-mount" class="kv-value mono">--</dd>
-          <dt data-i18n="lc.clients">在线客户端</dt>
-          <dd id="lc-clients" class="kv-value">--</dd>
-        </dl>
-        <div class="field-hint" id="lc-hint"></div>
-      </section>
+        <section class="card card-pad fade-in">
+          <div class="card-hd">
+            <h2 class="card-title"><i class="fa fa-server" aria-hidden="true"></i><span data-i18n="card.local_caster">本地 NTRIP Caster</span></h2>
+            <span class="card-hint" data-i18n="card.hint.local_caster">内网移动站直连本机取差分</span>
+          </div>
+          <dl class="kv kv--compact">
+            <dt data-i18n="lc.status">运行状态</dt>
+            <dd id="lc-status" class="kv-value" data-i18n="lc.reading">读取中…</dd>
+            <dt data-i18n="lc.address">接入地址</dt>
+            <dd id="lc-address" class="kv-value mono">--</dd>
+            <dt data-i18n="lc.mount">挂载点 / 账号</dt>
+            <dd id="lc-mount" class="kv-value mono">--</dd>
+            <dt data-i18n="lc.clients">在线客户端</dt>
+            <dd id="lc-clients" class="kv-value">--</dd>
+          </dl>
+          <div class="field-hint" id="lc-hint"></div>
+        </section>
 
-      <section class="card card-pad mb-16 fade-in">
-        <div class="card-hd">
-          <h2 class="card-title"><i class="fa fa-rss" aria-hidden="true"></i><span data-i18n="card.radio">无线电数传透传</span></h2>
-          <span class="card-hint" data-i18n="card.hint.radio">单向广播 · 附近流动站免 NTRIP 验证直接收差分</span>
-        </div>
-        <dl class="kv kv--compact">
-          <dt data-i18n="radio.status">运行状态</dt>
-          <dd id="radio-status" class="kv-value" data-i18n="radio.reading">读取中…</dd>
-          <dt data-i18n="radio.port">数传串口</dt>
-          <dd id="radio-port" class="kv-value mono">--</dd>
-          <dt data-i18n="radio.baud">波特率</dt>
-          <dd id="radio-baud" class="kv-value mono">--</dd>
-          <dt data-i18n="radio.sent">已发送</dt>
-          <dd id="radio-sent" class="kv-value">--</dd>
-          <dt data-i18n="radio.rate">实测速率</dt>
-          <dd id="radio-rate" class="kv-value">--</dd>
-          <dt data-i18n="radio.reconnects">重连次数</dt>
-          <dd id="radio-reconnects" class="kv-value">--</dd>
-        </dl>
-        <div class="field-hint" id="radio-hint"></div>
-      </section>
+        <section class="card card-pad fade-in">
+          <div class="card-hd">
+            <h2 class="card-title"><i class="fa fa-rss" aria-hidden="true"></i><span data-i18n="card.radio">无线电数传透传</span></h2>
+            <span class="card-hint" data-i18n="card.hint.radio">单向广播 · 附近流动站免 NTRIP 验证直接收差分</span>
+          </div>
+          <dl class="kv kv--compact">
+            <dt data-i18n="radio.status">运行状态</dt>
+            <dd id="radio-status" class="kv-value" data-i18n="radio.reading">读取中…</dd>
+            <dt data-i18n="radio.port">数传串口</dt>
+            <dd id="radio-port" class="kv-value mono">--</dd>
+            <dt data-i18n="radio.baud">波特率</dt>
+            <dd id="radio-baud" class="kv-value mono">--</dd>
+            <dt data-i18n="radio.sent">已发送</dt>
+            <dd id="radio-sent" class="kv-value">--</dd>
+            <dt data-i18n="radio.rate">实测速率</dt>
+            <dd id="radio-rate" class="kv-value">--</dd>
+            <dt data-i18n="radio.reconnects">重连次数</dt>
+            <dd id="radio-reconnects" class="kv-value">--</dd>
+          </dl>
+          <div class="field-hint" id="radio-hint"></div>
+        </section>
+      </div>
 
       <section class="card card-pad mb-16 fade-in">
         <div class="card-hd">

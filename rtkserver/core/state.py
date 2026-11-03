@@ -46,6 +46,14 @@ caster_uploader = None
 # ==================== 旁路模块单例 ====================
 announcer = None             # ZeroconfAnnouncer，未启用/依赖缺失时为 None
 
+# ==================== 标定租约（方案 §2.4 / §3.4） ====================
+# 这两个名字必须留在本模块：`main()` 的 gate 分支要读它们，而 core 层
+# 绝不允许 import 标定包。语义只有两条：
+#   hold 置位 = 有人正独占串口，本轮不许起数据面；
+#   beat 是标定工作线程的时间戳，30 秒不动就判定线程已死、强制放开。
+calibration_hold = threading.Event()
+calibration_beat = 0.0
+
 # ==================== 运行状态（首页卡片） ====================
 run_status = {
     "mode": "",
