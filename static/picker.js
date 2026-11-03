@@ -3,10 +3,14 @@
  *
  * 为什么不用原生 `<datalist>`：
  *   原生弹层的位置由浏览器自己算，在带 `transform` / `filter` 的祖先元素里会算错。
- *   本项目每张卡片都挂了 `.fade-in`（`animation: fade-in ... both`，末帧
- *   `transform: translateY(0)`），这个"末帧也是 transform"会把卡片变成一个新的
- *   包含块 —— 于是"扫描串口""读取挂载点"填完候选后，下拉列表出现在离输入框
- *   很远的地方（真机反馈：满屏乱跑）。这是浏览器行为，不是样式能改掉的。
+ *   第一次踩到的正是这个：每张卡片都挂了 `.fade-in`（当时是
+ *   `animation: fade-in ... both`，末帧 `transform: translateY(0)`），这个
+ *   "末帧也是 transform"把卡片变成了新的包含块 —— "扫描串口""读取挂载点"填完
+ *   候选后，下拉列表出现在离输入框很远的地方（真机反馈：满屏乱跑）。
+ *
+ *   那条动画后来已经改成不动画 transform 了（见 theme.css 末尾，附带另一条更要命的
+ *   实测：卡片正在做 transform 动画时点开原生 `<select>`，展开耗时从 50ms 涨到 970ms）。
+ *   但本面板仍然保留 —— 它不依赖祖先的布局状态，比"指望祖先永远不带变换"稳。
  *
  * 做法：
  *   1. 把 `list="xxx"` 从 input 上摘掉（只留 `data-picker-src="xxx"`），

@@ -901,9 +901,13 @@ select.form-input {
 }
 
 /* ---------- 候选下拉面板（static/picker.js） ----------
-   必须挂在 body 下并 `position: fixed`、坐标由脚本现算：
-   卡片上的 .fade-in 动画（末帧仍带 transform）会让任何绝对定位的子元素
-   以卡片为包含块，原生 datalist 就是在这里算错的（列表飞到屏幕另一头）。
+   必须挂在 body 下并 `position: fixed`、坐标由脚本现算。
+   当初的直接原因是卡片带着 `.fade-in` 的末帧 transform（那时是 `both` +
+   `translateY(0)`，等于永久留下一个单位矩阵），任何绝对定位的子元素都会以卡片为
+   包含块，原生 datalist 因此开到屏幕另一头。
+   现在那条动画已经不做 transform 了（见文件末尾），但这条规则**不要撤**：
+   自绘面板不依赖任何祖先的布局状态，比"希望祖先永远不带变换"可靠得多 ——
+   以后谁再往卡片上加 transform / filter / will-change，这里也不会跟着错位。
    z-index 要高于标定页那条 sticky 错误条（60）和页头。 */
 .picker-panel {
   position: fixed;
@@ -1289,13 +1293,32 @@ details[open].note > summary::before {
 }
 
 /* ---------- 动效 ---------- */
+/* 卡片入场动画**只做透明度，不做位移**。这不是审美选择，是实测出来的：
+ *
+ *   动画已结束再点 #cal-module（模块型号下拉）→ 50~56 ms
+ *   动画进行中（0.35s 窗口内）点同一个下拉   → 454 / 972 ms
+ *
+ * 同一台机器、同一页面，唯一变量就是"点的时候卡片是不是正在做 transform 动画"。
+ * 原因：`transform` 动画会把卡片提升为**合成层**，而原生 `<select>` 的下拉列表
+ * 由浏览器 UI 线程展开，需要在这个正在变的合成层里定位并绘制 —— 位移每帧都在变，
+ * 列表就得跟着重算。Windows 上的 Chrome 尤其明显；换到手机或低配设备上，
+ * 这几百毫秒会直接变成"点一下浏览器就卡死"。
+ *
+ * 之前这里还留着两个坑，一并记下来免得改回去：
+ *   - 末帧写 `transform: translateY(0)` + `fill-mode: both`，等于把"零位移的
+ *     transform"永久留在元素上（计算值是 matrix(1,0,0,1,0,0)，不是 none）。
+ *     元素因此常驻包含块，原生 `<datalist>` 弹层按它定位就会飞到屏幕另一头
+ *     —— 3.1 用 body 级自绘面板绕开了现象，根因其实一直在这条动画里。
+ *   - 就算末帧改成 `transform: none` 也没用：只要 keyframe 里出现过 transform，
+ *     它就参与插值，`none` 被当作单位矩阵，计算值依然是 matrix。
+ * 所以真正的解法是不动画 transform。淡入的观感几乎一样，代价是失去 6px 上移。 */
 .fade-in {
-  animation: fade-in 0.35s ease-out both;
+  animation: fade-in 0.22s ease-out;
 }
 
 @keyframes fade-in {
-  from { opacity: 0; transform: translateY(6px); }
-  to { opacity: 1; transform: translateY(0); }
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 .spin {

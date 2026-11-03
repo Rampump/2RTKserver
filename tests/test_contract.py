@@ -3709,9 +3709,39 @@ class TestDropdownAnchor(unittest.TestCase):
     """候选面板必须锚在输入框上（真机：扫描串口后列表满屏乱跑）。
 
     根因不是"样式没对齐"，而是原生 `<datalist>` 弹层会被祖先的 transform 影响：
-    卡片上的 `.fade-in` 动画末帧仍是 `transform: translateY(0)`，于是浏览器把
-    弹层坐标算到别处。修法是自绘面板 + `position: fixed` 现算坐标。
+    卡片上的 `.fade-in` 动画曾经在末帧留下 `transform: translateY(0)`，浏览器据此
+    把卡片当成包含块，弹层坐标就算到别处。修法是自绘面板 + `position: fixed` 现算坐标。
     """
+
+    def test_card_animation_must_not_touch_transform(self):
+        """`@keyframes fade-in` 里不许出现 transform —— 这直接决定下拉会不会卡。
+
+        实测（Chrome，同一台机器、同一页面，唯一变量是"点的时候动画有没有在跑"）：
+
+           动画已结束再点 #cal-module（模块型号下拉）→  50 ~ 56 ms
+           动画进行中（0.35s 窗口内）点同一个下拉   → 454 ~ 972 ms
+
+        `transform` 动画会把卡片提升为合成层，而原生 `<select>` 的下拉列表由浏览器
+        UI 线程在合成层里定位绘制 —— 位移每帧都变，列表就得跟着重算。几百毫秒的
+        延迟到了手机或低配设备上，用户看到的就是"点一下浏览器卡死"。
+
+        还有两个"看起来能修好、实际没用"的写法，别试：
+          * 末帧写 `transform: none`：keyframe 里只要出现过 transform 就参与插值，
+            `none` 按单位矩阵算，计算值仍是 matrix(1,0,0,1,0,0)；
+          * 只把 `both` 换成 `backwards`：能消掉残留，但动画进行中照样是合成层，
+            卡顿窗口只是缩小到 0.2 秒。
+        唯一可靠的做法是不动画 transform。这条测试就是防止它被加回去。
+        """
+        with open(os.path.join(REPO_ROOT, 'static', 'theme.css'), 'r',
+                  encoding='utf-8') as handle:
+            css = handle.read()
+
+        start = css.find('@keyframes fade-in')
+        self.assertNotEqual(start, -1, 'theme.css 里找不到 @keyframes fade-in')
+        block = css[start:css.find('}', css.find('to', start))]
+        self.assertNotIn('transform', block,
+                         '@keyframes fade-in 里又出现了 transform —— '
+                         '卡片里的原生下拉会重新变卡，详见本测试的说明')
 
     def test_picker_script_exists_and_is_wired(self):
         path = os.path.join(REPO_ROOT, 'static', 'picker.js')
