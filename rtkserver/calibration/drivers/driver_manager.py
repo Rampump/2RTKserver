@@ -29,6 +29,7 @@ _BUILTIN_MODULES = (
     'quectel_lg290p',
     'quectel_lc29hbs',
     'unicore_n4',
+    'ublox_zed_f9p',
 )
 
 _REGISTRY = {}          # model_key -> 驱动类

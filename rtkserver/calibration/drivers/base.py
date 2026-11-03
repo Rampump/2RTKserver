@@ -38,6 +38,53 @@ def frame(body):
     return f'${body}*{checksum(body)}\r\n'
 
 
+# ==================== UBX 二进制帧（u-blox 系） ====================
+# u-blox 全系（M8/F9/M9/F10）配置与查询走 UBX 二进制，同步头 `0xB5 0x62`，
+# 校验是 **Fletcher 8-8**（CK_A/CK_B），不是 NMEA 的 XOR —— 两者绝不能混用，
+# 拿 XOR 去算 UBX 帧只会得到"模块永远不回话"。
+UBX_SYNC = b'\xb5\x62'
+UBX_MAX_PAYLOAD = 4096          # 实际最大的 UBX-CFG-VALGET 应答也就 1~2 KB
+
+
+def ubx_checksum(data):
+    """UBX 的 Fletcher 8-8 校验：返回 (CK_A, CK_B)。
+
+    范围是 **同步头之后的全部字节**（class, id, len_lo, len_hi, payload），
+    **不含** `0xB5 0x62`。这一点和很多人的直觉相反，写错了表现为 ACK 永远收不到。
+    """
+    a = b = 0
+    for byte in data:
+        a = (a + byte) & 0xFF
+        b = (b + a) & 0xFF
+    return a, b
+
+
+def ubx_frame(cls, msg_id, payload=b''):
+    """拼一整帧 UBX：`B5 62 <cls> <id> <len:2 LE> <payload> <ckA> <ckB>`。"""
+    payload = bytes(payload or b'')
+    head = bytes([cls & 0xFF, msg_id & 0xFF,
+                  len(payload) & 0xFF, (len(payload) >> 8) & 0xFF])
+    body = head + payload
+    a, b = ubx_checksum(body)
+    return UBX_SYNC + body + bytes([a, b])
+
+
+def ubx_parse(frame_bytes):
+    """校验并拆一帧 UBX。返回 `(cls, msg_id, payload)`；校验不符返回 None。"""
+    data = bytes(frame_bytes or b'')
+    if len(data) < 8 or data[:2] != UBX_SYNC:
+        return None
+    length = data[4] | (data[5] << 8)
+    total = 6 + length + 2
+    if len(data) < total:
+        return None
+    body = data[2:6 + length]
+    a, b = ubx_checksum(body)
+    if a != data[6 + length] or b != data[7 + length]:
+        return None
+    return data[2], data[3], data[6:6 + length]
+
+
 class DriverBug(Exception):
     """驱动自身写错了（典型：表里记的校验和与实时算出来的不一致）。
 
@@ -437,17 +484,133 @@ class Channel:
         """`heads` 的字节集合。每次现算而不是缓存 —— 驱动可能在构造后才改 heads。"""
         return frozenset(ord(ch) for ch in (self.heads or ('$',)))
 
+    def _wants_ubx(self):
+        """本通道是否要拆 UBX 二进制帧。
+
+        由 `heads` 里是否出现 `0xB5` 决定：u-blox 驱动的 `LINE_HEADS` 会同时声明
+        `('$', '\\xb5')`（默认 NMEA 开着，UBX 应答和 NMEA 混在同一条流里）。
+        **没有声明 `0xB5` 的型号（Quectel / N4）走的还是原来的两条分支**，
+        0xB5 继续当噪声丢掉 —— 这样新增通路绝不会改变既有型号的收包行为。
+        """
+        return 0xB5 in self._head_bytes()
+
+    def _take_ubx(self):
+        """尝试从缓冲头切一个完整 UBX 帧。
+
+        返回三态：
+            'frame'  已消费一整帧（已归档进 cache）
+            'more'   数据还不够，等后续字节（调用方必须 return None，不能继续循环）
+            'skip'   这不是有效帧头，调用方应继续循环（本方法已滑掉字节）
+        """
+        if len(self._buffer) < 6:
+            return 'more'
+        if self._buffer[:2] != UBX_SYNC:
+            return 'skip'
+        length = self._buffer[4] | (self._buffer[5] << 8)
+        if length > UBX_MAX_PAYLOAD:
+            self._buffer = self._buffer[1:]
+            self.counters['noise'] += 1
+            return 'skip'
+        total = 6 + length + 2
+        if len(self._buffer) < total:
+            return 'more'                    # 等后续字节，别丢
+        candidate = self._buffer[:total]
+        parsed = ubx_parse(candidate)
+        if parsed is None:
+            # 载荷（尤其 RTCM 透传）里出现 `B5 62` 很常见，滑一个字节重新同步
+            self._buffer = self._buffer[1:]
+            self.counters['noise'] += 1
+            return 'skip'
+        self._buffer = self._buffer[total:]
+        cls, msg_id, payload = parsed
+        self.counters['ubx'] = self.counters.get('ubx', 0) + 1
+        # 按 class/id 归档：驱动靠 `ubx_last(cls, id)` 取应答，
+        # 不依赖到达顺序，也不会被模块主动输出的 NAV-* 流冲掉。
+        self.cache.setdefault('ubx', {})[(cls, msg_id)] = payload
+        self.cache['ubx_last'] = (cls, msg_id, payload)
+        return 'frame'
+
+    def ubx_last(self, cls, msg_id):
+        """取最近一次收到的某类 UBX 帧载荷；没有返回 None。"""
+        return (self.cache.get('ubx') or {}).get((cls, msg_id))
+
+    # ---------- UBX 收发 ----------
+    def write_ubx(self, cls, msg_id, payload=b''):
+        """下发一整帧 UBX（裸二进制，不加 `$`/`*XX`）。"""
+        if not self.is_open:
+            raise DriverBug(f'通道未打开（{self.port}）')
+        data = ubx_frame(cls, msg_id, payload)
+        self._serial.write(data)
+        self._serial.flush()
+        logging.debug(f'→ UBX {cls:02X} {msg_id:02X} len={len(data) - 8}: {data[:24]!r}')
+
+    def send_ubx(self, cls, msg_id, payload=b'', timeout=1.5, retries=2,
+                 wait_ack=True, ack_timeout=None):
+        """下发 UBX 配置/查询帧并按 ACK 判定，返回 `(status, ack_id, data)`。
+
+        status: 'ack' / 'nak' / 'timeout'
+        ack_id: 5=ACK-ACK，6=NAK，None=没等到
+
+        **必须一条一条等 ACK**（集成手册 §3.1.1 原文）：
+        "If several configuration messages are sent without waiting for this
+        response then the receiver may pause processing of input messages ...
+        a warning message 'wait for cfg ACK' will be sent to the host."
+        所以这里不提供"批量连发"的快捷方式，驱动侧也必须逐条调用。
+
+        `wait_ack=False` 用于 UBX-CFG-RST（重启）—— 它不回 ACK，回了也读不到。
+        """
+        ack_id = None
+        for attempt in range(max(0, int(retries)) + 1):
+            self.cache.get('ubx', {}).pop((0x05, 0x01), None)
+            self.cache.get('ubx', {}).pop((0x05, 0x00), None)
+            self.write_ubx(cls, msg_id, payload)
+            if not wait_ack:
+                return 'ok', None, {}
+            deadline = time.time() + float(ack_timeout or timeout)
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                line = self.read_line(min(remaining, 0.5))
+                if line is not None:
+                    self.absorb(line)        # UBX 型号也可能同时吐 NMEA
+                cached = self.cache.get('ubx') or {}
+                if (0x05, 0x01) in cached:   # UBX-ACK-ACK
+                    return 'ack', 0x01, {}
+                if (0x05, 0x00) in cached:   # UBX-ACK-NAK
+                    return 'nak', 0x00, {}
+                if remaining <= 0:
+                    break
+            if attempt < int(retries):
+                logging.debug(f'UBX {cls:02X}/{msg_id:02X} 无 ACK，第 {attempt + 1} 次重试')
+                time.sleep(0.15)
+        return 'timeout', None, {}
+
     # ---------- 接收 ----------
     def _next_line(self):
         """从缓冲里取出下一条完整 NMEA 行（含 `$`，不含 CRLF）。
 
         混合流拆分规则（方案 §4.4）：
-            0xD3 → 按长度字段读整帧 + CRC24Q 校验，喂 RTCM 缓存；
-            '$'  → 读到 `\\n`，超 256 字节判噪声重新同步；
-            其它 → 丢一个字节并计数（连续大量垃圾 = 波特率不对）。
+            0xD3       → 按长度字段读整帧 + CRC24Q 校验，喂 RTCM 缓存；
+            B5 62      → 按 UBX 长度字段读整帧 + Fletcher 校验，存进 ubx 缓存
+                        （**仅当 heads 里声明了 0xB5**，即 u-blox 系）；
+            '$'        → 读到 `\\n`，超 256 字节判噪声重新同步；
+            其它       → 丢一个字节并计数（连续大量垃圾 = 波特率不对）。
         """
         while self._buffer:
             head = self._buffer[0]
+
+            if head == 0xB5 and self._wants_ubx():
+                # 第二个字节不是 0x62 就别当帧头（载荷里的巧合 B5）
+                if len(self._buffer) >= 2 and self._buffer[1] != 0x62:
+                    self._buffer = self._buffer[1:]
+                    self.counters['noise'] += 1
+                    continue
+                state = self._take_ubx()
+                if state == 'more':
+                    return None
+                continue                     # 'frame' 或 'skip' 都继续循环
+
             if head == 0xD3:
                 if len(self._buffer) < 3:
                     return None
