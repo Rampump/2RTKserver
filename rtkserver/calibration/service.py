@@ -745,7 +745,9 @@ class CalibrationService:
 
     def _worker(self):
         task = dict(self._task)
-        lease = SerialLease(port=task['port'], baud=task['baud'], task_id=self._task_id)
+        lease = SerialLease(port=task['port'], baud=task['baud'],
+                            task_id=self._task_id,
+                            action=str(task.get('action') or ''))
         self._lease = lease
         final_stage = 'FAILED'
         final_message = ''
@@ -1722,10 +1724,21 @@ def on_startup():
         return None
     stage = str(lease.get('stage') or '?')
     module = lease.get('module') or {}
-    message = (f'上次标定在「{STAGE_TEXT.get(stage, stage)}」阶段被中断'
-               f'（端口 {lease.get("port") or "?"}'
-               + (f'，模块 {module.get("sn")}' if module.get('sn') else '')
-               + '）。模块可能停在中间配置上，建议重新标定或先做一次只读诊断')
+    action = str(lease.get('action') or '')
+    # 只读动作（诊断/识别）从不写模块，被打断时唯一该说的是"没有写任何配置"。
+    # 老租约没有 action 字段（3.0.0 及更早），按 stage 兜底：DETECT/OBSERVE 只在
+    # 只读诊断里出现，其余阶段一律按"可能已改动"处理——宁可多提醒一次。
+    readonly = (action == 'diagnose'
+                or (not action and stage in ('DETECT', 'OBSERVE')))
+    if readonly:
+        message = (f'上次的只读诊断在「{STAGE_TEXT.get(stage, stage)}」阶段被中断'
+                   f'（端口 {lease.get("port") or "?"}）。'
+                   '只读诊断不写模块，当前配置没有被改动，可以直接重新开始')
+    else:
+        message = (f'上次标定在「{STAGE_TEXT.get(stage, stage)}」阶段被中断'
+                   f'（端口 {lease.get("port") or "?"}'
+                   + (f'，模块 {module.get("sn")}' if module.get('sn') else '')
+                   + '）。模块可能停在中间配置上，建议重新标定或先做一次只读诊断')
     logging.warning(message)
 
     # 3a) 租约改终态：不改的话每次开机都会再报一次，最后没人再看这条提示

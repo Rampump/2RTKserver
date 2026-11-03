@@ -139,10 +139,16 @@ class SerialLease:
             lease.release(stage)     # 幂等，重复调用无副作用
     """
 
-    def __init__(self, port, baud=115200, task_id=''):
+    def __init__(self, port, baud=115200, task_id='', action=''):
         self.port = str(port or '')
         self.baud = int(baud) if baud else 115200
         self.task_id = str(task_id or '')
+        # 任务动作（diagnose / cors / survey_in / manual / restore）。
+        # 落进 lease.json 只为一件事：**进程被硬中断后，启动横幅能说对话**。
+        # 「识别模块」这类只读动作从不写模块，横幅若照样警告"模块可能停在中间
+        # 配置上"，用户会去做一次没必要的重新标定——狼来了几次之后，真正的
+        # 中断警告就没人看了。
+        self.action = str(action or '')
         self.stage = 'IDLE'
         self.channel = None
         self.driver = None                  # 归还时若要恢复模式，需要它
@@ -164,6 +170,7 @@ class SerialLease:
         """给 Web 页面看的租约快照（不落盘）。"""
         return {
             'task_id': self.task_id,
+            'action': self.action,
             'port': self.port,
             'baud': self.baud,
             'stage': self.stage,
@@ -387,6 +394,7 @@ class SerialLease:
         return {
             'version': __version__,
             'task_id': self.task_id,
+            'action': self.action,
             'port': self.port,
             'baud': self.baud,
             'stage': self.stage,
