@@ -154,7 +154,7 @@
         });
       } else {
         hint.textContent = bauds.length
-          ? t('cal.baud.auto_tip', { list: bauds.join(' / ') })
+          ? t('cal.baud.auto_tip', { top: bauds[0], list: bauds.join(' / ') })
           : t('cal.baud.auto_tip_plain');
       }
       hint.classList.remove('is-warn');

@@ -98,8 +98,8 @@ def list_supported_modules():
         }
     每项：id / name / match_prefix / dual_mode / caps / command_count /
           bauds / default_baud / baud_cmd
-    `bauds` 是该型号厂商文档写明的波特率档位，前端据此给候选；
-    用户仍可手动输入任意值，`bauds` 只影响自动探测顺序与非法值提示。
+    `bauds` 是该型号厂商文档写明的波特率档位，`default_baud` 打头、其余降序；
+    前端据此给候选，用户仍可手动输入任意值 —— `bauds` 只影响自动探测顺序与非法值提示。
     """
     load_builtin_drivers()
     dual, single = [], []
@@ -108,7 +108,7 @@ def list_supported_modules():
         # 注册表里仍保留，历史记录回填 / 手工指定型号照常能加载。
         if getattr(driver_class, 'HIDDEN', False):
             continue
-        # 借一个空实例走 bauds()，保证"去重 + 降序"这套规则只有一处实现
+        # 借一个空实例走 bauds()，保证"默认档打头 + 其余降序 + 去重"这套规则只有一处实现
         probe = driver_class(None)
         item = {
             'id': model_key,
@@ -399,7 +399,11 @@ def _selftest():
     # 每个型号都要带自己的官方波特率清单（前端据此给候选）
     for item in modules['all']:
         assert item['bauds'], f'{item["id"]} 没有声明 BAUDS'
-        assert item['bauds'] == sorted(item['bauds'], reverse=True), item['bauds']
+        # 顺序约定：`default_baud` 打头（押注手册示例最常见的那一档），其余降序。
+        # 这里曾经断言纯降序 —— 那条断言是"首轮先试 921600"的帮凶：
+        # 它把错误顺序固化成了不变量，改顺序就会红。
+        assert item['bauds'][0] == item['default_baud'], (item['id'], item['bauds'])
+        assert item['bauds'][1:] == sorted(item['bauds'][1:], reverse=True), item['bauds']
         assert item['default_baud'] in item['bauds'], item
     lg = [i for i in modules['all'] if i['id'] == 'lg290p'][0]
     bs = [i for i in modules['all'] if i['id'] == 'lc29hbs'][0]
@@ -603,7 +607,10 @@ def _selftest():
     assert 3000000 in got and 4800 in got, 'LC29H(BS) 的 4800/3000000 全局限表里没有'
     got = CalibrationService._baud_candidates(None, current=19200)
     assert got[0] == 19200 and len(got) == len(set(got)), got
-    print('[14] 波特率候选合流 OK  手填值置顶 + 型号官方档位 + 自动探测并集')
+    # 没手填、没记忆时，第一档必须是该型号的默认档 —— 否则全新模块白等超时
+    got = CalibrationService._baud_candidates(['lg290p'])
+    assert got[0] == 115200, f'lg290p 首个候选应为默认档 115200：{got}'
+    print('[14] 波特率候选合流 OK  手填值置顶 + 型号默认档打头 + 自动探测并集')
 
     # 15) `baud_explicit` 必须按"用户填没填"判定，不能按"值等不等于默认"。
     #     手填 115200（恰好等于默认）若被判成"没填"，识别失败时程序会去
