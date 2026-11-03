@@ -1,6 +1,6 @@
 # 2RTKserver 项目架构与对接点分析报告
 
-> 版本基线：`VERSION = 2.2.3`，提交 `50e576b`
+> 版本基线：`VERSION = 3.0.0`（编写时基于 `2.2.3` / 提交 `50e576b`，发布前已随 3.0.0 复核）
 > 阅读范围：`server.py` + `rtkserver/` 全部 38 个 `.py`（8 个包初始化、29 个实体模块）+ 4 个模板 + 4 个前端资源（script/maintenance/i18n/theme）+ `tests/test_contract.py`
 > 规模：Python 6530 行 / 前端 5027 行 / 测试 765 行
 > 本文只做结构分析与集成设计，不含业务实现代码。

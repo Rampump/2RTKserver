@@ -20,6 +20,7 @@ radio datalink — any combination, each with its own switch.
 
 - [What it does](#what-it-does)
 - [Features](#features)
+- [What's new in 3.0](#whats-new-in-30)
 - [Data flow](#data-flow)
 - [Hardware](#hardware)
 - [Requirements](#requirements)
@@ -27,6 +28,7 @@ radio datalink — any combination, each with its own switch.
 - [Web UI](#web-ui)
 - [Configuration](#configuration)
 - [Read this first: antenna phase center](#read-this-first-antenna-phase-center)
+- [Base-station calibration](#base-station-calibration)
 - [Service management](#service-management)
 - [Troubleshooting](#troubleshooting)
 - [Compatibility](#compatibility)
@@ -58,6 +60,7 @@ no telemetry.
 
 | | |
 | --- | --- |
+| **Base-station calibration** | Measures the antenna position on the device itself and writes it into the module: CORS/VRS survey, Survey-in, or manual entry. Supports Quectel LG290P / LC29HBS and Unicore N4. The resulting ECEF is stored in `calibration.db` and read back from RTCM 1005/1006 to prove that what was written is what gets broadcast. See [Base-station calibration](#base-station-calibration). |
 | **Two sources** | `serial` — read RTCM3 from a USB RTK/GNSS module (auto-scans ports, auto-detects baud). `relay` — pull from any NTRIP caster, with a "Fetch Mount Points" button that reads the peer's source table. |
 | **Outlet ① upstream push** | NTRIP 1.0 `SOURCE` push to your own caster, with automatic reconnect (5 s), bounded queue (512 frames, drop-oldest), and a dedicated thread — a dead upstream can never stall the serial port. |
 | **Outlet ② built-in caster** | Serves the same stream on the LAN as a real NTRIP caster: `GET /` returns a SOURCETABLE, `GET /2RTK` requires Basic auth, supports NTRIP 1.0 (`ICY 200 OK`) and 2.0 clients, up to 16 clients with per-client queues. |
@@ -70,6 +73,21 @@ no telemetry.
 > A single-base RTK setup is limited by ionosphere/troposphere/orbit/multipath errors: roughly
 > 20 km of useful range, sometimes 50 km with dual/multi-frequency receivers. It is not a
 > replacement for a national CORS network — it is what you build when you want your own.
+
+## What's new in 3.0
+
+- **On-device calibration** — `/calibrate` measures and writes the antenna position, no vendor
+  PC tool needed. CORS/VRS, Survey-in and manual entry; LG290P / LC29HBS / Unicore N4.
+- **`calibration.db`** — surveyed coordinates now live in their own database, so resetting the
+  configuration or upgrading the program no longer risks losing them. Backed up and restored
+  together with `2RTKserver.db` during upgrade and uninstall.
+- **Uninstall left the browser** — it is SSH-only now (`uninstall.sh`). The old API answers
+  `410 Gone` with instructions instead of silently 404-ing.
+- **Hardening** — the upgrade rollback validates every archive member path before extracting;
+  anonymous WebSocket clients no longer receive the log history.
+
+Upgrading from 2.x: nothing to migrate by hand, but coordinates previously written only into
+a module will not appear in the calibration history until you calibrate once more.
 
 ## Data flow
 
@@ -116,6 +134,10 @@ A typical deployment (photos to be added):
   [Read this first](#read-this-first-antenna-phase-center).
 - **Receiver**: any module that streams RTCM3 over serial and can be put into base mode —
   u-blox ZED-F9P, Unicore UM980/UM982, Septentrio mosaik, Trimble BD9xx, etc.
+  *On-device calibration* (the `/calibrate` page) is available for modules with a built-in
+  profile: **Quectel LG290P, Quectel LC29HBS, Unicore N4**. Other modules work fine as a data
+  source and can still be given a coordinate with the vendor tool — see
+  [Write the coordinate into the module](INSTALL.en.md#write-the-coordinate-into-the-module).
 - **Host**: Armbian on an old TV box / OneCloud works fine (tested), as do Raspberry Pi,
   Orange Pi and any x86 mini PC. 512 MB RAM is plenty; the process idles well under 100 MB.
 - **Radio (optional)**: any transparent USB data radio (e.g. 410–470 MHz modules) plus a
@@ -136,7 +158,8 @@ A typical deployment (photos to be added):
 - Open outbound TCP for upstream push / relay; the LAN caster needs one free TCP port
 - No root-only features beyond opening the serial device and binding a port above 1024
 
-Python packages (`requirements.txt`): `pyserial`, `pyrtcm`, `flask`, `flask-sock`.
+Python packages (`requirements.txt`): `pyserial`, `pyrtcm`, `flask`, `flask-sock`, and
+`zeroconf` (optional — only for the `2rtk.local` address; the program runs without it).
 
 ## Quick start
 
@@ -188,9 +211,14 @@ python3 server.py
 
 ## Web UI
 
-**Settings** — mode, the three outlet switches, and live status of each outlet on the same
-page. Fields only appear (and become required) when their switch is on, so an unused outlet
-can never block a save.
+**Status** (`/`) — satellites per constellation, RTCM inventory, live log, and the base
+position on a map.
+
+![Status page](docs/images/screenshot-status.png)
+
+**Settings** (`/config`) — mode, the three outlet switches, and live status of each outlet on
+the same page. Fields only appear (and become required) when their switch is on, so an unused
+outlet can never block a save.
 
 ![Settings page](docs/images/screenshot-settings.png)
 
@@ -198,6 +226,13 @@ can never block a save.
 the ports typed for relay/upload are *remote* endpoints and never occupy a local port.
 
 ![Local caster settings](docs/images/screenshot-local-caster.png)
+
+**Calibration** (`/calibrate`, new in 3.0) — pick a method, watch the stage progress and live
+quality indicator, then review the resulting coordinate and its accuracy grade inline. The
+history list lets you reuse a previous result, but only for the same module serial number.
+
+**Maintenance** (`/upgrade`) — check for updates, one-click upgrade with automatic rollback,
+and a pointer to the SSH-only uninstall.
 
 ## Fixed LAN address (`2rtk.local`)
 
@@ -261,6 +296,52 @@ the resulting ECEF / lat-lon-height into the module, and verify it appears in RT
 the map and the caster's STR record read it from there. Details and methods:
 [INSTALL.en.md § Antenna Phase Center](INSTALL.en.md#important-locate-the-antenna-phase-center-first).
 
+## Base-station calibration
+
+New in 3.0. The web UI at **`/calibrate`** measures the antenna position and writes it into
+the module, so you no longer need a vendor PC tool for the initial survey.
+
+**Three methods**
+
+| Method | When to use | What it needs |
+| --- | --- | --- |
+| `cors` | You have a CORS/NTRIP account with RTK corrections | Caster host/port, mountpoint, credentials. Typically 3–10 min to a fix. |
+| `survey_in` | No external corrections available | Clear sky view; averages a single-point solution over 60 s – 15 min. Accuracy is **sub-meter**, not centimetre. |
+| `manual` | You already surveyed the APC (control point, static session) | Latitude/longitude/height or ECEF, entered by hand. |
+
+**What it actually does**
+
+1. Takes an exclusive lease on the serial port. The data plane stops reading and gives the
+   port up first — two readers on one `/dev/ttyUSB0` corrupt each other's byte stream.
+   The lease is heartbeat-guarded: if the calibration thread dies, the main loop reclaims
+   the port within 30 s instead of hanging forever.
+2. Detects the module and applies the profile for its model (baud, command set, quirks).
+3. Switches to rover, enables RTK, pins the fix rate, then **saves parameters and reboots**.
+   This step is not optional: the RTK engine only re-initialises on a cold start, so a
+   configuration that reads back correctly can still be inert. Skipping the reboot produces
+   the classic symptom "differential data arrives, quality stays at 2 (DGPS) forever".
+4. Streams GGA upstream for VRS, filters out implausible jumps (>500 m), and collects the
+   position with a Kalman filter until 3D σ converges.
+5. Writes the coordinate into the module, then **reads back RTCM 1005/1006** and compares.
+   If what is broadcast does not match what was written, the run fails.
+6. Stores the result in `calibration.db` (separate from the config DB, so it survives a
+   configuration reset) and optionally applies the port as the data source.
+
+**Accuracy is labelled, not assumed.** Each record carries `fixed` / `float` / `sub_meter`
+/ `decimeter`. Under an obstructed sky — a rooftop corner, a window recess, a narrow alley —
+the module may never reach a fixed solution. In that case the run does **not** fail: it
+collects on the float solution and records the grade honestly. A float solution with a
+0.6 m vertical spread is good enough to seed a base station, because the module keeps
+smoothing its ECEF while broadcasting.
+
+**Reusing a previous result.** The history list offers *reuse* only for records whose module
+serial number matches the currently connected device. Coordinates from another module — or
+the same module on a different antenna — are shown for reference but cannot be applied.
+
+> Calibration writes to the module's NVM and reboots it. If you are calibrating a module
+> that is currently serving as a base station, every rover loses corrections for the
+> duration of the reboot.
+
 ## Service management
 
 ```bash
@@ -273,31 +354,46 @@ Update / uninstall:
 
 ```bash
 sudo ./update.sh      # backs up the DB, copies new files, reinstalls deps, restarts
-sudo ./uninstall.sh   # prompts to back up the DB, then removes service + install dir
+sudo ./uninstall.sh   # prompts to back up both DBs, then removes service + install dir
 ```
 
+`update.sh` never touches `calibration.db` or `.calibration/`; `uninstall.sh` offers to copy
+both databases (plus their `-wal`/`-shm`) to `/root/` before deleting anything.
+
 One-line uninstall, for when the source tree is already gone (the two `y` answers are
-"yes, uninstall" and "yes, back the config DB up to `/root`"):
+"yes, uninstall" and "yes, back both databases up to `/root`"):
 
 ```bash
 printf 'y\ny\n' | sudo bash /opt/2RTKserver/uninstall.sh
 ```
 
-### In-browser upgrade & uninstall
+### In-browser upgrade
 
-Both are also available from **Config → Maintenance**, no SSH needed:
+Available from **Config → Maintenance**, no SSH needed:
 
 - **Check for updates** probes both repositories at once and shows the commit of each.
-- **Upgrade now** pulls the newest code, verifies it (syntax compile, import smoke test,
-  the repo's own unit tests), stops the service, waits for the listening ports to be
-  really released, swaps the files, updates dependencies, starts the service and waits
-  for the web port to answer. Any failure at any step rolls back automatically to the
-  version you were running.
+- **Upgrade now** pulls the newest code, verifies it (syntax compile, import smoke test),
+  stops the service, waits for the listening ports to be really released, swaps the files,
+  updates dependencies, starts the service and waits for the web port to answer. Any
+  failure at any step rolls back automatically to the version you were running.
 - The page loses connection while the service restarts — that is expected. It keeps
   polling and reports the outcome by itself; on failure it shows the reason and states
   that the previous version was restored.
-- **Uninstall** requires the admin password plus typing `DELETE`. The config DB is backed
-  up to `/root/2RTKserver-<timestamp>.db` before anything is removed.
+
+**Uninstalling is deliberately not available from the browser.** It stops the service,
+removes the systemd unit and deletes the whole install directory — a confirmation dialogue
+is not enough protection against a mis-click on a device you may only reach over the
+network. Use SSH:
+
+```bash
+sudo bash /opt/2RTKserver/uninstall.sh
+```
+
+The script asks twice: once to confirm, once to back up. If you say yes to the backup, both
+`2RTKserver.db` (admin password + connection settings) and `calibration.db` (your surveyed
+base coordinates, including any pending `-wal`) are copied to `/root/` before anything is
+deleted. The old `/api/upgrade/uninstall` endpoint still answers, but with `410 Gone` and
+the same instruction, so a stale bookmark explains itself instead of failing silently.
 
 Two download sources are used, and they are **not** the same repository name:
 
@@ -370,6 +466,20 @@ devices, plus x86_64 Debian. Any Linux with Python 3.8+ and USB serial should be
 - [INSTALL.md](INSTALL.md) — 中文安装指南
 - [`reset_config.py`](reset_config.py) — CLI reset of admin password and connection settings
 
+Calibration design and field notes:
+
+- [docs/auto-calibration-design.zh.md](docs/auto-calibration-design.zh.md) — full design:
+  state machine, lease/watchdog, drivers, accuracy grading, DB schema and migrations
+- [docs/cors-calibration-flow.zh.md](docs/cors-calibration-flow.zh.md) — step-by-step CORS
+  calibration flow with the exact serial commands at each stage
+- [docs/quectel-lg290p-calibration-commands.zh.md](docs/quectel-lg290p-calibration-commands.zh.md)
+  — LG290P command reference (`PQTMCFG*` / `PQTMSVIN*`) plus a list of quirks and traps
+- [docs/architecture-and-calibration-integration.zh.md](docs/architecture-and-calibration-integration.zh.md)
+  — how the calibration package stays decoupled from the core (the `calibration` package can be
+  deleted and the program still runs)
+- [docs/lg290p-cors-field-test-2026-11-02.zh.md](docs/lg290p-cors-field-test-2026-11-02.zh.md)
+  — real-hardware field test report, including the failures and their root causes
+
 ## License & credits
 
 Licensed under [GNU GPLv3](LICENSE). Any distributed derivative must stay GPLv3.
@@ -388,13 +498,18 @@ models.
 
 ## 中文简介
 
-一个自建的 RTK 基准站 NTRIP 服务端：接一个 RTK 模块（天线架在楼顶，馈线拉到模块，天线相位中心的
-ECEF 坐标提前测好写进模块），模块插到刷了 Armbian 的机顶盒 / 玩客云这类小主机上，跑这个程序，
-用浏览器访问 `http://设备IP:5757` 就能配置和看状态。
+一个自建的 RTK 基准站 NTRIP 服务端：接一个 RTK 模块（天线架在楼顶，馈线拉到模块），模块插到刷了
+Armbian 的机顶盒 / 玩客云这类小主机上，跑这个程序，用浏览器访问 `http://设备IP:5757` 就能配置和看状态。
 
 三个数据出口互相独立、可任意勾选：上传到自己的 NTRIP Caster、同时开一个本地局域网的 Caster
 给移动站/手簿直连、或者接一个 USB 数传模块把差分直接播给附近的流动站和无人机；数据源也可以反过来
 选 relay，从别的 Caster 拉流再分发。
+
+**3.0 起新增「标定」页（`/calibrate`）**：不用再拿厂家上位机去测天线坐标，直接在网页上把基准站
+设好。支持 CORS/VRS 标定、Survey-in 自测量、手动输入三种方式，自动识别 Quectel LG290P /
+LC29HBS 与 Unicore N4 模块；测出来的 ECEF 存进 `calibration.db`，写入后还会回读模块播发的
+RTCM 1005 校验「写进去的 == 播出去的」。精度如实标注（固定解 / 浮动解 / 亚米级），
+天线被挡住只能拿到浮动解时不会假装成功，也不会直接判失败。
 
 安装、天线相位中心定位方法、故障排除见 [INSTALL.md](INSTALL.md)，本文件上方为英文说明。
 
@@ -417,7 +532,23 @@ sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone 
 2. 不要手打或输入法半途切换 —— 全角标点（`，` `；` `（` 和中文引号）会让命令变成非法语法。
 3. 浏览器窗口太窄会把命令折行显示，复制时确认整行都在代码块里、末尾没有断掉。
 
-卸载（源码目录已经删了也能用；两个 `y` 分别是"确认卸载"和"先把配置库备份到 /root"）：
+### 一键升级
+
+已经装过旧版本的，从 2.x 升到 3.x 也用这一行（同样先 GitCode 再 GitHub；`update.sh` 会保留
+`2RTKserver.db`、`calibration.db`、`.calibration/` 和 `venv`，只换程序文件并重装依赖）：
+
+```bash
+sudo rm -rf /tmp/2rtk-update && (sudo git clone --depth 1 https://gitcode.com/rampump/NTRIPserver.git /tmp/2rtk-update || (sudo rm -rf /tmp/2rtk-update && sudo git clone --depth 1 https://github.com/Rampump/2RTKserver.git /tmp/2rtk-update)) && sudo bash /tmp/2rtk-update/update.sh
+```
+
+升级完成后浏览器里「系统维护」显示的版本应为 `3.0.0`。也可以在网页上点「检查更新 → 立即升级」，
+效果一致：它会先备份、换文件、装依赖、启动服务，任何一步失败自动回滚到原版本。
+
+> **从 2.x 升级特别注意**：3.0 首次启动会自动建 `calibration.db`（标定库）。旧的
+> `2RTKserver.db` 不用动，配置和口令照旧；但如果旧库里曾手工存过坐标，升级后需要重新标定一次
+> 才能进入标定页的历史列表。
+
+卸载（源码目录已经删了也能用；两个 `y` 分别是"确认卸载"和"把两个数据库都备份到 /root"）：
 
 ```bash
 printf 'y\ny\n' | sudo bash /opt/2RTKserver/uninstall.sh

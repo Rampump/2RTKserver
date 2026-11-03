@@ -58,11 +58,13 @@ STAGE_TEXT = {
 }
 
 # 需要从新版本复制到安装目录的条目（与 update.sh 的白名单保持一致）
+# 不含 `tests`：测试套件不随发布包分发（见 .gitignore），升级验证只做
+# 语法编译 + 导入冒烟；`verify()` 对 tests 目录有 isdir 判断，缺失时自动跳过。
 SYNC_ITEMS = [
     'server.py', 'rtkserver', 'reset_config.py', 'requirements.txt',
     'install.sh', 'uninstall.sh', 'update.sh',
     'README.md', 'INSTALL.md', 'INSTALL.en.md', 'LICENSE',
-    'templates', 'static', 'docs', 'tests', 'VERSION',
+    'templates', 'static', 'docs', 'VERSION',
 ]
 
 # 升级时绝对不能被覆盖的东西：虚拟环境、配置库、会话密钥、升级工作目录、日志

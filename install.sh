@@ -36,9 +36,16 @@ else
 fi
 
 # 安装系统依赖
+# ca-certificates 必须显式列出：git clone https 与 pip 拉 PyPI 都靠它校验证书，
+# 精简版 Armbian 镜像里经常没有，缺了会报 "server certificate verification failed"
+# 或 "SSL: CERTIFICATE_VERIFY_FAILED"，而这一步装依赖时装不到。
 echo -e "${YELLOW}安装系统依赖...${NC}"
 apt update
-apt install -y python3 python3-pip python3-venv git systemd
+apt install -y python3 python3-pip python3-venv git systemd ca-certificates || {
+    echo -e "${RED}系统依赖安装失败（apt 返回非零）${NC}"
+    echo "请检查网络与软件源，然后重新运行本脚本"
+    exit 1
+}
 
 # 检查 Python 版本（代码用到了 f-string、typing 等 3.8+ 特性）
 PY_VER=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)
@@ -73,7 +80,7 @@ if [ -f "$SRC_DIR/server.py" ]; then
     # rtkserver 是拆包后的代码包（server.py 只是入口壳），漏掉它 systemctl start
     # 会立刻 ModuleNotFoundError: No module named 'rtkserver'。
     for item in server.py rtkserver reset_config.py requirements.txt install.sh uninstall.sh update.sh \
-                VERSION README.md INSTALL.md INSTALL.en.md LICENSE templates static docs tests; do
+                VERSION README.md INSTALL.md INSTALL.en.md LICENSE templates static docs; do
         if [ -e "$SRC_DIR/$item" ]; then
             cp -r "$SRC_DIR/$item" "$INSTALL_DIR/"
         fi
@@ -102,9 +109,23 @@ fi
 cd $INSTALL_DIR
 
 # 创建Python虚拟环境
+# venv 创建本身会失败：ubuntu/debian 把 ensurepip 拆到 python3-venv 包里，
+# Armbian 精简镜像有时即便 apt 装了也缺 python3.X-venv 对应的版本包。
+# 不检查就会在下一步 `source activate` 处报"没有那个文件"，错误信息离根因很远。
 echo -e "${YELLOW}创建Python虚拟环境...${NC}"
-python3 -m venv $INSTALL_DIR/venv
+if ! python3 -m venv $INSTALL_DIR/venv || [ ! -x "$INSTALL_DIR/venv/bin/pip" ]; then
+    echo -e "${RED}虚拟环境创建失败${NC}"
+    echo "请先安装与当前 Python 版本对应的 venv 包，再重新运行本脚本："
+    echo "  sudo apt install -y python3-venv python${PY_VER}-venv"
+    exit 1
+fi
 source $INSTALL_DIR/venv/bin/activate
+
+# 老系统的 pip 往往认不出新 wheel 的 manylinux 标签，会退化成源码编译并失败。
+# 先自升级一轮；失败不致命（离线源/旧镜像常见），继续用原 pip 试装。
+echo -e "${YELLOW}升级 pip...${NC}"
+pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || \
+    echo -e "${YELLOW}pip 自升级未成功，继续使用当前版本${NC}"
 
 # 安装Python依赖
 echo -e "${YELLOW}安装Python依赖...${NC}"
@@ -121,6 +142,26 @@ else
         exit 1
     fi
 fi
+
+# 装完必须验证「真的能 import」：pip 报 Successfully installed 不代表装对了，
+# 常见的是装进了系统 site-packages 而非 venv，或 wheel 装上了但 so 依赖缺失。
+echo -e "${YELLOW}验证依赖...${NC}"
+MISSING=""
+for mod in serial flask flask_sock pyrtcm; do
+    if ! $INSTALL_DIR/venv/bin/python -c "import $mod" 2>/dev/null; then
+        MISSING="$MISSING $mod"
+    fi
+done
+if [ -n "$MISSING" ]; then
+    echo -e "${RED}以下依赖在 venv 中不可用:${MISSING}${NC}"
+    echo "可手动重试：$INSTALL_DIR/venv/bin/pip install -r $INSTALL_DIR/requirements.txt"
+    exit 1
+fi
+# zeroconf 只影响 2rtk.local，缺了程序照常跑，这里只提示不中止
+if ! $INSTALL_DIR/venv/bin/python -c "import zeroconf" 2>/dev/null; then
+    echo -e "${YELLOW}未安装 zeroconf：不影响使用，但没有 2rtk.local 固定地址${NC}"
+fi
+echo -e "${GREEN}依赖验证通过${NC}"
 
 # 创建systemd服务文件
 echo -e "${YELLOW}创建系统服务...${NC}"

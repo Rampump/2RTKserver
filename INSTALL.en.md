@@ -64,15 +64,30 @@ Pick one, from most to least accurate:
 
 ### Write the coordinate into the module
 
-Once you have an accurate coordinate, use the module's configuration tool (vendor software
-or serial commands) to write the **phase-center latitude, longitude and ellipsoidal height**
+**Since 3.0 this can be done in the browser**: sign in and open
+`http://<device-ip>:5757/calibrate`, then pick a method:
+
+| Method | When to use | Accuracy |
+| --- | --- | --- |
+| CORS / VRS survey | You have a CORS account (host, port, mountpoint, credentials) | Centimetre (fixed) |
+| Survey-in | No external corrections, but an open sky view | Sub-meter |
+| Manual entry | You already surveyed the APC by static session or control point | As good as your input |
+
+The calibration page detects the module, switches its mode, collects and filters the
+position, writes the coordinate, and then **reads back RTCM 1005/1006 to prove that what was
+written is what gets broadcast**. Results are stored in `calibration.db`. When the sky is
+obstructed and only a float solution is reachable, the record is labelled as float /
+decimetre instead of pretending to be fixed.
+
+For modules without a built-in profile, you still need the vendor's configuration tool
+(or serial commands) to write the **phase-centre latitude, longitude and ellipsoidal height**
 into the module, so it emits the correct coordinate in RTCM 1005/1006 messages. This program
 parses those messages for the map display and the NTRIP source table (STR).
 
-> How to verify: after installing and running, open the "Base Station Location" card on the
-> web home page and check whether the map marker matches your expected position; or check the
-> latitude/longitude in the local caster's source table (STR line). If it doesn't match, the
-> module's coordinate is not yet configured correctly.
+> How to verify: open the "Base Station Location" card on the web home page and check whether
+> the map marker matches your expected position; or check the latitude/longitude in the local
+> caster's source table (STR line). If it doesn't match, the module's coordinate is not yet
+> configured correctly.
 
 ---
 
@@ -229,8 +244,13 @@ From the web UI (**Settings → Maintenance**, no SSH needed):
 | Button | What it does |
 | --- | --- |
 | Check for updates | Probes both repositories in parallel and lists each commit |
-| Upgrade now | Fetch → verify (compile, import smoke test, bundled unit tests) → backup → stop service and wait for ports to be released → swap files → install deps → start → health check. Rolls back automatically if any step fails |
-| Uninstall | Requires the admin password plus typing `DELETE`; the config DB is backed up to `/root/2RTKserver-<timestamp>.db` first |
+| Upgrade now | Fetch → verify (compile, import smoke test) → backup → stop service and wait for ports to be released → swap files → install deps → start → health check. Rolls back automatically if any step fails |
+
+**Uninstalling is SSH-only.** It deletes the whole install directory, and a browser
+confirmation box is not enough protection against a mis-click. `uninstall.sh` asks twice:
+once to confirm, once to back up `2RTKserver.db` (settings + admin password) and
+`calibration.db` (surveyed coordinates, including pending `-wal`) to `/root/`. The old
+`/api/upgrade/uninstall` endpoint answers `410 Gone` with the same instruction.
 
 The web service stops for a few seconds while upgrading, so the page loses its
 connection — that is expected. The page keeps polling, refreshes itself on success,
@@ -239,13 +259,14 @@ and on failure shows the reason plus a clear note that the previous version was 
 ### One single source for the version number
 
 The version lives in the `VERSION` file at the program root (a single `major.minor.patch`
-line such as `2.2.2`):
+line such as `3.0.0`):
 
 - Maintenance page shows `v<version> · <commit>`: the version comes from `VERSION`,
   the commit from `.version`;
 - the console banner and the mDNS TXT record read the same file, and **no version
-  string is hard-coded in the code** (`tests/test_contract.py::TestVersionSingleSource`
-  fails on any hard-coded `x.y.z`);
+  string is hard-coded in the code** (the local contract suite's
+  `TestVersionSingleSource` fails on any hard-coded `x.y.z`; the suite is kept out of the
+  published repository, so run it from a development checkout);
 - `install.sh`, `update.sh` and the upgrade runner all copy `VERSION` and record it in
   `.version`;
 - to cut a release, edit **only that one line** and commit. If a package ever ships

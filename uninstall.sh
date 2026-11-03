@@ -46,14 +46,40 @@ rm -f /usr/local/bin/2rtkserver
 # 删除安装目录
 echo -e "${YELLOW}删除安装目录...${NC}"
 
-# 安装目录里除了程序，还有配置数据库（管理员口令 + 全部连接设置）和会话密钥，
-# 一并删掉就找不回来了，先问一句要不要留个备份。
-if [ -f "$INSTALL_DIR/2RTKserver.db" ]; then
-    echo -e "${YELLOW}注意：$INSTALL_DIR/2RTKserver.db 内含管理员口令和全部连接配置，删除后无法恢复。${NC}"
+# 安装目录里除了程序，还有两个不能再生的资产：
+#   2RTKserver.db    管理员口令 + 全部连接配置
+#   calibration.db   测出来的基准站坐标（天线相位中心 ECEF）
+# 后者尤其致命：坐标没了，所有下游流动站都得回现场重测一次。
+# 服务和上面这些都已停掉，此时文件不再被写入，直接拷即可。
+if [ -f "$INSTALL_DIR/2RTKserver.db" ] || [ -f "$INSTALL_DIR/calibration.db" ]; then
+    echo -e "${YELLOW}注意：以下数据删除后无法恢复${NC}"
+    [ -f "$INSTALL_DIR/2RTKserver.db" ] && \
+        echo "  · 2RTKserver.db  —— 管理员口令与全部连接配置"
+    [ -f "$INSTALL_DIR/calibration.db" ] && \
+        echo "  · calibration.db —— 基准站坐标（标定结果，丢了要回现场重测）"
     read -p "是否先备份到 /root/ 下? (y/n): " backup_confirm
     if [[ $backup_confirm == [yY] ]]; then
-        BACKUP_FILE="/root/2RTKserver-$(date +%F-%H%M).db"
-        cp "$INSTALL_DIR/2RTKserver.db" "$BACKUP_FILE" && echo "已备份到: $BACKUP_FILE"
+        STAMP="$(date +%F-%H%M)"
+        # 两个库都在 WAL 模式，最近的写入可能还在 -wal 里，必须连带 -wal/-shm 一起拷，
+        # 只拷主库文件等于丢掉最后一次修改。
+        if [ -f "$INSTALL_DIR/2RTKserver.db" ]; then
+            BACKUP_FILE="/root/2RTKserver-config-$STAMP.db"
+            cp "$INSTALL_DIR/2RTKserver.db" "$BACKUP_FILE" && echo "配置库已备份: $BACKUP_FILE"
+            for suffix in -wal -shm; do
+                [ -f "$INSTALL_DIR/2RTKserver.db$suffix" ] && \
+                    cp "$INSTALL_DIR/2RTKserver.db$suffix" "$BACKUP_FILE$suffix"
+            done
+        fi
+        if [ -f "$INSTALL_DIR/calibration.db" ]; then
+            CALIB_FILE="/root/2RTKserver-calibration-$STAMP.db"
+            cp "$INSTALL_DIR/calibration.db" "$CALIB_FILE" && echo "标定库已备份: $CALIB_FILE"
+            for suffix in -wal -shm; do
+                [ -f "$INSTALL_DIR/calibration.db$suffix" ] && \
+                    cp "$INSTALL_DIR/calibration.db$suffix" "$CALIB_FILE$suffix"
+            done
+        fi
+    else
+        echo -e "${RED}已选择不备份：标定坐标将永久丢失${NC}"
     fi
 fi
 
