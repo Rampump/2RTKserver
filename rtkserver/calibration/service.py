@@ -113,6 +113,10 @@ TERMINAL_STAGES = ('DONE', 'FAILED', 'ABORTED', 'INTERRUPTED')
 # 所以"播发值 == 配置值"本该精确相等，1 cm 已经是极宽松的门槛。
 COORD_MATCH_THRESHOLD = 0.01
 
+# 串口噪声告警阈值：噪声字节占接收字节的比例。
+# 正常 8N1 下偶发同步失败远低于 1%；超过 20% 基本就是波特率错或线材问题。
+NOISE_RATIO_WARN = 0.2
+
 # GGA 质量位（NMEA 0183 标准定义，基站模式下 NMEA 默认关闭，拿不到也不影响结论）
 _QUALITY_TEXT = {
     0: '无效', 1: '单点', 2: '差分', 3: 'PPS', 4: 'RTK 固定', 5: 'RTK 浮动',
@@ -182,6 +186,8 @@ class CalibrationService:
         self._task_id = ''
         self._started_at = ''
         self._finished_at = ''
+        # 当前阶段的进入时刻（页面阶段流水每行的时间戳用它，而不是任务开机时间）
+        self._stage_at = ''
         self._last_persist = 0.0
         self._persist_interval = 1.0
 
@@ -211,6 +217,7 @@ class CalibrationService:
             # 前端据此决定要不要在结果里显示"已自动改为 X"这类说明。
             'baud_explicit': bool(self._task.get('baud_explicit')),
             'started_at': self._started_at,
+            'stage_at': self._stage_at,
             'finished_at': self._finished_at,
             'lease': lease.snapshot() if lease is not None else None,
             # 上次被硬中断的详情（只有启动钩子置过 INTERRUPTED 才有值）。
@@ -244,6 +251,7 @@ class CalibrationService:
                 self._progress = STAGE_PROGRESS['PREPARE']
                 self._result = {}
                 self._started_at = _now_text()
+                self._stage_at = self._started_at
                 self._finished_at = ''
                 self._driver = None
                 self._writer = None
@@ -1005,6 +1013,12 @@ class CalibrationService:
         with self._lock:
             changed = stage != self._stage
             self._stage = stage
+            # 阶段进入时刻。页面上的阶段流水每行都要显示"这一步是什么时候开始的"，
+            # 原来那行取的是 `started_at`（整个任务的开机时间），于是整条时间线
+            # 全是同一秒——用户看不出卡在哪一步、卡了多久。真机上 2 分半的标定
+            # 日志 13 行全部写着 16:04:21。
+            if changed:
+                self._stage_at = _now_text()
             if message is not None:
                 self._message = str(message)
             if progress is not None:
@@ -1150,8 +1164,18 @@ class CalibrationService:
             'frames': channel.counters.get('frames', 0),
             'noise': channel.counters.get('noise', 0),
         })
-        if channel.counters.get('noise', 0) > channel.counters.get('lines', 0):
-            warn('丢字节数超过收到的行数：波特率可能不对，或串口线受干扰')
+        # 噪声判据：必须拿"噪声字节"比"接收字节"，不能比"行数"。
+        # 这里原来写的是 `noise > lines`，可 noise 计的是**字节**、lines 计的是
+        # **条数**，两种单位。基准站模式下串口上几乎全是 RTCM 二进制（帧长几百到
+        # 上千字节，且一帧顶几千个"行"），任何正常基站都会永久命中这条告警，
+        # 提示"波特率可能不对，或串口线受干扰"——而实际上一个字节都没丢。
+        # 真机上就是这么出现的：诊断结论明明写"配置坐标与播发坐标一致"，
+        # 下面却跟一条丢字节警告，自相矛盾。
+        noise = channel.counters.get('noise', 0)
+        rx_bytes = getattr(channel, 'rx_bytes', 0) or 0
+        if rx_bytes > 0 and noise / rx_bytes > NOISE_RATIO_WARN:
+            warn(f'噪声占接收字节 {noise * 100 // rx_bytes}%'
+                 f'（{noise}/{rx_bytes}）：波特率可能不对，或串口线受干扰')
         return report
 
     def _observe_1005(self, lease, seconds, report):

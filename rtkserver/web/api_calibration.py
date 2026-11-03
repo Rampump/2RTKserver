@@ -124,6 +124,7 @@ def _snapshot_payload(full=False):
         # "让后端按型号官方档位逐档试"，否则结果里"已自动改为 X"无处解释。
         'baud_explicit': bool(snap.get('baud_explicit')),
         'started_at': snap.get('started_at'),
+        'stage_at': snap.get('stage_at'),
         'finished_at': snap.get('finished_at'),
         'lease': snap.get('lease'),
         # 上次被硬中断的详情：页面据此显示警告横幅（方案 §14 #20）。

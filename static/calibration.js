@@ -915,12 +915,17 @@
         '：' + fmtNum(geo.lat, 8) + '°, ' + fmtNum(geo.lon, 8) + '°, ' +
         fmtNum(geo.height, 3) + ' m');
     }
-    // 1005 播发值 vs 写入值的偏差：这条是"链路通不通"的唯一硬证据
+    // 1005 播发值 vs 写入值的偏差：这条是"链路通不通"的唯一硬证据。
+    // 后端 `delta` 是一个对象 {dx,dy,dz,max_axis,norm}（单位 m），不是标量。
+    // 这里曾经直接 `Number(delta) * 100`，Number({...}) 恒为 NaN，页面上就显示
+    // 「1005 播发偏差：NaN cm」——明明结论是"一致"，却配一个 NaN，等于把唯一的
+    // 硬证据变成了噪声。取 max_axis（最大轴差），并在取不到时显示占位符。
     var broadcast = (summary && summary.broadcast) || (result && result.broadcast);
     var delta = (summary && summary.delta) || (result && result.delta);
     if (broadcast && broadcast.x !== undefined) {
-      var deltaText = (delta === null || delta === undefined) ? '—'
-        : (Number(delta) * 100).toFixed(2) + ' cm';
+      var axis = (delta && typeof delta === 'object') ? delta.max_axis : delta;
+      var axisNum = (axis === null || axis === undefined) ? NaN : Number(axis);
+      var deltaText = isFinite(axisNum) ? (axisNum * 100).toFixed(2) + ' cm' : '—';
       lines.push(t('cal.result.broadcast') + '：' + deltaText);
     }
     // 模块持久化的状态：用户据此判断"要不要断电重来"
@@ -1062,7 +1067,10 @@
     var isFail = snap.stage === 'FAILED' || snap.stage === 'ABORTED';
     li.className = isFail ? 'is-fail' : (snap.stage === 'DONE' ? 'is-ok' : '');
     var time = document.createElement('time');
-    time.textContent = (snap.started_at || '').split(' ').pop() || '';
+    // 用**本阶段的进入时刻**，不是整个任务的开机时刻。取 started_at 时，
+    // 一次 2 分半的标定里 13 行流水全写着同一个 16:04:21，用户根本看不出
+    // 卡在哪一步、每步花了多久——而这正是这个列表唯一的用途。
+    time.textContent = ((snap.stage_at || snap.started_at) || '').split(' ').pop() || '';
     li.appendChild(time);
     li.appendChild(document.createTextNode(
       stageLabel(snap.stage, snap.stage_text) + (snap.message ? ' · ' + snap.message : '')));
