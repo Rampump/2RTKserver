@@ -3600,14 +3600,16 @@ class TestBaudRecall(unittest.TestCase):
     def test_default_baud_is_tried_first(self):
         """候选表必须把 `DEFAULT_BAUD` 排第一，而不是最高档。
 
-        真机教训：纯降序让 921600 永远排第一，一块出厂跑 115200 的 LG290P
-        要错 3 档（每档 2 秒超时）才命中 —— 用户抱怨的"一档档试"从低往高
+        真机教训：纯降序让 921600 永远排第一，一块默认跑 460800 的 LG290P
+        要错 2 档（每档 2 秒超时）才命中 —— 用户抱怨的"一档档试"从低往高
         变成了从高往低，总等待一点没少。`DEFAULT_BAUD` 之前只声明、不参与
         排序，等于白写。
 
-        这里锁两件事：
-          1. 第一位是 `DEFAULT_BAUD`（押注手册示例 + 实测最常见的档位）；
-          2. 厂商档位一个都不能丢 —— 押错了还得靠它们兜。
+        这里锁三件事：
+          1. 第一位是 `DEFAULT_BAUD`（该型号自己的默认档）；
+          2. 厂商档位一个都不能丢 —— 押错了还得靠它们兜；
+          3. 每个型号的首选是它自己的常量，不是一张通用表
+             （LG290P=460800 / LC29H(BS)=115200，见下一个测试）。
         """
         from rtkserver.calibration.drivers.quectel_lg290p import LG290PDriver
 
@@ -3637,7 +3639,7 @@ class TestBaudRecall(unittest.TestCase):
 
         order = CalibrationService._baud_candidates(['lg290p'])
         self.assertEqual(order[0], LG290PDriver.DEFAULT_BAUD,
-                         '全新模块的第一档必须是 115200，不能是 921600')
+                         '全新模块的第一档必须是该型号自己的默认档，不能是 921600')
 
     def test_store_remembers_and_keeps_uart_baud(self):
         import shutil
@@ -3696,9 +3698,10 @@ class TestBaudRecall(unittest.TestCase):
         self.assertEqual(got[:2], [460800, 115200],
                          f'手填值必须最优先，记忆值紧跟其后：{got}')
 
-        # 没记忆时：DEFAULT_BAUD 打头（押注手册示例最常见的值），其余降序
+        # 没记忆时：该型号的 DEFAULT_BAUD 打头，其余降序
+        # （LG290P 的默认档是 460800，不是 115200 —— 见驱动里那段注释）
         plain = CalibrationService._baud_candidates(['lg290p'])
-        self.assertEqual(plain, [115200, 921600, 460800, 230400, 9600], plain)
+        self.assertEqual(plain, [460800, 921600, 230400, 115200, 9600], plain)
 
         # 记忆值本来就在厂商档位里时不能出现两次
         got = CalibrationService._baud_candidates(['lg290p'], remembered=921600)
@@ -3870,8 +3873,16 @@ class TestLc29hbsMissingCommands(unittest.TestCase):
         from rtkserver.calibration.drivers.quectel_lc29hbs import LC29HBSDriver
 
         class _StubChannel:
+            """按真实 `Channel` 的接口来：PAIR 设置命令走 write_line/read_line/absorb，
+            走 `send()` 的只有基类那条通用路径。
+
+            早先这个桩只实现了 `send()`，于是驱动里新加的 `$PAIR001` 应答路径
+            在测试里直接 AttributeError —— 等于"新逻辑一条都没被测到"。
+            """
+
             def __init__(self):
-                self.replies = list(replies)
+                self.queue = [line for status, line in replies
+                              if status != 'timeout' and line]
                 self.sent = []
                 self.cache = {}
                 self.counters = {'lines': 0, 'frames': 0, 'noise': 0}
@@ -3880,11 +3891,26 @@ class TestLc29hbsMissingCommands(unittest.TestCase):
                 self.frame_out = True
                 self.reply_aliases = {}
 
+            def write_line(self, body):
+                self.sent.append(body)
+
+            def read_line(self, timeout=None):
+                if not self.queue:
+                    return None
+                return self.queue.pop(0)
+
+            def absorb(self, line):
+                self.counters['lines'] += 1
+                if self.parser is not None:
+                    return self.parser(line)
+                return None
+
             def send(self, body, timeout=None, retries=None, interval=None):
                 self.sent.append(body)
-                if not self.replies:
+                if not self.queue:
                     return 'timeout', ''
-                return self.replies.pop(0)
+                line = self.queue.pop(0)
+                return ('error' if ',ERROR' in line else 'ok'), line
 
         channel = _StubChannel()
         return LC29HBSDriver(channel), channel
@@ -3974,6 +4000,522 @@ class TestLc29hbsMissingCommands(unittest.TestCase):
         ok, message, _data = driver.disable_survey_in(persist=False)
         self.assertTrue(ok, message)
         self.assertEqual(channel.sent, ['PQTMCFGSVIN,W,0,0,0,0,0,0'])
+
+
+class TestLc29hbsRealDevice(unittest.TestCase):
+    """LC29H(BS) 真机联调暴露的问题（2026-11-03，LC29HBSNR11A01S / CH340 / 115200）。
+
+    这一组全部来自真机：文档命令体本身是对的（16 条示例校验和逐条验过），
+    错的是驱动与流程层的接口、以及"设置类 PAIR 命令怎么收应答"。
+    """
+
+    def _driver(self, replies):
+        from rtkserver.calibration.drivers.quectel_lc29hbs import LC29HBSDriver
+
+        class _StubChannel:
+            def __init__(self):
+                self.queue = [line for status, line in replies
+                              if status != 'timeout' and line]
+                self.sent = []
+                self.cache = {}
+                self.counters = {'lines': 0, 'frames': 0, 'noise': 0}
+                self.parser = None
+                self.heads = ('$',)
+                self.frame_out = True
+                self.reply_aliases = {}
+
+            def write_line(self, body):
+                self.sent.append(body)
+
+            def read_line(self, timeout=None):
+                if not self.queue:
+                    return None
+                return self.queue.pop(0)
+
+            def absorb(self, line):
+                self.counters['lines'] += 1
+                if self.parser is not None:
+                    return self.parser(line)
+                return None
+
+            def send(self, body, timeout=None, retries=None, interval=None):
+                self.sent.append(body)
+                if not self.queue:
+                    return 'timeout', ''
+                line = self.queue.pop(0)
+                return ('error' if ',ERROR' in line else 'ok'), line
+
+        channel = _StubChannel()
+        return LC29HBSDriver(channel), channel
+
+    # ---------- ① 签名：流程层是按基类签名调的 ----------
+    def test_flow_layer_keyword_calls_never_raise_type_error(self):
+        """流程层按**基类签名**调驱动，任何型号都不许把参数收窄。
+
+        真机症状：`TypeError: LC29HBSDriver.set_mode() got an unexpected
+        keyword argument 'persist'` —— 写坐标和自收敛两条路都在 BASE_SETUP
+        阶段就炸掉，一条命令都没发出去。这类错误在单元测试里完全看不见
+        （没人按流程层的方式调），所以只能拿基类签名去套所有驱动。
+        """
+        import inspect
+        from rtkserver.calibration.drivers.base import BaseDriver
+        from rtkserver.calibration.drivers import driver_manager as dm
+
+        # 流程层真正带关键字调用的方法（`writer.py` / `lease.py`）
+        keyword_calls = {
+            'set_mode': {'persist': True, 'restart': False, 'verify': False},
+            'config_survey_in': {'count': 1, 'acc_limit': 1.0, 'distance': None,
+                                 'persist': False, 'restart': False, 'verify': False},
+            'set_fixed_ecef': {'x': 1.0, 'y': 2.0, 'z': 3.0,
+                               'persist': False, 'restart': False, 'verify': False},
+            'set_antenna_info': {'desc': 'ant', 'setup_id': 0, 'sn': '',
+                                 'persist': False},
+            'config_rtcm': {'msm_type': 4, 'persist': False},
+            'disable_survey_in': {'persist': False, 'restart': False},
+        }
+        dm.load_builtin_drivers()
+        self.assertTrue(dm._REGISTRY, '至少要有内置驱动')
+        for key, cls in sorted(dm._REGISTRY.items()):
+            for method, kwargs in keyword_calls.items():
+                func = getattr(cls, method, None)
+                base = getattr(BaseDriver, method)
+                if func is None or func is base:
+                    continue
+                signature = inspect.signature(func)
+                try:
+                    # bind_partial：位置参数由流程层另行传，这里只验关键字能不能收
+                    signature.bind_partial(object(), **kwargs)
+                except TypeError as exc:
+                    self.fail(f'{cls.__name__}.{method} 收不下流程层的调用 '
+                              f'({", ".join(kwargs)})：{exc}；'
+                              f'实际签名 {signature}')
+
+    # ---------- ② 设置类 PAIR 命令的应答是 $PAIR001 ----------
+    def test_pair_set_command_accepts_pair001_ack(self):
+        """`PAIR432,1` 只回 `$PAIR001,432,0`，驱动必须认这条应答。
+
+        真机实测：走通用 request() 时三条 PAIR 设置全部报"无应答（已重试）"，
+        而模块其实已经执行 —— 用户看到的是"配置配不上"。
+        """
+        driver, channel = self._driver([('ok', '$PAIR001,432,0*3E')])
+        ok, message, data = driver.config_rtcm(msm_type=7, persist=False)
+        self.assertTrue(ok, message)
+        self.assertEqual(channel.sent, ['PAIR432,1'], '一条命令只能发一次')
+        self.assertEqual(data['mode'], 1)
+        self.assertEqual(driver._last_pair['result'], 0)
+
+    def test_pair_ack_result_code_is_translated(self):
+        """结果码 4 = 参数错误，必须原样报出来，而不是"无应答"。"""
+        driver, _channel = self._driver([('ok', '$PAIR001,432,4*3A')])
+        ok, message, data = driver.config_rtcm(msm_type=4, persist=False)
+        self.assertFalse(ok)
+        self.assertIn('参数错误', message)
+        self.assertEqual(data['pair_result'], 4)
+
+    def test_pair_ack_with_other_command_id_is_ignored(self):
+        """别的命令的 ACK 不能当成本次应答（查询 433 时先来的是 ACK，不是结果）。"""
+        driver, channel = self._driver([('ok', '$PAIR001,433,0*3F')])
+        ok, message, data = driver.set_rtcm_output(mode=0)
+        self.assertFalse(ok)
+        self.assertIn('无应答', message)
+        self.assertEqual(channel.sent.count('PAIR432,0'), 1,
+                         '同一条设置只能发一次，不能重发（会重复写 NVM）')
+
+    def test_pair_set_uses_single_send(self):
+        """成功时不能重发：同一条设置重发会重复写 NVM（闪存寿命）。"""
+        driver, channel = self._driver([('ok', '$PAIR001,434,0*38')])
+        ok, message, _data = driver.set_message_rate('RTCM3-1005', 1)
+        self.assertTrue(ok, message)
+        self.assertEqual(channel.sent, ['PAIR434,1'])
+
+    # ---------- ③ 角色映射：SVIN 的 mode 是字符串 ----------
+    def test_role_mapping_reads_string_mode(self):
+        """`get_svin_config()` 返回的是 'fixed'/'survey_in'/'disabled'，不是 0/1/2。
+
+        拿字符串和整数比较永远不成立，`get_mode()` 会恒为 'unknown'：
+        真机上坐标明明已经写进模块，页面显示"模式未知"，VERIFY_MODE 必然判失败。
+        """
+        from rtkserver.calibration.drivers.quectel_lc29hbs import LC29HBSDriver
+
+        self.assertEqual(LC29HBSDriver._role_from_svin({'mode': 'fixed'}), 'base')
+        self.assertEqual(LC29HBSDriver._role_from_svin({'mode': 'survey_in'}), 'base',
+                         '自收敛中也是基站：此刻正在按均值播 1005')
+        self.assertEqual(LC29HBSDriver._role_from_svin({'mode': 'disabled'}), 'rover')
+        self.assertEqual(LC29HBSDriver._role_from_svin({'mode': 2}), 'base',
+                         '原始数字也要能认')
+
+        driver, _channel = self._driver([
+            ('ok', '$PQTMCFGSVIN,OK,2,0,0.0,-2001283.8896,5416711.8735,2699543.2568*5C')])
+        ok, message, data = driver.get_mode()
+        self.assertTrue(ok, message)
+        self.assertEqual(data['mode'], 'base')
+        self.assertEqual(data['svin_mode'], 'fixed', '原始 SVIN 模式要单独留一份')
+
+    # ---------- ④ info() 取值 ----------
+    def test_info_reports_rtcm_and_antenna_values(self):
+        """`info()` 的 rtcm_mode/ant_pnt 必须从 fields 取，不能读 `data['mode']`。"""
+        driver, _channel = self._driver([
+            ('ok', '$PQTMVERNO,LC29HBSNR11A01S,2023/02/13,10:14:06*27'),
+            ('ok', '$PQTMCFGSVIN,OK,2,0,0.0,-2001283.8896,5416711.8735,2699543.2568*5C'),
+            ('ok', '$PAIR433,0*22'),
+            ('ok', '$PAIR435,1*25'),
+        ])
+        ok, _message, data = driver.info()
+        self.assertTrue(ok)
+        self.assertEqual(data['rtcm_mode'], 0, 'PAIR433 的值在 fields[0]')
+        self.assertEqual(data['ant_pnt'], 1)
+        self.assertEqual(data['mode'], 'base')
+
+    # ---------- ⑤ 1005 走 PAIR434，不是"逐报文速率" ----------
+    def test_coord_msg_1005_maps_to_pair434(self):
+        """流程层用 `set_message_rate('RTCM3-1005', 1)` 表达"播坐标"。
+
+        本型号没有逐报文速率，只有 PAIR434 一个开关。驱动负责翻译，
+        并且 `fields` 要按 `[名字, 速率]` 的形状回（备份/还原都取 fields[1]）。
+        """
+        driver, channel = self._driver([('ok', '$PAIR001,434,0*38')])
+        ok, message, data = driver.set_message_rate('RTCM3-1005', 1)
+        self.assertTrue(ok, message)
+        self.assertEqual(channel.sent, ['PAIR434,1'])
+        self.assertEqual(data['rate'], 1)
+
+        driver, channel = self._driver([('ok', '$PAIR435,1*25')])
+        ok, _message, data = driver.get_message_rate('RTCM3-1005')
+        self.assertTrue(ok)
+        self.assertEqual(data['fields'], ['RTCM3-1005', '1'])
+        self.assertEqual(channel.sent, ['PAIR435'])
+
+    def test_coord_msg_1006_is_rejected(self):
+        """RTCM 输出表里只有 1005，1006 必须明确拒绝而不是静默不播。"""
+        driver, channel = self._driver([])
+        ok, message, _data = driver.set_message_rate('RTCM3-1006', 1)
+        self.assertFalse(ok)
+        self.assertIn('1005', message)
+        self.assertEqual(channel.sent, [])
+
+    # ---------- ⑥ 没有重启命令的型号 ----------
+    def test_driver_declares_no_restart_needed(self):
+        """文档里没有重启命令，而配置即时生效 —— 必须声明，否则标定必死。"""
+        from rtkserver.calibration.drivers.quectel_lc29hbs import LC29HBSDriver
+
+        self.assertFalse(LC29HBSDriver.RESTART_REQUIRED)
+        self.assertIn('没有 PQTMSRR', LC29HBSDriver(None).reboot()[1])
+
+    def test_restart_step_skips_when_not_required(self):
+        """`RESTART_REQUIRED = False` 时流程层跳过软重启，而不是判整个标定失败。"""
+        from rtkserver.calibration import writer as W
+
+        class _Driver:
+            RESTART_REQUIRED = False
+
+            def reboot(self):
+                raise AssertionError('不该调 reboot()')
+
+        writer = W.CoordinateWriter(_Driver(), channel=None)
+        writer._step_restart(None)            # 不抛异常 = 通过
+        self.assertTrue(writer.result['restart']['skipped'])
+        self.assertEqual(writer.result['steps'][-1]['stage'], 'RESTART')
+        self.assertTrue(writer.result['steps'][-1]['ok'])
+
+    def test_set_mode_base_is_a_noop_that_reports_truth(self):
+        """本型号没有模式命令：`set_mode('base')` 不许改 SVIN，只能如实说明。
+
+        照抄 LG290P 的"切基站 = 写 Mode=1"会把一台正在播固定坐标的模块
+        改成重新自收敛 —— 回滚路径（先还原坐标、再切模式）会因此把刚还原好的
+        坐标配置毁掉，而且播出去的 1005 还是旧均值。
+        """
+        fixed = ('ok', '$PQTMCFGSVIN,OK,2,0,0.0,-2001283.8896,5416711.8735,'
+                        '2699543.2568*5C')
+        driver, channel = self._driver([fixed])
+        ok, message, data = driver.set_mode('base', persist=True, restart=True, verify=True)
+        self.assertTrue(ok, message)
+        self.assertEqual(channel.sent, ['PQTMCFGSVIN,R'], '只许查询，不许下发')
+        self.assertTrue(data['noop'])
+
+        # 还没有坐标时：verify=True 必须说"还不是基站"，不能假装成功
+        driver, _channel = self._driver([
+            ('ok', '$PQTMCFGSVIN,OK,0,0,0,0,0,0*00')])
+        ok, message, data = driver.set_mode('base', persist=True, restart=False,
+                                            verify=True)
+        self.assertFalse(ok)
+        self.assertEqual(data['error'], 'base_needs_coords')
+        self.assertIn('写入固定坐标', message)
+
+    def test_survey_in_accepts_distance_and_reports_it_ignored(self):
+        """7 字段没有 `<Distance>`：接受但不下发，并如实标成 ignored。"""
+        driver, channel = self._driver([
+            ('ok', '$PQTMCFGSVIN,OK*70'),
+            ('ok', '$PQTMCFGSVIN,OK,1,3600,15.0,0.0,0.0,0.0*00')])
+        ok, message, data = driver.config_survey_in(3600, 15.0, 30.0,
+                                                    persist=False, restart=False,
+                                                    verify=True)
+        self.assertTrue(ok, message)
+        self.assertEqual(channel.sent, ['PQTMCFGSVIN,W,1,3600,15.0,0,0,0',
+                                        'PQTMCFGSVIN,R'])
+        self.assertEqual(data['ignored']['distance'], 30.0)
+
+
+class TestCrossModelIsolation(unittest.TestCase):
+    """一个型号的驱动改动，不许把另一个型号带歪。
+
+    用户 2026-11-03 在真机上明确要求过：不同模块的命令集、默认档、生效方式
+    都不一样，必须各自设计、不能混为一谈。这一组就是那条要求的机器可读版本：
+    凡是"为了某个型号方便"而写进共用层的假设（默认档、字段形状、能力位、
+    应答收取方式、是否重启），都会在这里报红。
+    """
+
+    # ---------- ① 波特率：每个型号一份，不许互相抄 ----------
+    def test_default_baud_is_per_model(self):
+        """LG290P=460800、LC29H(BS)=115200 —— 抄对方的值就白错一轮。"""
+        from rtkserver.calibration.drivers.quectel_lc29hbs import LC29HBSDriver
+        from rtkserver.calibration.drivers.quectel_lg290p import LG290PDriver
+
+        self.assertEqual(LG290PDriver.DEFAULT_BAUD, 460800,
+                         'LG290P 出厂配在 460800，写成 115200 会让新模块先错一轮')
+        self.assertEqual(LC29HBSDriver.DEFAULT_BAUD, 115200,
+                         'LC29H(BS) 文档 §2.3.8 明写「默认波特率为 115200 bps」')
+        # 真正被探测用的是 bauds()，不是常量本身，这里一并锁死
+        self.assertEqual(LG290PDriver(None).bauds()[0], 460800)
+        self.assertEqual(LC29HBSDriver(None).bauds()[0], 115200)
+
+    def test_baud_tables_do_not_borrow_each_other(self):
+        """各自的厂商档位表；兜底表必须同时覆盖两个派系。"""
+        from rtkserver.calibration.drivers.quectel_lc29hbs import LC29HBSDriver
+        from rtkserver.calibration.drivers.quectel_lg290p import LG290PDriver
+        from rtkserver.calibration.service import DETECT_BAUD_CANDIDATES
+
+        # 4800 / 3000000 是 LC29H(BS) 的档，LG290P 探它们纯属白等
+        self.assertNotIn(4800, LG290PDriver.BAUDS)
+        self.assertNotIn(3000000, LG290PDriver.BAUDS)
+        self.assertIn(3000000, LC29HBSDriver.BAUDS)
+
+        # 兜底表（完全不知道型号时用）：少一个派系就等于整条派系探不到
+        self.assertIn(115200, DETECT_BAUD_CANDIDATES)
+        self.assertIn(460800, DETECT_BAUD_CANDIDATES)
+
+    def test_probe_order_does_not_shrink_settable_set(self):
+        """`PROBE_BAUDS` 只影响"去试哪些"，`BAUDS` 仍是"能设置哪些"的全集。"""
+        from rtkserver.calibration.drivers.quectel_lc29hbs import LC29HBSDriver
+
+        # 3 Mbps 是 UART2 的默认档，本机走 UART1，不该进探测序列
+        self.assertIn(3000000, LC29HBSDriver.BAUDS)
+        self.assertNotIn(3000000, LC29HBSDriver.PROBE_BAUDS)
+        # 但它仍然是 `PAIR864` 的合法参数，写 UART2 时要用
+        self.assertEqual(LC29HBSDriver(None).body('set_baud', baud=3000000),
+                         'PAIR864,0,0,3000000',
+                         '探测顺序收窄不许影响"能不能设置"')
+
+    def test_auto_detect_keeps_both_camps_at_the_front(self):
+        """不知道型号时，两派的默认档必须都在队首两位。
+
+        整段拼接会让注册得早的型号独占队首：LG290P 的 460800 会被
+        LC29H(BS) 的 3000000 / 921600 压在后面，插一块 LG290P 仍要错三轮。
+        """
+        from rtkserver.calibration.service import CalibrationService
+
+        order = CalibrationService._baud_candidates(None)
+        self.assertEqual(set(order[:2]), {115200, 460800}, order[:4])
+
+    def test_blank_baud_follows_selected_module(self):
+        """留空 + 选了型号 → 从**该型号的**默认档开始，而不是全局 115200。
+
+        这是"默认档排第一"真正落地的地方：识别时首试档由 `_resolve_baud` 决定，
+        它不看型号的话，选了 LG290P 仍会先白等一轮 115200 超时才轮到 460800。
+        """
+        from rtkserver.calibration.service import DEFAULT_BAUD, CalibrationService
+
+        self.assertEqual(CalibrationService._resolve_baud(None, 'lg290p'),
+                         (460800, False, ''))
+        self.assertEqual(CalibrationService._resolve_baud('', 'lc29hbs'),
+                         (115200, False, ''))
+        # 没选型号 = 不押注，仍用全局兜底
+        self.assertEqual(CalibrationService._resolve_baud(None)[0], int(DEFAULT_BAUD))
+        # 手填值永远优先，且必须标成 explicit（否则失败后会按自动模式换档）
+        self.assertEqual(CalibrationService._resolve_baud(115200, 'lg290p'),
+                         (115200, True, ''))
+
+    # ---------- ② 运行时状态：不共享对象 ----------
+    def test_runtime_caps_are_per_instance(self):
+        """`probe_caps()` 会按真实应答改写能力位，共享一份字典就是灾难。"""
+        from rtkserver.calibration.drivers.quectel_lc29hbs import LC29HBSDriver
+        from rtkserver.calibration.drivers.quectel_lg290p import LG290PDriver
+
+        lc, lg = LC29HBSDriver(None), LG290PDriver(None)
+        self.assertIsNot(lc.runtime_caps, lg.runtime_caps)
+        self.assertIsNot(LC29HBSDriver.CAPS, LG290PDriver.CAPS)
+
+        before = dict(lg.runtime_caps)
+        lc.runtime_caps['svin'] = not lc.runtime_caps.get('svin')
+        lc.runtime_caps['ant_info'] = True
+        self.assertEqual(lg.runtime_caps, before, '改 A 的能力位不许影响 B')
+        self.assertTrue(LC29HBSDriver.CAPS.get('svin'),
+                        '类上的 CAPS 也不许被实例改写（否则下次新建的实例就带错能力）')
+
+    def test_pair_ack_override_stays_on_its_own_class(self):
+        """LC29H(BS) 覆写 `request()` 收 `$PAIR001` —— 只对它自己生效。"""
+        from rtkserver.calibration.drivers.base import BaseDriver
+        from rtkserver.calibration.drivers.quectel_lc29hbs import LC29HBSDriver
+        from rtkserver.calibration.drivers.quectel_lg290p import LG290PDriver
+
+        self.assertIsNot(LC29HBSDriver.request, BaseDriver.request)
+        self.assertIs(LG290PDriver.request, BaseDriver.request,
+                      'LG290P 的应答名就是命令名，不需要也不许套用 PAIR001 逻辑')
+
+    # ---------- ③ 流程层：默认值兜底，别的型号行为不变 ----------
+    def test_lg290p_still_goes_through_restart(self):
+        """`RESTART_REQUIRED` 默认 True —— LG290P 必须照旧重启。"""
+        from rtkserver.calibration import writer as W
+
+        class _Driver:
+            RESTART_REQUIRED = True
+
+            def __init__(self):
+                self.calls = 0
+
+            def reboot(self):
+                self.calls += 1
+                return True, 'PGK 已发出', {'boot': 'PQTMVER'}
+
+        driver = _Driver()
+        writer = W.CoordinateWriter(driver, channel=None)
+        writer._step_restart(None)
+        self.assertEqual(driver.calls, 1,
+                         'LG290P 不能因为 LC29H(BS) 不用重启就跟着跳过')
+        self.assertNotIn('skipped', writer.result.get('restart') or {})
+        self.assertEqual(writer.result['steps'][-1]['stage'], 'RESTART')
+
+    def test_lg290p_rtcm_readback_keeps_seven_fields(self):
+        """LG290P 回读仍是七字段、没有 `msm_type`，流程层继续用 `fields[0]`。"""
+        from rtkserver.calibration.drivers.quectel_lg290p import LG290PDriver
+
+        class _Chan:
+            def __init__(self):
+                self.sent = []
+
+            def send(self, body, timeout=None, retries=None, interval=None):
+                self.sent.append(body)
+                return 'ok', '$PQTMCFGRTCM,OK,4,0,-90,07,06,1,0*2B'
+
+        channel = _Chan()
+        driver = LG290PDriver(channel)
+        ok, _message, data = driver.read_rtcm_config()
+        self.assertTrue(ok)
+        self.assertEqual(data['fields'][0], '4')
+        self.assertNotIn('msm_type', data,
+                         'LG290P 不翻译 msm_type，流程层必须继续吃 fields[0]')
+        self.assertEqual(channel.sent, ['PQTMCFGRTCM,R'])
+
+    def test_lg290p_still_fans_out_constellations(self):
+        """空星座表是 LC29H(BS) 的声明，不许变成 LG290P 的默认。"""
+        from rtkserver.calibration.drivers.quectel_lc29hbs import LC29HBSDriver
+        from rtkserver.calibration.drivers.quectel_lg290p import LG290PDriver
+
+        self.assertIsNotNone(LG290PDriver.MSM_CONSTELLATIONS,
+                             'None 会退化成只开 107X（2026-11-02 真机踩过）')
+        self.assertGreaterEqual(len(LG290PDriver.MSM_CONSTELLATIONS), 2,
+                                'LG290P 要多星座逐条下发，不能只开一路')
+        self.assertEqual(LC29HBSDriver.MSM_CONSTELLATIONS, (),
+                         'LC29H(BS) 只有一个全局开关，空表是"不逐星座下发"')
+
+    # ---------- ④ 命令集：两张表互不重叠 ----------
+    def test_command_tables_are_separate(self):
+        """谁的专有命令就只留在谁的表里。"""
+        from rtkserver.calibration.drivers.quectel_lc29hbs import LC29HBSDriver
+        from rtkserver.calibration.drivers.quectel_lg290p import LG290PDriver
+
+        self.assertIsNot(LG290PDriver.CMD, LC29HBSDriver.CMD)
+
+        lc_bodies = ' '.join(LC29HBSDriver.CMD.values())
+        for name in ('PQTMCFGRCVRMODE', 'PQTMCFGRTCM', 'PQTMSRR',
+                     'PQTMSN', 'PQTMCFGUART', 'PQTMCFGFIXRATE'):
+            self.assertNotIn(name, lc_bodies,
+                             f'LC29H(BS) 的文档里没有 {name}，不许从 LG290P 照抄')
+
+        lg_bodies = ' '.join(LG290PDriver.CMD.values())
+        for name in ('PAIR432', 'PAIR433', 'PAIR434', 'PAIR864'):
+            self.assertNotIn(name, lg_bodies,
+                             f'LG290P 用 PQTMCFGRTCM/PQTMCFGUART，不是 {name}')
+
+    def test_resolve_baud_callers_actually_have_a_module(self):
+        """`_resolve_baud(baud, module)` 的调用点，所在函数必须真有 `module` 变量。
+
+        照着真踩的坑写的：批量把 `_resolve_baud(baud)` 改成 `(baud, module)` 时，
+        `start_restore()` 根本没有 `module` 参数 —— 它只有在用户真的点「一键还原」
+        并且波特率留空时才会 NameError，单元测试从来没走过那条路。
+        用 AST 静态查，比"记得补测试"可靠。
+        """
+        import ast
+
+        path = os.path.join(REPO_ROOT, 'rtkserver', 'calibration', 'service.py')
+        with io.open(path, encoding='utf-8') as handle:
+            tree = ast.parse(handle.read())
+
+        checked = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            params = {a.arg for a in node.args.args} | {
+                a.arg for a in node.args.kwonlyargs}
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                func = call.func
+                if not (isinstance(func, ast.Attribute)
+                        and func.attr == '_resolve_baud'):
+                    continue
+                self.assertGreaterEqual(len(call.args), 2,
+                                        f'{node.name}() 调用 _resolve_baud 没传型号')
+                arg = call.args[1]
+                if isinstance(arg, ast.Name):
+                    checked += 1
+                    self.assertIn(arg.id, params,
+                                  f'{node.name}() 里用了 {arg.id}，但它不是参数')
+        self.assertGreater(checked, 0, '一个调用点都没找到，这条断言已经失效了')
+
+    def test_frontend_checks_against_settable_set(self):
+        """前端"手填值合不合法"必须查 `set_bauds`（可设置全集），不是探测序列。
+
+        探测序列里没有 LC29H(BS) 的 3000000（UART2 档），拿它做校验会把一个
+        合法输入判成"不在官方档位"，用户只能被迫改成一个"看起来合法"的值。
+        """
+        with io.open(os.path.join(REPO_ROOT, 'static', 'calibration.js'),
+                     encoding='utf-8') as handle:
+            src = handle.read()
+
+        self.assertIn('function currentModuleLegalBauds()', src)
+        self.assertIn('set_bauds', src)
+        # offlist 提示前那几行必须用全集表
+        start = src.index('cal.baud.offlist')
+        block = src[start - 300:start]
+        self.assertIn('allowed', block,
+                      'offlist 校验要用 currentModuleLegalBauds()，不能用探测序列')
+
+
+class TestWriterUsesNormalizedContracts(unittest.TestCase):
+    """流程层不许只看"某个型号才有"的字段（真机联调时在 MSM 回读处炸掉）。"""
+
+    def _writer_source(self):
+        with io.open(os.path.join(REPO_ROOT, 'rtkserver', 'calibration', 'writer.py'),
+                     encoding='utf-8') as handle:
+            return handle.read()
+
+    def test_msm_readback_prefers_msm_type(self):
+        """LC29H(BS) 的 read_rtcm_config 返回空 fields，只能靠 msm_type 比对。"""
+        src = self._writer_source()
+        start = src.index("ok2, message2, readback = self.driver.read_rtcm_config()")
+        block = src[start:start + 1200]
+        self.assertIn("readback.get('msm_type')", block,
+                      '必须优先用驱动翻译好的 msm_type')
+        self.assertNotIn("if not fields or _to_int(fields[0]) != msm", block,
+                         '只看 fields[0] 会让"没有七字段"的型号永远校验不过')
+
+    def test_empty_constellation_list_means_global_switch(self):
+        """`MSM_CONSTELLATIONS = ()` 是"本型号只有一个全局开关"，不能用 `or` 兜掉。"""
+        src = self._writer_source()
+        start = src.index("constellations = getattr(self.driver, 'MSM_CONSTELLATIONS'")
+        block = src[start:start + 260]
+        self.assertIn('is None', block)
+        self.assertNotIn("or ('RTCM3-107X',)", block)
 
 
 class TestMeasureOnlyRequiresRover(unittest.TestCase):
@@ -4176,6 +4718,298 @@ class TestPortScanInlineFeedback(unittest.TestCase):
         self.assertIn("'ok': not error", block,
                       '枚举失败与"没有设备"必须能分开')
         self.assertIn("'count': len(items)", block)
+
+
+class TestSchemaMigrationSelfHeal(unittest.TestCase):
+    """库迁移必须能从中断处自愈。
+
+    SQLite 里 DDL 不受 Python 隐式事务保护（sqlite3 只在 DML 前开事务，
+    `ALTER TABLE` 是立即提交的）。所以"迁移跑到一半掉电"会留下
+    「列已经加上、`PRAGMA user_version` 还停在旧值」的半成品库。
+    如果迁移不是幂等的，下次启动重跑同一步就会撞 `duplicate column name`，
+    `init_db()` 抛异常，这台设备的标定库**永久打不开** —— 数据还在，
+    但页面上的标定、历史、备份全部失效，且没有任何界面能修。
+    """
+
+    def setUp(self):
+        import sqlite3
+        import tempfile
+        from rtkserver.calibration import store
+        self.store = store
+        self.sqlite3 = sqlite3
+        self._orig = store.CALIBRATION_DB
+        self._tmp = tempfile.mkdtemp(prefix='2rtk-migrate-')
+        self.db = os.path.join(self._tmp, 'calibration.db')
+        store.CALIBRATION_DB = self.db
+
+    def tearDown(self):
+        self.store.CALIBRATION_DB = self._orig
+
+    def _make_v1_db(self, records=1):
+        """造一个真的 v1 库：只有基础表 + 历史记录，版本号停在 1。"""
+        conn = self.sqlite3.connect(self.db)
+        for ddl in self.store._DDL_V1:
+            conn.execute(ddl)
+        for i in range(records):
+            conn.execute(
+                'INSERT INTO calibration_records '
+                '(module_sn, module_model, method, ecef_x, ecef_y, ecef_z, '
+                ' lat, lon, height, created_at) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (f'SN{i:03d}', 'lg290p', 'cors', 1.0, 2.0, 3.0,
+                 30.5, 114.3, 50.0, f'2026-11-0{i + 1} 10:00:00'))
+        conn.execute('PRAGMA user_version = 1')
+        conn.commit()
+        conn.close()
+
+    def _cols(self):
+        conn = self.sqlite3.connect(self.db)
+        try:
+            return [r[1] for r in conn.execute('PRAGMA table_info(calibration_records)')]
+        finally:
+            conn.close()
+
+    def _version(self):
+        conn = self.sqlite3.connect(self.db)
+        try:
+            return conn.execute('PRAGMA user_version').fetchone()[0]
+        finally:
+            conn.close()
+
+    def _count(self):
+        conn = self.sqlite3.connect(self.db)
+        try:
+            return conn.execute('SELECT COUNT(*) FROM calibration_records').fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_clean_v1_upgrades_to_current(self):
+        self._make_v1_db()
+        self.store.init_db()
+        self.assertEqual(self._version(), self.store.SCHEMA_VERSION)
+        self.assertEqual(self._count(), 1, '升级不能丢掉历史记录')
+
+    def test_half_applied_migration_recovers(self):
+        """半成品库（v2 只加了 4 列、版本号没动）必须能自己走完。"""
+        self._make_v1_db()
+        conn = self.sqlite3.connect(self.db)
+        for ddl in self.store._DDL_V2[:4]:
+            conn.execute(ddl)          # 模拟掉电前已提交的那几条
+        conn.commit()
+        conn.close()
+
+        self.store.init_db()           # 这里是原来的崩溃点
+        self.assertEqual(self._version(), self.store.SCHEMA_VERSION)
+        self.assertEqual(self._count(), 1, '自愈过程不能丢数据')
+        cols = self._cols()
+        for need in ('apc_x', 'nvm_state', 'task_id', 'arp_x',
+                     'gga_guard_used', 'kalman_std_e', 'svin_valid'):
+            self.assertIn(need, cols, f'自愈后仍缺列 {need}')
+
+    def test_init_db_is_idempotent(self):
+        self._make_v1_db()
+        for _ in range(3):
+            self.store.init_db()
+        self.assertEqual(self._version(), self.store.SCHEMA_VERSION)
+        self.assertEqual(self._count(), 1)
+
+    def test_downgrade_does_not_destroy_data(self):
+        """用户先跑新版本又回退：只告警，不重建、不删列。"""
+        self._make_v1_db()
+        self.store.init_db()
+        conn = self.sqlite3.connect(self.db)
+        conn.execute('PRAGMA user_version = 99')
+        conn.commit()
+        conn.close()
+
+        self.store.init_db()                     # 不该抛
+        self.assertEqual(self._version(), 99, '不能把新版本号改小')
+        self.assertEqual(self._count(), 1, '回退场景下绝不能丢数据')
+
+    def test_migration_statements_tolerate_existing_columns(self):
+        """`_exec_ddl` 对"列已存在"和"表已存在"都必须静默跳过。"""
+        conn = self.sqlite3.connect(self.db)
+        try:
+            conn.execute('CREATE TABLE t_demo (a INTEGER)')
+            conn.commit()
+            self.store._exec_ddl(conn, 'ALTER TABLE t_demo ADD COLUMN b INTEGER')
+            self.store._exec_ddl(conn, 'ALTER TABLE t_demo ADD COLUMN b INTEGER')  # 再来一次
+            self.store._exec_ddl(conn, 'CREATE TABLE IF NOT EXISTS t_demo (a INTEGER)')
+            cols = [r[1] for r in conn.execute('PRAGMA table_info(t_demo)')]
+            self.assertEqual(cols, ['a', 'b'])
+        finally:
+            conn.close()
+
+    def test_real_errors_still_raise(self):
+        """不能把所有 OperationalError 都吞掉，否则真错误会被静默掩盖。"""
+        conn = self.sqlite3.connect(self.db)
+        try:
+            with self.assertRaises(self.sqlite3.OperationalError):
+                self.store._exec_ddl(conn, 'ALTER TABLE no_such_table ADD COLUMN c INTEGER')
+        finally:
+            conn.close()
+
+
+class TestManualHeightRequired(unittest.TestCase):
+    """手动写坐标时高程是必填，不能静默按 0（海平面）处理。
+
+    用户手上有经纬度、但不知道椭球高是很常见的（CORS 成果表常常只给平面位置）。
+    旧行为是三处都补 0：前端 `parseFloat(...) || 0`、接口 `body.get('height') or 0.0`、
+    换算 `float(height or 0.0)`。结果是写进模块的 ECEF 落在椭球面上，
+    内陆站整体低几十米；而 1005 校验查不出来 —— 它只核对"写入 == 播发"，
+    两个值错得一模一样。必须让用户补这个数。
+    """
+
+    def _read(self, *parts):
+        with open(os.path.join(REPO_ROOT, *parts), encoding='utf-8') as handle:
+            return handle.read()
+
+    def test_conversion_rejects_missing_height(self):
+        from rtkserver.calibration.writer import _ecef_from_geodetic
+        for missing in (None, ''):
+            with self.assertRaises(ValueError) as ctx:
+                _ecef_from_geodetic(30.5, 114.3, missing)
+            self.assertIn('高程', str(ctx.exception), '错误信息要说清楚缺什么')
+
+    def test_conversion_rejects_nan_height(self):
+        from rtkserver.calibration.writer import _ecef_from_geodetic
+        with self.assertRaises(ValueError):
+            _ecef_from_geodetic(30.5, 114.3, float('nan'))
+
+    def test_conversion_rejects_non_numeric_height(self):
+        from rtkserver.calibration.writer import _ecef_from_geodetic
+        with self.assertRaises(ValueError) as ctx:
+            _ecef_from_geodetic(30.5, 114.3, 'xyz')
+        # 不能把 Python 的原始报错原样吐给用户
+        self.assertNotIn('could not convert', str(ctx.exception))
+
+    def test_explicit_zero_height_is_still_accepted(self):
+        """显式写 0 是"我说了在海平面"，这个意图要尊重；区别在于"没说"。"""
+        from rtkserver.calibration.writer import _ecef_from_geodetic
+        x, y, z = _ecef_from_geodetic(30.5, 114.3, 0)
+        self.assertAlmostEqual(x, -2263466.1599, delta=0.01)
+
+    def test_plan_build_requires_height(self):
+        from rtkserver.calibration.writer import WritePlan
+        with self.assertRaises(ValueError):
+            WritePlan.build(lat=30.5, lon=114.3)          # 不传 height
+        plan = WritePlan.build(lat=30.5, lon=114.3, height=50)
+        self.assertIsNotNone(plan.arp)
+
+    def test_api_rejects_lat_lon_without_height(self):
+        from rtkserver.web.app import create_app
+        app = create_app()
+        client = app.test_client()
+        with client.session_transaction() as sess:
+            sess['user'] = 'admin'
+            sess['logged_in'] = True
+        for body in ({'method': 'manual', 'port': '/dev/null',
+                      'lat': 30.5, 'lon': 114.3},
+                     {'method': 'manual', 'port': '/dev/null',
+                      'lat': 30.5, 'lon': 114.3, 'height': None},
+                     {'method': 'manual', 'port': '/dev/null',
+                      'lat': 30.5, 'lon': 114.3, 'height': ''}):
+            r = client.post('/api/calibration/start', json=body)
+            self.assertEqual(r.status_code, 400, body)
+            self.assertIn('高程', r.get_json().get('error') or '', body)
+
+    def test_store_does_not_fabricate_ecef_without_height(self):
+        """落库时高度未知就不要造 ECEF —— 这条记录会被当成"可复用的权威坐标"。"""
+        import tempfile
+        from rtkserver.calibration import store
+        orig = store.CALIBRATION_DB
+        try:
+            store.CALIBRATION_DB = os.path.join(
+                tempfile.mkdtemp(prefix='2rtk-h-'), 'c.db')
+            store.init_db()
+            store.insert_record({'module_sn': 'H1', 'method': 'manual',
+                                 'lat': 30.5, 'lon': 114.3})
+            row = store.list_records(limit=1)[0]
+            self.assertIsNone(row['ecef_x'],
+                              '没高程就不能反算 ECEF（h=0 会让整站低几十米）')
+            self.assertIsNone(row['height'])
+        finally:
+            store.CALIBRATION_DB = orig
+
+    def test_consistent_pair_without_height_is_not_flagged(self):
+        """经纬度与 ECEF 本来一致、只是没填高程时，不该报"不一致"。"""
+        import logging
+        import tempfile
+        from rtkserver.calibration import store
+        from rtkserver.calibration.geo import geodetic_to_ecef
+        orig = store.CALIBRATION_DB
+        try:
+            store.CALIBRATION_DB = os.path.join(
+                tempfile.mkdtemp(prefix='2rtk-h2-'), 'c.db')
+            store.init_db()
+            x, y, z = geodetic_to_ecef(30.5, 114.3, 50.0)
+
+            caught = []
+
+            class _Grab(logging.Handler):
+                def emit(self, record):
+                    caught.append(record.getMessage())
+
+            handler = _Grab(level=logging.WARNING)
+            root = logging.getLogger()
+            root.addHandler(handler)
+            try:
+                store.insert_record({'module_sn': 'H2', 'method': 'manual',
+                                     'lat': 30.5, 'lon': 114.3,
+                                     'ecef_x': x, 'ecef_y': y, 'ecef_z': z})
+            finally:
+                root.removeHandler(handler)
+
+            self.assertFalse([m for m in caught if '不一致' in m],
+                             '一组一致的数据不该被判成冲突（h=0 反算会得出假偏差）')
+            row = store.list_records(limit=1)[0]
+            self.assertAlmostEqual(row['height'], 50.0, delta=0.01,
+                                   msg='高度应由 ECEF 反算补上')
+        finally:
+            store.CALIBRATION_DB = orig
+
+    def test_frontend_does_not_coalesce_height_to_zero(self):
+        js = self._read('static', 'calibration.js')
+        self.assertNotIn("parseFloat($('cal-h').value) || 0", js,
+                         "空高程不能变成 0：0 是海平面，不是「没填」")
+        self.assertIn('cal.err.need_height', js, '前端要在提交前就拦住')
+
+    def test_error_message_is_translated(self):
+        i18n = self._read('static', 'i18n.js')
+        self.assertEqual(i18n.count("'cal.err.need_height'"), 2,
+                         '中英文各要一条')
+
+    def test_reuse_skips_records_without_coordinate(self):
+        """「复用历史坐标」只能挑带完整 ECEF 的那条。
+
+        现在允许落"只有经纬度、没有高程"的记录（不反算 ECEF）。如果复用
+        直接拿最近一条，用户点完会收到"请填写 ECEF 或经纬高" —— 库里明明
+        有别的可用记录，看起来就像按钮坏了。
+        """
+        import tempfile
+        from rtkserver.calibration import store
+        orig = store.CALIBRATION_DB
+        try:
+            store.CALIBRATION_DB = os.path.join(
+                tempfile.mkdtemp(prefix='2rtk-reuse-'), 'c.db')
+            store.init_db()
+            # 先存一条完整的
+            store.insert_record({'module_sn': 'R1', 'method': 'cors',
+                                 'ecef_x': -2263466.16, 'ecef_y': 5013021.86,
+                                 'ecef_z': 3218254.55,
+                                 'created_at': '2026-11-01 10:00:00'})
+            # 再存一条没有 ECEF 的（时间更新，会排在前面）
+            store.insert_record({'module_sn': 'R2', 'method': 'manual',
+                                 'lat': 30.5, 'lon': 114.3,
+                                 'created_at': '2026-11-02 10:00:00'})
+            self.assertEqual(store.list_records(limit=1)[0]['module_sn'], 'R2',
+                             '前提：列表最近一条确实是没有坐标的那条')
+            pick = store.get_latest_with_coord()
+            self.assertIsNotNone(pick)
+            self.assertEqual(pick['module_sn'], 'R1',
+                             '复用必须跳过没有 ECEF 的记录')
+        finally:
+            store.CALIBRATION_DB = orig
 
 
 if __name__ == '__main__':

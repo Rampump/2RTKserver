@@ -97,9 +97,11 @@ def list_supported_modules():
           'all':         [ ... ]
         }
     每项：id / name / match_prefix / dual_mode / caps / command_count /
-          bauds / default_baud / baud_cmd
-    `bauds` 是该型号厂商文档写明的波特率档位，`default_baud` 打头、其余降序；
-    前端据此给候选，用户仍可手动输入任意值 —— `bauds` 只影响自动探测顺序与非法值提示。
+          bauds / set_bauds / default_baud / baud_cmd
+    `bauds` 是**自动探测顺序**：`default_baud` 打头、其余降序；
+    `set_bauds` 是**合法取值全集**（降序），两者可能不同 ——
+    LC29H(BS) 的 3000000 是 UART2 的档，不进探测序列但仍可手动设置。
+    前端用 `bauds[0]` 做"优先试哪一档"的提示，用 `set_bauds` 判手填值合不合法。
     """
     load_builtin_drivers()
     dual, single = [], []
@@ -119,6 +121,13 @@ def list_supported_modules():
             'caps': dict(getattr(driver_class, 'CAPS', {}) or {}),
             'command_count': len(getattr(driver_class, 'CMD', {}) or {}),
             'bauds': list(probe.bauds()),
+            # 合法取值全集（降序），和上面的"探测顺序"分开：
+            # `bauds` 是"现在可能停在哪一档"（首项=默认档，供提示与自动探测），
+            # `set_bauds` 是"能设置成哪些值"（`PAIR864`/`PQTMCFGUART` 的合法参数）。
+            # 两者在 LC29H(BS) 上确实不同：3000000 是 UART2 的档，不进探测序列，
+            # 但手填 3000000 仍然是合法的，不能在前端被判成"不在官方档位"。
+            'set_bauds': sorted({int(v) for v in (getattr(driver_class, 'BAUDS', ()) or ())
+                                 if str(v).lstrip('-').isdigit()}, reverse=True),
             'default_baud': int(getattr(driver_class, 'DEFAULT_BAUD', 115200)),
             'baud_cmd': getattr(driver_class, 'BAUD_CMD_KEY', ''),
         }
@@ -408,8 +417,17 @@ def _selftest():
     lg = [i for i in modules['all'] if i['id'] == 'lg290p'][0]
     bs = [i for i in modules['all'] if i['id'] == 'lc29hbs'][0]
     n4 = [i for i in modules['all'] if i['id'] == 'um980'][0]
+    # 默认档是**每个型号自己的常量**，不是一张通用表：
+    # LG290P 出厂 460800、LC29H(BS) 文档明写 115200。抄错一边就白错一轮超时。
+    assert lg['default_baud'] == 460800, lg
+    assert bs['default_baud'] == 115200, bs
+    assert n4['default_baud'] == 115200, n4
+
     # 清单必须各不相同 —— 否则"每型号存一份"就没意义了
-    assert 3000000 in bs['bauds'] and 3000000 not in lg['bauds'], (lg['bauds'], bs['bauds'])
+    # 3000000 是 LC29H(BS) 的 UART2 档：**可设置**，但不进探测序列（本机走 UART1）。
+    # 这两件事必须分开断言，混成一条会把"能不能设"和"要不要试"搅在一起。
+    assert 3000000 in bs['set_bauds'] and 3000000 not in bs['bauds'], bs
+    assert 3000000 not in lg['set_bauds'] and 3000000 not in lg['bauds'], lg
     assert 19200 in n4['bauds'] and 19200 not in lg['bauds'], (lg['bauds'], n4['bauds'])
     assert 4800 in bs['bauds'] and 4800 not in n4['bauds'], (n4['bauds'], bs['bauds'])
     # 同一份手册拆出来的几个型号共用波特率表（表 4-4 对 COM1/2/3 一致），
@@ -604,12 +622,20 @@ def _selftest():
     got = CalibrationService._baud_candidates(['lg290p'], current=115200)
     assert got[0] == 115200 and 4800 not in got, got
     got = CalibrationService._baud_candidates(['lc29hbs'], current=None)
-    assert 3000000 in got and 4800 in got, 'LC29H(BS) 的 4800/3000000 全局限表里没有'
+    assert 4800 in got, 'LC29H(BS) 的 4800 在探测序列里，全局限表里没有'
+    # 3000000 是 UART2 的默认档：**可设置**，但不进 UART1 的探测序列（探它永远落空，
+    # 而且 USB 转串口在 3 Mbps 下容易丢字节，探到了也不能用）。
+    assert 3000000 not in got, got
+    assert 3000000 in get_driver_by_id('lc29hbs').BAUDS, 'UART2 仍需能写成 3 Mbps'
     got = CalibrationService._baud_candidates(None, current=19200)
     assert got[0] == 19200 and len(got) == len(set(got)), got
     # 没手填、没记忆时，第一档必须是该型号的默认档 —— 否则全新模块白等超时
+    lg_default = int(get_driver_by_id('lg290p').DEFAULT_BAUD)
+    bs_default = int(get_driver_by_id('lc29hbs').DEFAULT_BAUD)
     got = CalibrationService._baud_candidates(['lg290p'])
-    assert got[0] == 115200, f'lg290p 首个候选应为默认档 115200：{got}'
+    assert got[0] == lg_default, f'lg290p 首个候选应为默认档 {lg_default}：{got}'
+    assert got[0] == 460800, f'LG290P 出厂配在 460800：{got}'
+    assert bs_default == 115200, f'LC29H(BS) 文档 §2.3.8 默认 115200：{bs_default}'
     print('[14] 波特率候选合流 OK  手填值置顶 + 型号默认档打头 + 自动探测并集')
 
     # 15) `baud_explicit` 必须按"用户填没填"判定，不能按"值等不等于默认"。
@@ -622,6 +648,9 @@ def _selftest():
     assert r('  ')[0] == int(DEFAULT_BAUD), r('  ')
     assert r(115200) == (115200, True, ''), r(115200)
     assert r('460800') == (460800, True, ''), r('460800')
+    # 留空时首试档跟型号走：选了 LG290P 就从 460800 开始，不再统一落 115200
+    assert r(None, 'lg290p') == (lg_default, False, ''), r(None, 'lg290p')
+    assert r(None, 'lc29hbs') == (bs_default, False, ''), r(None, 'lc29hbs')
     assert r(True)[0] is None, 'True 会被 int() 当成 1，必须拒掉'
     assert r(0)[0] is None and r('abc')[0] is None, '0 与非数字都必须拒掉'
     print('[15] 波特率显式标记 OK  留空=自动(可换档)，手填 115200 也算"用户指定"')
@@ -632,7 +661,9 @@ def _selftest():
 
 # ==================== 真机探测入口 ====================
 # 全局兜底候选表：只在**还不知道是哪个型号**时用（各驱动自己的 BAUDS 优先）。
-# 顺序有讲究：115200 是绝大多数模块的出厂默认，460800/921600 是工程上常见的提速档。
+# **两个派系的默认档都必须在这张表里**：115200 是 LC29H(BS) / 和芯 N4 系，
+# 460800 是 LG290P 系。少一个就等于整条派系探不到 —— 早先只有 460800 排第一，
+# 靠"所有驱动都声明了 BAUDS"才没出事，属于运气不是设计。
 DEFAULT_BAUDS = (115200, 460800, 921600, 230400, 38400, 9600)
 
 
@@ -641,7 +672,8 @@ def detect_bauds(model_key=None):
 
     传了 model_key 且该驱动声明了 BAUDS → 用厂商文档里的清单，
     `DEFAULT_BAUD` 打头、其余降序（见 `BaseDriver.bauds()` 的说明：
-    首轮先押最常见的 115200，而不是先拿最高档试）；
+    首轮先押**该型号自己的**默认档 —— LG290P 是 460800、LC29H(BS) 是 115200，
+    不是一个通用答案）；
     否则退回全局 DEFAULT_BAUDS。
     """
     if model_key:

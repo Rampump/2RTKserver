@@ -30,8 +30,23 @@
 
 `3` 要单独识别：它意味着"这块固件没实现这条命令"，应把对应能力位关掉，
 而不是当成"参数填错"反复重试。
+
+## 第五个坑：PAIR 的**设置**命令，应答名不是命令名
+
+`$PAIR432,0` 发出去，模块只回一条 `$PAIR001,432,0`（§2.3.2 结果：「返回
+$PAIR001 消息」）。**不会**回 `$PAIR432,OK`。
+
+而 `Channel.send()` 是按"应答名 == 命令名"匹配的，所以走通用的 `request()`
+永远等不到应答 —— 真机实测三条 PAIR 设置全部报"无应答（已重试）"，
+可模块那边其实已经执行了（同一条命令重发 3 次还会被写 3 次 NVM，
+只是设置类命令幂等才没出事）。
+
+只有**查询**命令（PAIR433/435/437）才有同名应答，它们走通用路径不用管。
+设置命令（432/434/436/864）必须按 `$PAIR001,<命令号>,<结果码>` 收应答，
+见 `PAIR_ACK_IDS` 与 `request()` 的覆写。
 """
 import logging
+import time
 
 from .base import BaseDriver
 from .driver_manager import register
@@ -54,7 +69,11 @@ CMD = {
     # ---- 输出速率（§2.2.5，仅 PQTMSVINSTATUS / PQTMEPE，必须带 MsgVer）----
     'msg_rate_ver':     'PQTMCFGMSGRATE,W,{name},{rate},{ver}',
     'get_msg_rate_ver': 'PQTMCFGMSGRATE,R,{name},{ver}',
-    # 本型号支持的两条语句及其 MsgVer（文档 §2.2.5 表：都固定为 1）
+    # 本型号支持的两条语句及其 MsgVer —— **两条不一样**：
+    #   PQTMSVINSTATUS §2.2.7 `<MsgVer>`："1 = 版本 1（此版本始终为 1）"
+    #   PQTMEPE       §2.2.6 `<MsgVer>`："2 = 版本 2（此版本始终为 2）"
+    # 早先这里的注释写成"都固定为 1"，是照着 §2.2.5 的示例编号想当然。
+    # 真机实测确认：写错版本号不会报错，只会配到一条不输出的记录上（见 MSG_VER 注释）。
     'rate_svin':        'PQTMCFGMSGRATE,W,PQTMSVINSTATUS,{rate},1',
     'rate_epe':         'PQTMCFGMSGRATE,W,PQTMEPE,{rate},2',
 
@@ -123,8 +142,25 @@ PAIR_RESULT = {
 RATE_TARGETS = ('PQTMSVINSTATUS', 'PQTMEPE')
 RATE_RANGE = (1, 20)          # §2.2.5：Rate 取值 1~20
 
-# 每条语句的 `<MsgVer>`。**不能统一写 1**：PQTMEPE 的版本是 2，
-# 写成 1 会被模块回 ERROR,1（"参数无效"），而错误信息完全看不出是版本号错了。
+# 坐标报文：本型号**没有逐报文速率**，只有 `PAIR434` 一个开关（§2.3.4），
+# 播发节拍由模块自己按定位频率走。流程层统一用
+# `set_message_rate('RTCM3-1005', 1)` 表达"要播坐标"，这里翻译成 PAIR434 ——
+# 和 `read_rtcm_config()` 把 PAIR432 翻成 `msm_type` 是同一件事：
+# 让流程层不必知道每个型号的命令长什么样。
+COORD_MSG = ('RTCM3-1005',)
+# 1006 不在本型号的 RTCM 输出表里（§3 表 5 只有 1005/1019/1020/1042/1044/1046/MSM）。
+# 明确拒绝，而不是"配了但没播"——后者在页面上看起来是成功的。
+COORD_MSG_UNSUPPORTED = ('RTCM3-1006',)
+
+# 每条语句的 `<MsgVer>`。**不能统一写 1**：PQTMEPE 的版本是 2。
+#
+# 真机实测（LC29HBSNR11A01S，2026-11-03）纠正一个想当然的说法：
+#   `$PQTMCFGMSGRATE,W,PQTMEPE,0,1` 模块**照样回 OK**，`R,PQTMEPE,1` 也回
+#   `OK,PQTMEPE,0,1` —— 说明它不是"校验版本号"，而是**按 (语句名, MsgVer)
+#   各存一条记录**。所以写错版本号不会报错，只会配到一条根本不输出的记录上：
+#   命令回 OK、回读也 OK，而真正播发的 `$PQTMEPE` 速率一点没变。
+#   这种"静默不生效"比 ERROR 难查得多，版本号必须按文档钉死。
+#   （`W,GGA,1,1` 则是实打实的 `ERROR,1`：这个型号只认表 7 里的两句话。）
 MSG_VER = {
     'PQTMSVINSTATUS': 1,
     'PQTMEPE': 2,
@@ -132,6 +168,19 @@ MSG_VER = {
 
 # RTCM 输出模式（§2.3.2 <Mode>）
 RTCM_MODE_LABEL = {-1: '禁用', 0: 'MSM4', 1: 'MSM7'}
+
+# 这些键是**设置**类 PAIR 命令：模块只回 `$PAIR001,<命令号>,<结果码>`（§2.3.1），
+# 应答名与命令名不同，通用 `request()` 等不到。值 = 该命令的 CommandID。
+PAIR_ACK_IDS = {
+    'rtcm_mode': 432,      # §2.3.2
+    'ant_pnt': 434,        # §2.3.4
+    'ephemeris': 436,      # §2.3.6
+    'set_baud': 864,       # §2.3.8
+}
+
+# 等 $PAIR001 的上限。模块里 MNL 处理这四条命令都是"改个开关"，实测毫秒级返回；
+# 1.5 秒已经是很宽的余量，再长只是在界面上的"正在配置"里白等。
+PAIR_ACK_TIMEOUT = 1.5
 
 
 @register
@@ -147,12 +196,28 @@ class LC29HBSDriver(BaseDriver):
     CAPS = CAPS
     CMD = CMD
     CS_EXPECT = CS_EXPECT
+    # 本型号**没有软重启命令**（文档 2.2/2.3 全部命令里没有一条重启），
+    # 而它改配置也不需要重启：`PQTMCFGSVIN` / `PAIR432/434/436` 都是即时生效，
+    # 只有 `PAIR864` 改波特率要重启（§2.3.8 备注 1，那一步本来就由用户断电完成）。
+    # 流程层的 RESTART 步骤据此跳过，否则每次标定都会卡在"模块没有重启成功"。
+    RESTART_REQUIRED = False
 
     # 官方波特率（§2.3.8 PAIR864 的 <Baudrate> 取值范围，文档原样十档）。
     # 注意 4800 与 3000000 是 LG290P 根本没有的档位 —— 这就是"每型号存一份"
     # 的意义：拿 LG290P 的清单去探 LC29H(BS)，这两档永远试不到。
     BAUDS = (4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 3000000)
+    # 首选项 **115200**，依据是文档原文而不是猜测：
+    #   §2.3.8 标题下第一句「设置 UART 接口的波特率（**默认波特率为 115200 bps**）」。
+    # 这是本型号与 LG290P 的又一处硬差异 —— LG290P 出厂配在 460800，
+    # 两边抄对方的值都会让新模块多错一轮超时。
     DEFAULT_BAUD = 115200
+    # 探测序列与"可设置值"分开：
+    #   3000000 是 UART2 的默认档（LC29H 硬件手册 §4.1「UART2 默认波特率 3 Mbps」），
+    #      本机走 UART1，探它永远落空；USB 转串口在 3 Mbps 下还容易丢字节，
+    #      探到了也不能拿它跑配置，所以**不进探测序列**（但仍留在 BAUDS 里，
+    #      `PAIR864` 要能把它当合法参数写进 UART2）。
+    #   4800 保留但排在最后：文档支持，只是现实里极少见，一轮 2 秒的代价可控。
+    PROBE_BAUDS = (4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600)
     BAUD_CMD_KEY = 'set_baud'
 
     # 只有一个 MSM 开关（PAIR432 是全局开关，不分星座），
@@ -164,6 +229,62 @@ class LC29HBSDriver(BaseDriver):
         # PAIR 命令的应答是异步的（$PAIR001 在结果帧之后才到），
         # 这里缓存最近一次 PAIR001 的 (命令号, 结果码)，供 request 收尾时取用。
         self._last_pair = None
+
+    # ==================== 应答收取（PAIR 设置命令专用）====================
+    def request(self, key, line_timeout=None, retries=None, **kwargs):
+        """设置类 PAIR 命令按 `$PAIR001,<命令号>,<结果码>` 收应答；其余走基类。
+
+        为什么不给 `REPLY_ALIASES` 加"PAIR432 → PAIR001"这种别名：
+        别名只按**名字**匹配，不看命令号。查询命令的应答序列是
+        `$PAIR001,433,0` 紧接 `$PAIR433,0` —— 一旦把 PAIR001 认成合法应答，
+        查询会先接住那条 ACK（`fields=['433','0']`），真正的档位值被当成噪声丢掉，
+        结果就是"档位永远读成 433 或 None"。**必须核对 CommandID**。
+
+        真机实测（LC29HBSNR11A01S / CH340 / 115200）：不覆写这个方法时，
+        PAIR432/434/436 三条设置全部报"无应答（已重试）"，而模块其实已经执行，
+        用户看到的是"配置文件配不上"，实际是应答认错了名字。
+        """
+        ack_id = PAIR_ACK_IDS.get(key)
+        if ack_id is None:
+            return super().request(key, line_timeout=line_timeout, retries=retries, **kwargs)
+
+        body = self.body(key, **kwargs)
+        self.verify_checksum(key, body)
+        self._last_pair = None
+        self.channel.write_line(body)
+
+        wait = PAIR_ACK_TIMEOUT if line_timeout is None else line_timeout
+        deadline = time.time() + max(0.0, wait)
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            line = self.channel.read_line(remaining)
+            if line is None:
+                break
+            # 无关输出照常进缓存：`_last_pair` 就是 absorb → parse_line 里记下来的。
+            self.channel.absorb(line)
+            if self._last_pair and self._last_pair.get('command') == ack_id:
+                break
+
+        pair = self._last_pair or {}
+        if pair.get('command') != ack_id:
+            return False, (f'{body.split(",")[0]} 无应答'
+                           f'（等不到 $PAIR001,{ack_id},0）'), {
+                'error': 'timeout', 'body': body, 'ack_id': ack_id}
+
+        code = pair.get('result')
+        raw = f'$PAIR001,{ack_id},{code}'
+        data = {'pair_result': code, 'ack_id': ack_id, 'raw': raw}
+        if code == 0:
+            return True, raw, data
+        if code == 1:
+            # §2.3.1：1 = 正在处理命令，请等待结果。这四条都是开关类，
+            # 真的回 1 说明 MNL 还在处理上一条，不算失败，但要如实告诉上层。
+            return True, f'{raw}（模块报告"处理中"）', data
+        return False, (f'PAIR{ack_id} 未生效：'
+                       f'{PAIR_RESULT.get(code, f"未知结果码 {code}")}'), {
+            **data, 'error': f'pair_{code}'}
 
     # ==================== 一、识别与信息 ====================
     def detect(self):
@@ -220,11 +341,15 @@ class LC29HBSDriver(BaseDriver):
 
         ok, _msg, rtcm = self.request('get_rtcm_mode')
         if ok and rtcm:
-            data['rtcm_mode'] = rtcm.get('mode')
+            # 必须走 `_pair_value` 取 `$PAIR433,0` 的第 1 个字段：
+            # `request()` 返回的是 `{'fields': [...], 'raw': ...}`，没有 `mode` 键。
+            # 早先这里写 `rtcm.get('mode')`，诊断页的 RTCM 档位恒为 None，
+            # 看着像"模块没配过"，其实是字段取错了地方（与 get_rtcm_output 同一坑）。
+            data['rtcm_mode'] = self._pair_value(rtcm, 'mode')
 
         ok, _msg, ant = self.request('get_ant_pnt')
         if ok and ant:
-            data['ant_pnt'] = ant.get('enable')
+            data['ant_pnt'] = self._pair_value(ant, 'enable')
 
         return True, firmware or '已读取', data
 
@@ -232,40 +357,70 @@ class LC29HBSDriver(BaseDriver):
     def get_mode(self):
         """没有 RCVRMODE 命令，用 SVIN 的 `<Mode>` 反推当前角色。
 
-        0/1 → 没在播固定坐标，对外就是"流动站/未固定"
-        2   → 已经在播固定坐标，等同基站
+        返回的 `mode` 是**角色**（base/rover），原始 SVIN 模式另放在 `svin_mode`
+        里 —— 两者混用一个字段是这里最容易犯的错，见 `_role_from_svin()`。
         """
         ok, message, data = self.get_svin_config()
         if not ok:
             return False, message, {'mode': 'unknown'}
-        mode = self._role_from_svin(data or {})
+        svin_mode = (data or {}).get('mode')
+        role = self._role_from_svin(data or {})
         data = dict(data or {})
-        data['role'] = mode
-        data['mode'] = mode
-        return True, f'当前模式 {mode}', data
+        data['svin_mode'] = svin_mode
+        data['role'] = role
+        data['mode'] = role
+        return True, f'当前模式 {role}（SVIN {svin_mode}）', data
 
-    def set_mode(self, mode):
+    def set_mode(self, mode, persist=True, restart=True, verify=True):
         """切工作模式。
 
-        `base` → 只是"进入基站身份"，坐标仍要靠 set_fixed_ecef 写；
-                这里用 Mode=1（测量模式）让模块先动起来，与 LG290P 的流程对齐。
-        `rover` → LC29H(BS) 是单基站模块，**没有流动站模式**，直接拒绝并说明原因。
+        **本型号没有模式命令**（文档里没有 `PQTMCFGRCVRMODE`）：
+        "是不是基站"由 `PQTMCFGSVIN` 的 `<Mode>` 决定，`Mode=2` + 有效坐标 = 基站。
+
+        所以这里对 `base` **故意什么都不下发**：
+          - 写 `Mode=1`(survey-in) 会把这台模块从"播固定坐标"改成"重新自收敛"，
+            回滚路径（先还原坐标、再 set_mode('base')）会因此把刚还原好的坐标配置
+            改成测量模式 —— 一次"还原"反而把基站变成正在测量的站，且 1005 播的是
+            旧均值。这条坑是照抄 LG290P 的 set_base 才会踩到。
+          - 写 `Mode=0` 更糟：等于把坐标清掉。
+        真正让模块成为基站的是流程层随后的 `set_fixed_ecef()`。
+
+        `persist` / `restart` 因此都是空操作，只为满足基类契约（流程层按统一签名调用）。
+        签名必须与 `BaseDriver.set_mode(mode, persist=True, restart=True)` 兼容：
+        早先这里写成 `set_mode(self, mode)`，真机上每次标定都在 BASE_SETUP 阶段炸成
+        `TypeError: got an unexpected keyword argument 'persist'`。
         """
         want = str(mode or '').strip().lower()
         if want in ('rover', 'mobile', '流动站', '移动站'):
             return False, (
                 f'{self.DISPLAY_NAME} 是单基站模块，不支持流动站模式'
                 '（文档里没有 PQTMCFGRCVRMODE 命令）'), {'error': 'unsupported mode'}
+        if want not in ('base', '基站', ''):
+            return False, f'未知模式 {mode}', {'error': 'bad mode'}
 
-        # 切基站 = 先把 SVIN 置为测量模式，具体坐标由后续 set_fixed 覆盖
-        ok, message, data = self.request('set_svin', count=3600, acc=15.0)
+        data = {'noop': True, 'reason': 'no_mode_command',
+                'hint': '基站身份由 PQTMCFGSVIN 的 Mode=2 + 有效坐标决定'}
+
+        ok, message, cfg = self.get_svin_config()
         if not ok:
-            return False, message, data
-        return True, '已进入基站（测量模式，等待写入坐标）', data
+            return False, f'读不到坐标配置，无法确认基站状态：{message}', {
+                **data, 'error': 'no_reply'}
+
+        if cfg.get('mode') == 'fixed':
+            return True, '当前已是基站（固定坐标模式，Mode=2）', {**data, 'svin': cfg}
+
+        if verify:
+            return False, (
+                f'当前不是基站（Mode={cfg.get("mode")}）：本型号没有模式命令，'
+                f'必须先写入固定坐标（PQTMCFGSVIN,W,2,...）才会成为基站'), {
+                **data, 'svin': cfg, 'error': 'base_needs_coords'}
+
+        return True, (f'本型号无模式命令：已确认可写坐标（当前 Mode={cfg.get("mode")}），'
+                      f'写入固定坐标后即为基站'), {**data, 'svin': cfg}
 
     def set_mode_memory_only(self, mode):
-        """只改配置不重启。LC29H(BS) 的 Mode 字段本身就即时生效，所以直接复用。"""
-        return self.set_mode(mode)
+        """只改配置不重启。LC29HBS 的 Mode 字段本身就即时生效，所以直接复用。"""
+        return self.set_mode(mode, persist=False, restart=False, verify=False)
 
     # ==================== 三、坐标与 Survey-in ====================
     def get_svin_config(self):
@@ -342,26 +497,59 @@ class LC29HBSDriver(BaseDriver):
 
         return True, f'固定坐标已写入（{x:.4f}, {y:.4f}, {z:.4f}）', data
 
-    def config_survey_in(self, count, acc):
+    def config_survey_in(self, count, acc_limit, distance=None, persist=True,
+                         restart=True, verify=True):
         """§2.2.1 Mode=1：Survey-in。
 
         `count` 是**最少定位次数**（不是秒）—— 1Hz 下 43200 次约等于 12 小时，
-        这也是文档给的上限与默认值。`acc` 是 3D 精度上限（米），0 = 不限制。
+        这也是文档给的上限与默认值。`acc_limit` 是 3D 精度上限（米），0 = 不限制。
+
+        `distance` 是基类为 LG290P 设的参数（那台有 `<Distance>` 字段），
+        **本型号的 7 字段里没有它**，多写一个字段模块回 `ERROR,1`。
+        这里接受但不下发，并在返回数据的 `ignored` 里如实标出来 ——
+        悄悄丢掉用户设的参数，比明确说"这型号没有这项"更难查。
+
+        签名的四个关键字参数（distance/persist/restart/verify）必须都在：
+        流程层是按基类签名调的，少一个就是 `TypeError`（真机上"子收敛模式"
+        每次都失败就是这个原因）。
         """
         try:
             n = int(count)
-            a = float(acc)
+            a = float(acc_limit)
         except (TypeError, ValueError):
-            return False, f'Survey-in 参数不合法：count={count} acc={acc}', {'error': 'bad args'}
+            return False, f'Survey-in 参数不合法：count={count} acc={acc_limit}', {
+                'error': 'bad args'}
         if n <= 0:
             return False, f'定位次数必须大于 0（实际 {n}）', {'error': 'bad count'}
         if n > 86400:
             return False, f'定位次数上限 86400（实际 {n}）', {'error': 'bad count'}
+        if a < 0:
+            return False, f'3D 精度上限不能为负（实际 {a}）', {'error': 'bad acc'}
 
         ok, message, data = self.request('set_svin', count=n, acc=f'{a:.1f}')
-        if ok:
-            return True, f'已启动 Survey-in（{n} 次 / 精度 {a:.1f} m）', data
-        return False, message, data
+        if not ok:
+            return False, message, data
+        data = dict(data or {})
+        if distance not in (None, ''):
+            data['ignored'] = {'distance': distance,
+                               'why': 'LC29H(BS) 的 PQTMCFGSVIN 只有 7 个字段，没有 Distance'}
+
+        if persist:
+            saved, save_message, save_data = self.save()
+            if not saved:
+                return False, f'Survey-in 已配置但保存失败：{save_message}', save_data
+
+        if verify:
+            ok2, read_message, readback = self.get_svin_config()
+            if not ok2:
+                return False, f'配置后回读失败：{read_message}', readback
+            if readback.get('mode') != 'survey_in':
+                return False, (f'回读模式是 {readback.get("mode")}，不是 survey_in；'
+                               f'配置没有生效'), readback
+            data['verify'] = readback
+
+        note = '' if self.RESTART_REQUIRED else '（本型号无软重启命令，配置即时生效）'
+        return True, f'已启动 Survey-in（{n} 次 / 精度 {a:.1f} m）{note}', data
 
     def survey_status(self):
         """读 `$PQTMSVINSTATUS` 缓存的最后一帧。
@@ -540,6 +728,51 @@ class LC29HBSDriver(BaseDriver):
             return _to_int(msg_ver)
         return MSG_VER.get(name)
 
+    # ---------- 坐标报文 1005 → PAIR434/435 ----------
+    def _get_coord_msg(self, name):
+        """读 1005 开关，按流程层的习惯返回 `fields=[语句名, 速率]`。
+
+        `fields` 的形状必须和 LG290P 那边一致（`[名字, 速率]`）：
+        `backup._read_rate()` 与 `Writer._read_rate()` 都取 `fields[1]`，
+        少一段就会把"1005 开着"读成 None，还原时被当成"没读到 → 不动"，静默丢配置。
+        """
+        if name in COORD_MSG_UNSUPPORTED:
+            return False, (f'{self.DISPLAY_NAME} 不播 {name}'
+                           f'（RTCM 输出表里只有 1005）'), {
+                'error': 'unsupported', 'supported': list(COORD_MSG)}
+        ok, message, data = self.request('get_ant_pnt')
+        if not ok:
+            return False, message, data
+        value = self._pair_value(data, 'enable')
+        if value is None:
+            return False, f'PAIR435 应答里没有开关值：{message}', {'error': 'bad_reply'}
+        return True, message, {'name': name, 'rate': value, 'msg_ver': None,
+                               'fields': [name, str(value)],
+                               'raw': (data or {}).get('raw')}
+
+    def _set_coord_msg(self, name, rate):
+        """`PAIR434`：1005 只有开/关两态，没有速率。
+
+        上层传 `rate=1` 就是"开"、`0` 就是"关"。传 2 以上按"开"处理并在
+        提示里说清 —— 这个型号做不到"每 N 次定位播一次坐标"。
+        """
+        if name in COORD_MSG_UNSUPPORTED:
+            return False, (f'{self.DISPLAY_NAME} 不播 {name}'
+                           f'（RTCM 输出表里只有 1005）'), {
+                'error': 'unsupported', 'supported': list(COORD_MSG)}
+        value = _to_int(rate)
+        if value is None:
+            return False, f'{name} 的速率必须是整数（0=关，1=开）', {'error': 'bad_rate'}
+        enable = 1 if value > 0 else 0
+        ok, message, data = self.request('ant_pnt', enable=enable)
+        if not ok:
+            return False, message, data
+        note = '' if value in (0, 1) else f'（本型号 1005 只能开/关，{value} 按"开"下发）'
+        data = dict(data or {})
+        data.update({'name': name, 'rate': enable})
+        return True, f'1005 已{"开启" if enable else "关闭"}{note}', data
+
+
     def get_message_rate(self, name, msg_ver=None):
         """查询报文速率（§2.2.5 `PQTMCFGMSGRATE,R,<name>,<MsgVer>`）。
 
@@ -547,6 +780,8 @@ class LC29HBSDriver(BaseDriver):
         `ERROR,1`，这里直接拒绝并说明，省掉一次 2 秒超时白等。
         """
         name = str(name or '').strip().upper()
+        if name in COORD_MSG or name in COORD_MSG_UNSUPPORTED:
+            return self._get_coord_msg(name)
         if name not in RATE_TARGETS:
             return False, (f'{self.DISPLAY_NAME} 只能查询 {"、".join(RATE_TARGETS)} '
                            f'两条语句的速率，不支持 {name or "(空)"}'), {
@@ -577,6 +812,8 @@ class LC29HBSDriver(BaseDriver):
         "不支持"——上层据此跳过，而不是把一整条链路的失败算到模块头上。
         """
         name = str(name or '').strip().upper()
+        if name in COORD_MSG or name in COORD_MSG_UNSUPPORTED:
+            return self._set_coord_msg(name, rate)
         if name not in RATE_TARGETS:
             return False, (f'{self.DISPLAY_NAME} 不支持配置 {name or "(空)"} 的速率'
                            f'（只支持 {"、".join(RATE_TARGETS)}）'), {
@@ -609,13 +846,18 @@ class LC29HBSDriver(BaseDriver):
             saved, save_message, save_data = self.save()
             if not saved:
                 return False, f'停用 Survey-in 成功但保存失败：{save_message}', save_data
-        if restart:
+        if restart and self.RESTART_REQUIRED:
             return self.reboot()
         return True, '已停用 Survey-in / 固定坐标配置', data
 
     # ==================== 五、天线信息 ====================
-    def set_antenna_info(self, desc, setup_id, sn):
-        """LC29H(BS) 文档没有 1033 接收机/天线说明命令，明确拒绝而不是假装成功。"""
+    def set_antenna_info(self, desc, setup_id=0, sn='', persist=True):
+        """LC29H(BS) 文档没有 1033 接收机/天线说明命令，明确拒绝而不是假装成功。
+
+        默认值必须写全（`setup_id=0, sn=''`）：流程层是按基类签名
+        `set_antenna_info(desc, setup_id, sn, persist=False)` 调的，
+        少一个默认值就会在"配天线信息"这一步抛 TypeError。
+        """
         return False, (
             f'{self.DISPLAY_NAME} 不支持写天线信息（文档无 1033 对应命令）；'
             '下游若不校验 1033 可忽略此项'), {'error': 'unsupported'}
@@ -727,10 +969,26 @@ class LC29HBSDriver(BaseDriver):
 
     @staticmethod
     def _role_from_svin(data):
+        """SVIN 配置 → 角色（base/rover/unknown）。
+
+        **必须按字符串比较**：`get_svin_config()` 返回的 `mode` 是
+        `'disabled' / 'survey_in' / 'fixed'`（人可读），原始数字在 `mode_code` 里。
+        早先这里写的是 `if mode == 2`、`if mode in (0, 1)` —— 拿字符串和整数比，
+        永远不成立，于是 `get_mode()` 恒返回 'unknown'。真机现象是：
+        坐标明明已经写进模块（`PQTMCFGSVIN,OK,2,...`），页面却显示"模式未知"，
+        流程层的 VERIFY_MODE 也永远对不上 `base`，标定到最后一律判失败。
+
+        `survey_in`(1) 也算 base：它此刻正在按均值播 1005，收敛完成就是基站；
+        写成 rover 会让"自收敛"这条路径在 VERIFY_MODE 阶段必然失败。
+        """
         mode = (data or {}).get('mode')
-        if mode == 2:
+        if isinstance(mode, int):                 # 有人传了原始数字也能认
+            mode = {0: 'disabled', 1: 'survey_in', 2: 'fixed'}.get(mode)
+        if mode == 'fixed':
             return 'base'
-        if mode in (0, 1):
+        if mode == 'survey_in':
+            return 'base'
+        if mode == 'disabled':
             return 'rover'
         return 'unknown'
 

@@ -118,12 +118,12 @@ The short version of the 2026-11-03 run:
 
 ## Test suite
 
-`tests/test_contract.py` ships with the repository: **242 assertions**, standard library and this
+`tests/test_contract.py` ships with the repository: **287 assertions**, standard library and this
 project's own modules only — nothing to `pip install` beyond what the app already needs. Run it
 on the device or on your laptop:
 
 ```bash
-python -m unittest discover -s tests -t . -q     # 242 tests, ~3 s, 1 skipped when not on Linux
+python -m unittest discover -s tests -t . -q     # 287 tests, ~4 s, 1 skipped when not on Linux
 ```
 
 These are not "does the function return what it returned yesterday" tests. Each one pins a defect
@@ -151,10 +151,13 @@ running install is left untouched. A release that breaks a contract cannot reach
   stores the answer per model in `calibration.db`, and tries that value first next time —
   instead of climbing 115200 → 230400 → 460800 and burning a 2 s timeout on every wrong step.
   The **first** run no longer guesses either: the model's `DEFAULT_BAUD` now leads the candidate
-  list (`lg290p → 115200, 921600, 460800, 230400, 9600`), so a factory-fresh module answers on
-  the first try. The manual states no factory default at all — it tells you to read the value
-  back — so 115200 here is a bet backed by the manual's examples and the measured device, not a
-  claim about the hardware.
+  list (`lg290p → 460800, 921600, 230400, 115200, 9600`), so a factory-fresh module answers on
+  the first try. Each model keeps its own default: LG290P ships at **460800**, LC29H(BS) at
+  **115200** (its protocol spec says so verbatim in §2.3.8). The LG29xP manual states no factory
+  default at all — it tells you to read the value back — so 460800 there is a bet backed by the
+  vendor default configuration and the field unit, not a claim printed in the PDF.
+  Leaving the field empty now starts from the **selected model's** default rather than one global
+  number, so picking LG290P and hitting identify no longer burns a 2 s timeout on 115200 first.
   See [Serial port and baud rate](#serial-port-and-baud-rate).
 - **Candidate lists open under their input.** `Scan serial ports` and `Fetch mount points`
   used to fill a native `<datalist>` whose popup the browser positioned anywhere it liked
@@ -196,6 +199,24 @@ LC29H(BS) on a different USB port:
   disagrees by more than 5 cm is corrected from ECEF with a warning, because ECEF is what actually
   goes out in the 1005 message.
 
+**3.1.3** — a cross-model isolation audit, prompted by the LC29H(BS) field run:
+
+- **Baud defaults are per model, and the empty field follows the model.** LG290P ships at
+  **460800**, LC29H(BS) at **115200** (stated verbatim in its spec §2.3.8). A field left empty now
+  starts from the **selected model's** default instead of one global 115200 — picking LG290P and
+  hitting identify no longer burns a 2 s timeout on 115200 first. The probe order and the settable
+  set are now separate tables (`PROBE_BAUDS` vs `BAUDS`): LC29H(BS)'s 3000000 is legal on UART2
+  but is not probed on UART1, where it can never answer.
+- **Auto-detect no longer lets one model push another down the list.** Candidate tables are
+  interleaved round-robin instead of concatenated, so both camps' defaults occupy the first two
+  slots no matter which driver happened to register first. Previously the early-registered model
+  owned the whole head of the list.
+- **Cross-model isolation is enforced by tests, not by comments.** Twelve contract tests assert
+  that LC29H(BS)'s transport semantics — no restart command, empty constellation list, `$PAIR001`
+  acknowledgements, `msm_type` readback — cannot leak into LG290P: it must still restart, still fan
+  out five MSM constellations, still read the MSM tier from `fields[0]`, and still use the base
+  `request()`. Re-introducing any of those leaks turns the suite red.
+
 **3.1.2** — one defect reported from the browser, one that had been hiding behind a stale comment:
 
 - **Clicking the module-model dropdown no longer hangs the browser.** The card entrance animation
@@ -218,11 +239,12 @@ LC29H(BS) on a different USB port:
 
 - **Baud rate: the first candidate is now the model's most likely rate.** `DEFAULT_BAUD` had been
   declared for a while but never entered the ordering — `bauds()` sorted descending only, so a
-  factory-fresh 115200 module burned three 2-second timeouts on 921600 / 460800 / 230400 first.
-  The complaint about "climbing the candidate list" was never actually fixed; it had only changed
-  direction. Order is now `115200, 921600, 460800, 230400, 9600` — a bet backed by the manual's
-  examples and the measured device, not a claim about a documented factory default (the protocol
-  spec states none and tells you to read the value back).
+  factory-fresh module burned 2-second timeouts on the higher rates first. The complaint about
+  "climbing the candidate list" was never actually fixed; it had only changed direction. Order is
+  now the model's own default first, then the rest highest-first (`lg290p →
+  460800, 921600, 230400, 115200, 9600`; `lc29hbs → 115200, 921600, 460800, …`).
+  The defaults are **per model** and must never be borrowed from one another: LG290P runs at
+  460800, LC29H(BS) at 115200. A contract test fails if the two ever converge.
 
 - **The test suite ships in the repository again.** 3.0.0 had moved `tests/` into `.gitignore`, which
   quietly falsified two claims: the README's "each fix ships with a regression test", and the upgrade
@@ -452,11 +474,14 @@ Leaving the baud field **empty** on the calibration page means "figure it out", 
 2. **What this device last read back from the module.** Stored per model in
    `module_profiles.uart_baud`. This is the one that matters: a receiver reports its own UART
    configuration, so the answer comes from the hardware rather than from a table.
-3. **The model's `DEFAULT_BAUD`** — the value the manual's examples use and the measured device
-   ran at (LG290P: 115200). This is a bet, not a documented factory default: the protocol
-   specification lists the accepted rates but says the default must be read back with `Get`.
-4. **The rest of the vendor's documented table**, highest first (LG290P: 921600 / 460800 /
-   230400 / 9600).
+3. **The selected model's `DEFAULT_BAUD`** — the rate that model ships at (LG290P: **460800**,
+   LC29H(BS): **115200**, Unicore N4: 115200). This is the model's own constant, not one global
+   number: copying LG290P's 460800 onto an LC29H(BS) board (or the reverse) costs one wrong step
+   on every fresh module. The LG29xP manual states no factory default — it lists the accepted
+   rates and tells you to read the value back — so 460800 there comes from the vendor default
+   configuration and the field unit, while LC29H(BS)'s 115200 is printed in its spec (§2.3.8).
+4. **The rest of that model's documented table**, highest first
+   (LG290P: 921600 / 230400 / 115200 / 9600).
 5. **A global fallback list**, only when the model is still unknown.
 
 Step 3 is what makes the *first* run fast: a factory-fresh module answers on the first attempt
@@ -762,6 +787,20 @@ RTCM 1005 校验「写进去的 == 播出去的」。精度如实标注（固定
 - **坐标两种形态都落库**：一条记录必定同时有 ECEF 与经纬高，两个方向都能换算（取决于模块
   或人工给的是哪一种）；两者相差超过 5 cm 时以 ECEF 为准重算并告警，因为真正播进 1005 的是 ECEF。
 
+**3.1.3 做的是跨型号隔离审计**（起因是 LC29H(BS) 真机联调那一轮改动）：
+
+- **默认波特率是每个型号自己的常量，留空时也跟着型号走**。LG290P 是 **460800**，
+  LC29H(BS) 是 **115200**（后者在其协议规范 §2.3.8 里白纸黑字写着）。输入框留空现在从
+  **所选型号**的默认档开始试，不再统一落 115200 —— 选了 LG290P 点「识别」不会再先白等一轮
+  2 秒超时。探测顺序与"能设置哪些值"也拆成两张表（`PROBE_BAUDS` / `BAUDS`）：LC29H(BS) 的
+  3000000 作为 UART2 档位合法，但不进 UART1 的探测序列（在那条线上它永远不可能应答）。
+- **自动探测不再让一个型号把另一个型号挤到后面**。各型号的候选表改为按轮次交错，而不是整段
+  拼接 —— 两个派系的默认档固定占据队首两位，与驱动注册顺序无关。此前先注册的型号独占队首。
+- **跨型号隔离由测试守着，不靠注释**。12 条契约测试断言 LC29H(BS) 的传输语义（无重启命令、
+  空星座表、`$PAIR001` 应答、`msm_type` 回读）不会漏进 LG290P：它必须照旧重启、照旧逐条
+  下发五个 MSM 星座、照旧从 `fields[0]` 读档位、照旧用基类 `request()`。任何一条漏过去，
+  测试就会红。
+
 **3.1.2 修的是一个"点一下浏览器就卡死"**：
 
 - **点「模块型号」下拉时页面卡死**。卡片入场动画当时在动 `transform`，而 `transform` 动画会把
@@ -780,24 +819,18 @@ RTCM 1005 校验「写进去的 == 播出去的」。精度如实标注（固定
   `backwards` 也没用（残留消了，但动画进行中仍是合成层）。契约测试会在这个 keyframe 里
   重新出现 `transform` 时失败。
 
-- **波特率：第一个候选改成该型号最可能命中的那一档**。`DEFAULT_BAUD` 早就声明了却从没参与
-  排序，`bauds()` 只做纯降序 —— 一块出厂跑 115200 的模块要先在 921600 / 460800 / 230400 上
-  各等 2 秒。用户抱怨的"一档档试"其实一直没修好，只是从低往高试变成了从高往低试。
-  现在顺序是 `115200, 921600, 460800, 230400, 9600`：押注手册示例与实测结果，不是"官方默认值"
-  （手册没写出厂值，正文只要求用 Get 命令回读）。
-
 - **测试套件回到仓库里**。3.0.0 把 `tests/` 加进了 `.gitignore`，于是两处说法同时变成空话：
   README 的"每个修复都带回归测试"、升级执行器自己那句"契约测试：仓库自带的断言"。clone 下来
-  根本没有 tests 目录，那道门禁从未生效。现在 242 条断言随仓库分发，`verify()` 会在安装前跑，
+  根本没有 tests 目录，那道门禁从未生效。现在 287 条断言随仓库分发，`verify()` 会在安装前跑，
   失败就拒绝升级。
 
 ### 测试套件
 
-`tests/test_contract.py` 随仓库分发，**242 条断言**，只依赖标准库和本项目自己的模块，
+`tests/test_contract.py` 随仓库分发，**287 条断言**，只依赖标准库和本项目自己的模块，
 不需要额外 `pip install` 任何东西。设备上和电脑上都能直接跑：
 
 ```bash
-python -m unittest discover -s tests -t . -q     # 242 项，约 3 秒，非 Linux 跳过 1 项
+python -m unittest discover -s tests -t . -q     # 287 项，约 4 秒，非 Linux 跳过 1 项
 ```
 
 这些测试不验证"函数今天和昨天返回值一样"，每一条都钉住一个**只在真机上才会出现**的缺陷：
@@ -842,7 +875,7 @@ sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone 
 sudo rm -rf /tmp/2rtk-update && (sudo git clone --depth 1 https://gitcode.com/rampump/NTRIPserver.git /tmp/2rtk-update || (sudo rm -rf /tmp/2rtk-update && sudo git clone --depth 1 https://github.com/Rampump/2RTKserver.git /tmp/2rtk-update)) && sudo bash /tmp/2rtk-update/update.sh
 ```
 
-升级完成后浏览器里「系统维护」显示的版本应为 `3.1.2`。也可以在网页上点「检查更新 → 立即升级」，
+升级完成后浏览器里「系统维护」显示的版本应为 `3.1.3`。也可以在网页上点「检查更新 → 立即升级」，
 效果一致：它会先备份、换文件、装依赖、启动服务，任何一步失败自动回滚到原版本。
 
 > **从 2.x 升级特别注意**：3.0 首次启动会自动建 `calibration.db`（标定库）。旧的

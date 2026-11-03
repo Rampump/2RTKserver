@@ -129,14 +129,20 @@ MIN_OBSERVE_SECONDS = 3
 MAX_OBSERVE_SECONDS = 300
 
 # 识别失败后的波特率枚举（方案 §14 #3 / #25）。
-# 顺序按真机出现概率排：LG290P 出厂 115200，工程上常被改成 460800；
-# 9600 太慢，一轮识别要 6 秒，所以放最后且只在其它档全失败时才试。
+#
+# **两个派系的首选档都必须在表里**：115200 是 LC29H 系 / 和芯 N4 系的默认，
+# 460800 是 LG290P 系的默认。早先这张表只有 460800 这一派，靠"所有驱动都声明
+# 了 BAUDS"才没出事 —— 一旦某个型号没声明（或将来新增一个），选它的时候
+# 115200 的模块就整条派系探不到，用户看到的是"模块无应答"而不是"档位没试"。
+# 9600 一轮识别要 6 秒，放最后且只在其它档全失败时才试。
+#
 # **只在用户没有显式指定波特率时才枚举**：用户明确填了 460800 却被
 # 悄悄改成 115200 去试，等于把用户的判断覆盖掉，而且改完还不告诉他。
 #
-# 这份只是**兜底**：真正该用哪些档位，由各驱动类的 BAUDS（厂商文档口径）决定，
-# 见 `_baud_candidates()`。驱动没声明 BAUDS 的型号才回落到这里。
-DETECT_BAUD_CANDIDATES = (460800, 230400, 921600, 38400, 9600)
+# 这份只是**兜底**：真正该用哪些档位、哪一档排第一，由各驱动类的
+# `BAUDS` / `DEFAULT_BAUD`（厂商文档口径）决定，见 `_baud_candidates()`。
+# 驱动没声明 BAUDS 的型号才回落到这里。
+DETECT_BAUD_CANDIDATES = (115200, 460800, 230400, 921600, 38400, 9600)
 
 
 class TaskAborted(Exception):
@@ -271,24 +277,30 @@ class CalibrationService:
         return port or _config_serial_port()
 
     @staticmethod
-    def _resolve_baud(baud):
+    def _resolve_baud(baud, module=None):
         """`(baud, explicit, error)`。
 
         `explicit` 区分两种"看起来一样"的情况：
-          - 前端留空（自动）→ 落 DEFAULT_BAUD，`explicit=False`，
-            识别失败时允许按该型号官方档位逐档重试（见 `_scan_bauds`）。
+          - 前端留空（自动）→ 落**该型号的默认档**（没指定型号才落全局 115200），
+            `explicit=False`，识别失败时允许按该型号官方档位逐档重试
+            （见 `_scan_bauds`）。
           - 用户手填 115200 → 值恰好等于默认，但它仍是**用户的判断**，
             `explicit=True`，不允许被悄悄改成别的档位。
 
         如果只看"值等不等于默认"来判，手填 115200 就会被当成没填，
         接错线时程序反而会去乱换波特率，把用户的排除动作全推翻。
+
+        **为什么留空时要看型号**：LG290P 出厂 460800、LC29H(BS) 出厂 115200。
+        留空一律落 115200 的话，选了 LG290P 的用户点"识别"仍要先白等一轮超时
+        （2 秒）才轮到 460800 —— 那"默认档排第一"就等于没做。
+        这里只影响**首试档**，失败后的逐档重试顺序仍由驱动候选表决定。
         """
         raw = baud
         given = raw not in (None, '') and str(raw).strip() != ''
         if not given:
-            # 留空 = 自动：落默认档，但标记成"非显式"，
+            # 留空 = 自动：落该型号默认档，但标记成"非显式"，
             # 这样识别失败时允许按型号官方档位逐档重试。
-            return int(DEFAULT_BAUD), False, ''
+            return int(_default_baud_for(module)), False, ''
         try:
             if isinstance(raw, bool):
                 raise TypeError
@@ -306,7 +318,7 @@ class CalibrationService:
         port = self._resolve_port(port)
         if not port:
             return False, '没有指定串口，配置里也没有设置串口', self.status()
-        baud, baud_explicit, error = self._resolve_baud(baud)
+        baud, baud_explicit, error = self._resolve_baud(baud, module)
         if error:
             return False, error, self.status()
         try:
@@ -324,7 +336,7 @@ class CalibrationService:
 
     # ---------- 启动：P1 写入历史坐标 ----------
     def start_write(self, port=None, baud=None, ecef=None, lat=None, lon=None,
-                    height=0.0, method='manual', msm=4, antenna=None,
+                    height=None, method='manual', msm=4, antenna=None,
                     remark='', dry_run=False, rtcm_timeout=DEFAULT_RTCM_TIMEOUT,
                     task_id=None, module=None, coord_msg='1005', arp=None):
         """写入固定坐标并跑完整校验链路（方案 §8）。返回 `(success, message, status)`。
@@ -337,7 +349,7 @@ class CalibrationService:
         port = self._resolve_port(port)
         if not port:
             return False, '没有指定串口，配置里也没有设置串口', self.status()
-        baud, baud_explicit, error = self._resolve_baud(baud)
+        baud, baud_explicit, error = self._resolve_baud(baud, module)
         if error:
             return False, error, self.status()
 
@@ -377,7 +389,7 @@ class CalibrationService:
         port = self._resolve_port(port)
         if not port:
             return False, '没有指定串口，配置里也没有设置串口', self.status()
-        baud, baud_explicit, error = self._resolve_baud(baud)
+        baud, baud_explicit, error = self._resolve_baud(baud, module)
         if error:
             return False, error, self.status()
 
@@ -438,7 +450,7 @@ class CalibrationService:
         port = self._resolve_port(port)
         if not port:
             return False, '没有指定串口，配置里也没有设置串口', self.status()
-        baud, baud_explicit, error = self._resolve_baud(baud)
+        baud, baud_explicit, error = self._resolve_baud(baud, module)
         if error:
             return False, error, self.status()
 
@@ -528,7 +540,10 @@ class CalibrationService:
         port = self._resolve_port(port or snapshot.get('port'))
         if not port:
             return False, '没有指定串口，备份里也没有记录端口', self.status()
-        baud, baud_explicit, error = self._resolve_baud(baud)
+        # 还原没有"用户选型号"这一步，型号只能来自备份本身。
+        # 这一步不能省：留空波特率时要靠型号挑首试档（LG290P 460800 / LC29H(BS) 115200）。
+        baud, baud_explicit, error = self._resolve_baud(
+            baud, (plan.module or {}).get('model_key'))
         if error:
             return False, error, self.status()
 
@@ -711,11 +726,13 @@ class CalibrationService:
     def _baud_candidates(only, current=None, remembered=None):
         """采集/识别该试哪些波特率（按优先级，已去重）。
 
-        - 指定了型号 → 该型号厂商文档写的档位，`DEFAULT_BAUD`（手册示例 +
-          实测最可能命中的一档）打头，其余降序。首轮就押中最常见的 115200，
+        - 指定了型号 → 该型号厂商文档写的档位，`DEFAULT_BAUD`（该型号的
+          出厂默认档）打头，其余降序。首轮就押中这块模块的默认档，
           不像纯降序那样先拿 921600 白等两轮超时。
-        - 自动探测   → 所有已注册型号的档位并集 + 全局兜底表，
-          保证这块模块哪怕型号键还没被 `only` 覆盖到也能被找到。
+        - 自动探测   → 所有已注册型号的档位按**轮次交错**（不是整段拼接），
+          再加全局兜底表。交错是为了不让"注册得早的型号"独占队首：
+          拼接的话 LG290P 的 460800 会被前面型号的七八个档位压在后面，
+          插一块 LG290P 照样要错三四轮 —— 换了个型号就把别人拖慢，等于没做隔离。
         - 总把 `current`（用户手填的那个值）排在最前：它虽然没被声明为
           官方档位，但用户这么填通常是因为现场模块就跑在这个档上
           （换过固件、改过 CONFIG COM1、或是工程上约定的非标值）。
@@ -757,10 +774,21 @@ class CalibrationService:
             if candidates:
                 return head + [b for b in candidates if b not in head]
 
+        # 每个型号一段候选表，按**轮次**交错而不是整段拼接。
+        # 拼接的坏处：第一个注册的型号把队首全占了（它的全部档位都在别人前面）。
+        # 实测过这个坑 —— LG290P 的首选从 115200 改成 460800 之后，
+        # 拼接顺序变成 [115200, 3000000, 921600, 460800, ...]，
+        # 插一块 LG290P 仍要错三轮才轮到它自己的默认档。
+        # 交错之后各型号的默认档先聚在队首（115200 / 460800 各占一位），
+        # 之后才轮到次要档位，谁都不会被别的型号拖慢。
+        tables = [driver_manager.detect_bauds(key)
+                  for key in driver_manager.supported_driver_ids()]
+        tables.append(list(DETECT_BAUD_CANDIDATES))
         merged = []
-        for key in driver_manager.supported_driver_ids():
-            merged.extend(driver_manager.detect_bauds(key))
-        merged.extend(DETECT_BAUD_CANDIDATES)
+        for depth in range(max((len(t) for t in tables), default=0)):
+            for table in tables:
+                if depth < len(table):
+                    merged.append(table[depth])
         tail = ordered(merged) or list(DETECT_BAUD_CANDIDATES)
         return head + [b for b in tail if b not in head]
 
@@ -1583,6 +1611,27 @@ def _clean_module(module):
     return text
 
 
+def _default_baud_for(module=None):
+    """用户没填波特率时，第一档该从哪开始试。
+
+    **指定了型号 → 该型号自己的默认档**：LG290P 460800、LC29H(BS) 115200。
+    这就是驱动里 `DEFAULT_BAUD` 的意义 —— 它不是"整个程序统一的默认值"，
+    而是"这块模块出厂大概率停在哪一档"。留空时一律落 115200 的话，
+    选了 LG290P 的人点"识别"还是要先白等一轮 2 秒超时才轮到 460800。
+
+    没指定型号 → 全局兜底 115200（不猜型号时不押注，用最常见的一档）。
+
+    这里只决定**首试档**：押错之后按 `_scan_bauds` 的候选表继续试，
+    候选表同样按型号排（见 `_baud_candidates`）。
+    """
+    key = _clean_module(module)
+    if key:
+        table = driver_manager.detect_bauds(key)
+        if table:
+            return int(table[0])
+    return int(DEFAULT_BAUD)
+
+
 def _module_caps(module):
     """取用户**明确选定**型号的能力表；没选/选了未知型号返回 None。
 
@@ -1695,7 +1744,7 @@ def start_diagnose(port=None, baud=None, seconds=DEFAULT_OBSERVE_SECONDS, module
                                         module=module)
 
 
-def start_write(port=None, baud=None, ecef=None, lat=None, lon=None, height=0.0,
+def start_write(port=None, baud=None, ecef=None, lat=None, lon=None, height=None,
                 method='manual', msm=4, antenna=None, remark='',
                 dry_run=False, rtcm_timeout=DEFAULT_RTCM_TIMEOUT, module=None,
                 coord_msg='1005', arp=None):
@@ -2003,8 +2052,9 @@ def main(argv=None):
     write_group.add_argument('--write-ecef', metavar='X,Y,Z',
                              help='直接给 ECEF（即要写进模块的坐标），如 '
                                   '-2519265.0514,4849534.9045,3277834.6432')
-    write_group.add_argument('--write-latlon', metavar='LAT,LON[,H]',
-                             help='给经纬高（度/米），内部先转 ECEF 再写')
+    write_group.add_argument('--write-latlon', metavar='LAT,LON,H',
+                             help='给经纬高（度/米），内部先转 ECEF 再写。'
+                                  '三项都要给：只有经纬度时算不出该写进模块的高程')
     write_group.add_argument('--msm', default='4',
                              help='MSM 档位 4/5/6/7；keep = 沿用模块当前配置（不下发）。默认 4')
     write_group.add_argument('--coord-msg', default='1005',
@@ -2145,9 +2195,8 @@ def main(argv=None):
         ecef = _parse_triple(args.write_ecef, '--write-ecef') if args.write_ecef else None
         lat = lon = height = None
         if args.write_latlon:
-            values = _parse_triple(args.write_latlon, '--write-latlon', allow_two=True)
-            lat, lon = values[0], values[1]
-            height = values[2] if len(values) > 2 else 0.0
+            values = _parse_triple(args.write_latlon, '--write-latlon')
+            lat, lon, height = values[0], values[1], values[2]
         ok, message, _payload = service.start_write(
             port=args.port, baud=args.baud, ecef=ecef, lat=lat, lon=lon, height=height,
             msm=args.msm, remark=args.remark,
@@ -2178,10 +2227,14 @@ def main(argv=None):
     return 0 if final.get('stage') == 'DONE' else 1
 
 
-def _parse_triple(text, flag, allow_two=False):
-    """解析 `a,b,c` 这种三元素命令行参数。给了非法值直接抛 SystemExit(2)。"""
+def _parse_triple(text, flag):
+    """解析 `a,b,c` 这种三元素命令行参数。给了非法值直接抛 SystemExit(2)。
+
+    只认三个：`--write-latlon` 曾经允许省掉高程（按 0 处理），
+    那等于替用户断言"天线在椭球面上海平面"，已改成必须给全。
+    """
     parts = [item.strip() for item in str(text).replace('，', ',').split(',') if item.strip()]
-    need = 2 if allow_two else 3
+    need = 3
     if len(parts) < need:
         raise SystemExit(f'× {flag} 需要 {need} 个数字（用逗号分隔），收到 {text!r}')
     try:

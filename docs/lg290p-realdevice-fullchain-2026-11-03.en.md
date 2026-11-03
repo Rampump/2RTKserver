@@ -529,6 +529,17 @@ Measured effect on this device: **the first candidate hits, zero timeouts** (pre
 From the second run on, the read-back value also applies, and the hardware panel proves the rate
 came from the module rather than from a table.
 
+> **Revision in 3.1.3 (later on 2026-11-03)**: the `115200`-first order above is a fact about
+> *this particular unit* — it reads back as `UART1 115200 8N1` (firmware `LG290P03AANR01A03S`,
+> possibly reflashed or reconfigured). LG290P's **default rate under the vendor's default
+> configuration is 460800**, so from 3.1.3 `DEFAULT_BAUD` is 460800 and the table reads
+> `460800, 921600, 230400, 115200, 9600`.
+> The two do not conflict: **the read-back value still outranks the default**. This 115200 unit
+> keeps answering on the first try because "last read back: 115200" sits ahead of the table;
+> only a fresh 460800 unit benefits from the correction. LC29H(BS) is **115200** (its spec §2.3.8
+> says so verbatim) and the two values live in their own drivers — twelve cross-model isolation
+> contract tests fail if either one is ever copied onto the other.
+
 ### 8.5 "One-click calibration has no module selection"
 
 It does — the select box sits in the Device card — but nothing on the page said what it changed, so

@@ -172,7 +172,8 @@ def api_calibration_options():
     """
     modules = driver_manager.list_supported_modules()
     # 把"这块型号上次回读到的串口参数"贴到型号条目上：页面据此提示
-    # "留空则优先试 115200"，而不是让用户面对一个空输入框猜。
+    # "留空则先试该型号自己的默认档（LG290P 460800 / LC29H(BS) 115200）"，
+    # 而不是让用户面对一个空输入框猜。
     # 放在 API 层合并、不放进 driver_manager：驱动注册表不该反过来依赖标定库。
     try:
         profiles = {item.get('model_key'): item for item in store.list_profiles()}
@@ -199,7 +200,11 @@ def api_calibration_options():
     # 坐标描述的是**天线相位中心**这个物理点，跟谁去测、谁去播没关系。
     # 页面把模块型号/SN/标定时间一并显示出来，让用户自己核对"是不是同一根天线"，
     # 这比程序替他判定更可靠：程序根本不知道天线有没有被挪过。
-    reuse = latest[0] if latest else None
+    #
+    # 只挑**带完整 ECEF** 的那条：记录可以只有经纬度（按约定不再反算 ECEF），
+    # 或者来自一次中断的运行。把这种行当默认复用项，用户点完会收到
+    # "请填写 ECEF 或经纬高" —— 库里明明有能用的记录。
+    reuse = store.get_latest_with_coord()
     snap = calib.status()
     return jsonify({
         'ok': True,
@@ -215,6 +220,9 @@ def api_calibration_options():
         'reuse_history': [_mask_obj(reuse)] if reuse else [],
         'backup': calib.backup_info(),
         'defaults': {
+            # 只是"没选型号时"的兜底展示值。**真正的首试档由型号决定**：
+            # 输入框留空且选了型号时，后端走 `_default_baud_for(module)`
+            # （LG290P 460800 / LC29H(BS) 115200），不读这个字段。
             'baud': 115200,
             # 上次回读到的波特率（任意型号）。前端只在用户留空且选了具体型号时
             # 才拿它当提示，不会覆盖用户的显式输入。
@@ -307,7 +315,10 @@ def api_calibration_start():
         ok, message, payload = calib.start_write(
             port=port, baud=baud,
             ecef=body.get('ecef'), lat=body.get('lat'), lon=body.get('lon'),
-            height=body.get('height') or 0.0,
+            # 高程**不要**在这里补 0：缺了就让它缺，由 WritePlan 报"必须给高程"。
+            # 补 0 等于替用户断言"天线在椭球高 0 米"，而这个断言在页面上看不出来，
+            # 后果是整站静默低几十米（校验链路只核对"写入 == 播发"，两个都错就查不出）。
+            height=body.get('height'),
             arp=body.get('arp'),
             method='manual', msm=_msm_value(body.get('msm')),
             antenna=body.get('antenna'),

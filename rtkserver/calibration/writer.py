@@ -268,7 +268,7 @@ class WritePlan:
 
     # ---------- 构造 ----------
     @classmethod
-    def build(cls, ecef=None, lat=None, lon=None, height=0.0,
+    def build(cls, ecef=None, lat=None, lon=None, height=None,
               method='manual', mode='base', svin_mode='fixed', survey_in=None,
               msm=4, antenna=None, remark='', verify_rtcm=True, coord_msg='1005',
               arp=None):
@@ -565,7 +565,21 @@ def _ecef_from_geodetic(lat, lon, height):
         raise ValueError(f'纬度必须在 -90~90 之间，收到 {lat}')
     if not (-180.0 <= lon <= 180.0):
         raise ValueError(f'经度必须在 -180~180 之间，收到 {lon}')
-    return geodetic_to_ecef(lat, lon, float(height or 0.0))
+    # 高程缺失**不能**默认成 0。椭球高 0 是"海平面"，而内陆城市的地面高程
+    # 常有几十到几百米；静默按 0 算，写进模块的 ECEF 就会整体低一模高，
+    # 而且这件事在 1005 校验里查不出来（校验只核对"写入 == 播发"，
+    # 两者都错得一样）。宁可让用户补一个数，也不要把错坐标钉进基站。
+    if height is None or height == '':
+        raise ValueError('给了经纬度就必须同时给高程（椭球高）。'
+                         '只填经纬度的话，写进模块的 ECEF 会被当成海平面，'
+                         '整站要静默低几十米；不知道高程就改用 ECEF 输入。')
+    try:
+        height = float(height)
+    except (TypeError, ValueError):
+        raise ValueError(f'高程必须是数字，收到 {height!r}')
+    if not (math.isfinite(lat) and math.isfinite(lon) and math.isfinite(height)):
+        raise ValueError('经纬高里出现了 NaN / inf，无法换算成 ECEF')
+    return geodetic_to_ecef(lat, lon, height)
 
 
 def _check_msm(value):
@@ -1072,7 +1086,9 @@ class CoordinateWriter:
         # 基站模式切完后要重启才生效（协议规范 §4.1 生效条件"需要重启"），而
         # `$PQTMSVINSTATUS` 只在基站模式输出（真机实测 rover 下开状态输出直接 ERROR,1）。
         # 所以在配 survey-in 之前，先重启一次让基站模式真正起来。
-        if plan.mode_ack in ('ack', 'deferred'):
+        # 声明了"不需要重启"的型号（无重启命令、配置即时生效）跳过这一步。
+        if plan.mode_ack in ('ack', 'deferred') and getattr(self.driver,
+                                                            'RESTART_REQUIRED', True):
             self._stage('SVIN_CFG', '重启让基站模式生效（SVINSTATUS 只在基站模式输出）')
             ok, message, data = self.driver.reboot()
             if not ok:
@@ -2646,12 +2662,19 @@ class CoordinateWriter:
             ok2, message2, readback = self.driver.read_rtcm_config()
             if not ok2:
                 raise WriteFailed('MSG_SETUP', f'RTCM 配置回读失败：{message2}', readback)
-            fields = readback.get('fields') or []
-            if not fields or _to_int(fields[0]) != msm:
+            # 回读的档位优先取驱动翻译好的 `msm_type`：
+            # 不是每个型号都有"七字段"（LC29H(BS) 只有一个全局 PAIR432 开关，
+            # 它的 read_rtcm_config 明确返回空的 fields）。只看 `fields[0]` 的话，
+            # 那台模块回读永远得到 None，一次都过不了这关。
+            got_msm = readback.get('msm_type')
+            if got_msm is None:
+                fields = readback.get('fields') or []
+                got_msm = _to_int(fields[0]) if fields else None
+            if got_msm != msm:
                 raise WriteFailed(
                     'MSG_SETUP',
-                    f'RTCM 回读的 MSM 档位是 {fields[0] if fields else "(空)"}，应为 {msm}',
-                    readback)
+                    f'RTCM 回读的 MSM 档位是 {got_msm if got_msm is not None else "(空)"}，'
+                    f'应为 {msm}', readback)
 
         # 3.2 坐标报文：1005（默认）或 1006（多带一个天线高度）。
         #     1006 自带 1005 的全部字段，所以选 1006 时不必再开 1005；
@@ -2689,7 +2712,14 @@ class CoordinateWriter:
         #     差分，可用卫星数直接砍半、固定变慢。所以这里逐个打开。
         #     失败只记警告：基站模式默认就播 GPS MSM4，少开星座不影响"能不能用"，
         #     但会让精度变差，所以要在结果里能看出来。
-        constellations = getattr(self.driver, 'MSM_CONSTELLATIONS', None) or ('RTCM3-107X',)
+        # 空元组是"明确声明：本型号只有一个全局开关，不逐星座下发"（LC29H(BS) 就是这样）。
+        # 所以只能判 None，不能用 `or` —— 早先写成 `... or ('RTCM3-107X',)`，
+        # 空表会被兜成默认值，于是对只有一个全局 MSM 开关的型号照样逐条发
+        # `RTCM3-107X`，换来一串"不支持"的假警告。
+        constellations = getattr(self.driver, 'MSM_CONSTELLATIONS', None)
+        if constellations is None:
+            constellations = ('RTCM3-107X',)
+
         if msm:
             opened, failed = [], []
             for name in constellations:
@@ -2841,6 +2871,19 @@ class CoordinateWriter:
     # ---------- 步骤 5：重启（§8.1 第 5 步 / §8.5） ----------
     def _step_restart(self, plan, attempt=1):
         self._checkpoint()
+        # 有些型号的协议里**根本没有重启命令**，而它们的配置又是即时生效的
+        # （例：LC29H(BS) 的 PQTMCFGSVIN / PAIR432 都立即生效，只有改波特率
+        # 需要断电重启，那一步本来就不在标定流程里）。这类驱动声明
+        # `RESTART_REQUIRED = False`，这里跳过软重启并如实记录 ——
+        # 否则每次标定都死在"模块没有重启成功"，而模块其实早就配好了。
+        if not getattr(self.driver, 'RESTART_REQUIRED', True):
+            self.result['restart'] = {'skipped': True, 'reason': 'no_reboot_command'}
+            self._warn('本型号没有软重启命令（配置即时生效），已跳过重启；'
+                       '如需确认掉电后仍保持，请手动断电重启一次再校验')
+            self._record_step('RESTART', True, '本型号无软重启命令，配置即时生效（已跳过）',
+                              self.result['restart'])
+            return
+
         self._stage('RESTART', '软重启（SRR），等模块重新上线')
         ok, message, data = self.driver.reboot()
         if not ok:
@@ -2853,36 +2896,50 @@ class CoordinateWriter:
     # ---------- 步骤 6：重启后回读（§8.1 第 6 步） ----------
     def _step_verify_mode(self, plan):
         self._checkpoint()
-        self._stage('VERIFY_MODE', '重启后回读模式与坐标（NVM 持久化确认）')
+        # 没有软重启命令的型号（RESTART 已跳过）这里读的是**当前内存态**：
+        # 配置是即时生效的，所以"生效"能确认；但"掉电后还在"这件事只有断电才知道，
+        # 文案必须分清，不能拿"重启后"骗自己（真机上这一步曾直接写死"重启后"）。
+        #
+        # 判据用**本次流程实际有没有跳过重启**，而不是再读一遍 `RESTART_REQUIRED`：
+        # 后者回答的是"这个型号需不需要重启"，不是"这次到底重启了没有"。
+        # 将来若新增别的跳过条件（例如 dry-run），读属性就会把"没重启"说成"重启后"。
+        restarted = not bool((self.result.get('restart') or {}).get('skipped'))
+        when = '重启后' if restarted else '当前（未重启）'
+        self._stage('VERIFY_MODE',
+                    f'{when}回读模式与坐标（{"NVM 持久化确认" if restarted else "配置生效确认"}）')
+
         ok, message, mode_data = self.driver.get_mode()
         if not ok:
-            raise WriteFailed('VERIFY_MODE', f'重启后读不到工作模式：{message}', mode_data)
+            raise WriteFailed('VERIFY_MODE', f'{when}读不到工作模式：{message}', mode_data)
         actual = mode_data.get('mode')
         if actual != plan.mode:
             raise WriteFailed('VERIFY_MODE',
-                              f'重启后模式是 {actual}，不是 {plan.mode}：'
-                              f'配置没有持久化成功（请检查模块 NVM/是否被复位）', mode_data)
+                              f'{when}模式是 {actual}，不是 {plan.mode}：'
+                              f'{"配置没有持久化成功（请检查模块 NVM/是否被复位）" if restarted else "写入没有生效"}',
+                              mode_data)
         if plan.mode_ack == 'deferred':
             self.result['mode_ack'] = 'confirmed_after_reboot'
 
         ok, message, readback = self.driver.get_svin_config()
         if not ok:
-            raise WriteFailed('VERIFY_MODE', f'重启后读不到坐标配置：{message}', readback)
+            raise WriteFailed('VERIFY_MODE', f'{when}读不到坐标配置：{message}', readback)
         if plan.svin_mode == 'fixed':
             verdict = _compare_fixed(readback, plan.arp[0], plan.arp[1], plan.arp[2])
             if not verdict['ok']:
                 raise WriteFailed(
                     'VERIFY_MODE',
-                    f'重启后坐标与写入值不一致（模式={readback.get("mode")}，'
+                    f'{when}坐标与写入值不一致（模式={readback.get("mode")}，'
                     f'最大轴差 {verdict["delta"]["max_axis"]:.4f} m）：'
-                    f'配置没有持久化成功', readback)
+                    f'{"配置没有持久化成功" if restarted else "写入没有生效"}', readback)
             self.result['verify']['readback'] = verdict['readback']
             self.result['verify']['delta'] = verdict['delta']
         elif plan.svin_mode == 'survey_in' and readback.get('mode') != 'survey_in':
             raise WriteFailed('VERIFY_MODE',
-                              f'重启后坐标模式是 {readback.get("mode")}，不是 survey_in', readback)
+                              f'{when}坐标模式是 {readback.get("mode")}，不是 survey_in',
+                              readback)
+        tail = 'NVM 持久化确认通过' if restarted else '配置已生效，持久化待断电复核'
         self._record_step('VERIFY_MODE', True,
-                          f'重启后模式 {actual}、坐标一致（NVM 持久化确认通过）', readback)
+                          f'{when}模式 {actual}、坐标一致（{tail}）', readback)
 
     # ---------- 步骤 7：1005 一致性校验（§8.6） ----------
     # **语义边界（极易被误读）**：1005 播发的就是模块内部存的那份坐标，

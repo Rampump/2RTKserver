@@ -165,8 +165,9 @@
       hint.classList.add('is-warn');
       return;
     }
-    if (bauds.length && bauds.indexOf(legal) < 0) {
-      hint.textContent = t('cal.baud.offlist', { value: legal, list: bauds.join(' / ') });
+    var allowed = currentModuleLegalBauds();
+    if (allowed.length && allowed.indexOf(legal) < 0) {
+      hint.textContent = t('cal.baud.offlist', { value: legal, list: allowed.join(' / ') });
       hint.classList.add('is-warn');
       return;
     }
@@ -190,9 +191,20 @@
   }
 
   // 当前所选型号的官方波特率档位（自动探测时返回空数组 = 不限制）。
+  // 这是**探测顺序**：首项是该型号自己的默认档（LG290P 460800 / LC29H(BS) 115200），
+  // 押错之后依次往下试。提示文案里的"优先试 X"取的就是首项。
   function currentModuleBauds() {
     var mod = selectedModule();
     return (mod && mod.bauds) ? mod.bauds : [];
+  }
+
+  // 当前型号**可以设置**的全部档位（降序，含不进探测序列的那些）。
+  // 校验"手填值合不合法"必须用这张表：LC29H(BS) 的 3000000 是 UART2 的档，
+  // 不会出现在探测序列里，但手填 3000000 依然合法，不能判成"不在官方档位"。
+  function currentModuleLegalBauds() {
+    var mod = selectedModule();
+    if (mod && mod.set_bauds && mod.set_bauds.length) return mod.set_bauds;
+    return currentModuleBauds();
   }
 
   // 这块型号上次"模块自报"的波特率（0 = 没有记录，别拿 0 当有效值）。
@@ -207,12 +219,15 @@
   // 型号切换时刷新 datalist 候选与提示文案
   function refreshBaudOptions() {
     var list = $('cal-baud-list');
-    var bauds = currentModuleBauds();
+    // 候选给的是**可设置全集**（不是探测顺序）：用户手动填的时候要能看到
+    // 3000000 这种"不进探测序列但合法"的档位。
+    var bauds = currentModuleLegalBauds();
     if (!bauds.length) {
       // 自动探测：把已注册型号的档位并起来给个参考（去重、降序）
       var set = [];
       (((STATE.options || {}).modules || {}).all || []).forEach(function (m) {
-        (m.bauds || []).forEach(function (b) { if (set.indexOf(b) < 0) set.push(b); });
+        var table = (m.set_bauds && m.set_bauds.length) ? m.set_bauds : (m.bauds || []);
+        table.forEach(function (b) { if (set.indexOf(b) < 0) set.push(b); });
       });
       bauds = set.sort(function (a, b) { return b - a; });
     }
@@ -1346,7 +1361,11 @@
         } else {
           payload.lat = parseFloat($('cal-lat').value);
           payload.lon = parseFloat($('cal-lon').value);
-          payload.height = parseFloat($('cal-h').value) || 0;
+          // 高程留空就传 null，**不要** `|| 0`。
+          // `parseFloat('') || 0` 会把"没填"变成"椭球高 0 米"，而 0 是海平面 ——
+          // 内陆站因此静默低几十米，且校验链路查不出来（写入与播发错得一样）。
+          var rawH = ($('cal-h').value || '').trim();
+          payload.height = rawH === '' ? null : parseFloat(rawH);
         }
       }
     }
@@ -1366,6 +1385,13 @@
       // 复用分支下发的是 arp，手输下发的是 ecef / lat，两条通路都要认
       var hasCoord = payload.ecef || payload.arp || isFinite(payload.lat);
       if (!hasCoord) return t('cal.err.need_coord');
+      // 走经纬度这条路时高程是必填：少了它算不出要写进模块的 ECEF。
+      // 之前这里放过去、后端再补 0，等于把整站钉在海平面上。
+      if (!payload.ecef && !payload.arp && isFinite(payload.lat)
+          && (payload.height === null || payload.height === undefined
+              || !isFinite(payload.height))) {
+        return t('cal.err.need_height');
+      }
     }
     // 能力互斥：后端第一步也会拦，但让用户点按钮之前就知道，
     // 比跑起来再报错省一次等待（而且省掉一次串口占用）。
@@ -1511,7 +1537,7 @@
     STATE.corsSource = 'measure';
     STATE.coordSource = 'typing';
     syncMethod();
-    var target = $('cal-cors-card') || $('cal-sec-method');
+    var target = $('cal-cors-card');
     if (target && target.scrollIntoView) {
       target.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
