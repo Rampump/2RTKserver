@@ -39,6 +39,13 @@
 **1006、1007、1033 只支持输入，不支持输出** —— 写进 CFG-MSGOUT 会直接
 ACK-NAK。本驱动显式拒绝（`COORD_MSG_UNSUPPORTED`），不做"配了但没播"。
 
+但 1006/1007 与 1033 的"不支持"性质**不同**，报错文案必须分开（已按此实现）：
+    · 1006/1007 —— 配置键存在（`RTCM_INPUT_ONLY`），能 VALGET 到 0，
+                   只是模块不输出 → 文案"只支持输入"
+    · 1033      —— **配置键根本不存在**（pyubx2 的 1343 个键里没有
+                   `CFG_MSGOUT_RTCM_3X_TYPE1033_*` 任何一个）→ 写它必 NAK，
+                   文案要直接指向"必须改用 1230"（`RTCM_NO_KEY`）
+
 其余规则（见 `validate_rtcm_plan`）：
     · 所有观测报文必须同速率
     · 同一星座只能开一种观测报文
@@ -66,6 +73,16 @@ HP 字段范围 -127~+127，漏写就差出厘米级。高度同理：`HEIGHT`=c
 不带 INF 说明，换波特率/换 layer 都复现 —— 极容易被误读成"模块不支持该键"。
 详见 `_valset` 的注释。
 
+## CFG-CFG 载荷是 13 字节，最后 1 字节是 deviceMask
+
+    clearMask(4) | saveMask(4) | loadMask(4) | deviceMask(**1**)
+
+**最后那个字段只有 1 字节**，写成 `<IIII` 会多送 3 个 `0x00`，模块按错位
+解析后直接 NAK。这个坑在 `save()` 里潜伏过很久（表现是"配置写了能用，
+重启就丢"，极易被归因成 Flash 坏了或固件问题）。现在统一用 `<IIIB`，
+`deviceMask` 的位也和另外三个掩码**不是同一套**：bit0=BBR bit1=Flash
+bit2=EEPROM（`K.CFG_CFG_DEV_*`）。
+
 ## 本驱动**没有**做的事（不是忘了）
 
 · 1033 天线信息写入：F9P 不输出 1033（输出表里没有），`set_antenna_info`
@@ -89,9 +106,11 @@ CAPS = {
     'fixed': True,          # §3.1.5.4
     'ant_info': False,      # 不输出 1033（输出表里没有）
     'ant_delta': False,     # 不输出 1006
-    'msg_rate': True,       # CFG-MSGOUT-* 逐条可配
+    'msg_rate': True,       # CFG-MSGOUT-* 逐条可配（NAV/NMEA/RXM/RTCM 四类）
     'rtcm_out': True,       # CFG-MSGOUT-RTCM_3X_*
     'err3': False,          # UBX 用 ACK-NAK 表达拒绝，没有"错误码 3"这套
+    'valdel': True,         # CFG-VALDEL 删键（只能作用 BBR/Flash，不能作用 RAM）
+    'factory_reset': True,  # CFG-CFG clear+load，注意会把波特率打回 38400
 }
 
 # TMODE_MODE 取值（§3.1.5 + ubx_keys 注释）
@@ -137,9 +156,17 @@ def pack_value(type_info, value):
     """按键的类型打包一个值。返回 bytes。
 
     `type_info` 是 `(name, size, signed)` 三元组。调用方负责缩放换算，
-    这里只收**已经换算好的整数**。
+    这里只收**已经换算好的数值**。
+
+    浮点键（`R4`/`R8`）的 name 首字母是 `R`，值原样按 IEEE754 打包，
+    **不做 int(round())** —— 那会把 0.5 Hz 之类的值抹成 0。
     """
-    _name, size, signed = type_info
+    name, size, signed = type_info
+    if name[:1] == 'R':
+        fmt = {4: '<f', 8: '<d'}.get(size)
+        if fmt is None:
+            raise DriverBug(f'不支持的浮点键长：{size}')
+        return struct.pack(fmt, float(value))
     value = int(round(value))
     if size == 1:
         if not (-128 <= value <= 127 if signed else 0 <= value <= 255):
@@ -149,20 +176,30 @@ def pack_value(type_info, value):
         return struct.pack('<h' if signed else '<H', value)
     if size == 4:
         return struct.pack('<i' if signed else '<I', value)
+    if size == 8:
+        # 8 字节整数键（X8）只可能是无符号，有符号的 I8 在 F9P 键表里不存在
+        return struct.pack('<q' if signed else '<Q', value)
     raise DriverBug(f'不支持的键长：{size}')
 
 
 def unpack_value(type_info, raw):
-    """从字节里解一个值（原始整数，未缩放）。"""
-    _name, size, signed = type_info
+    """从字节里解一个值（原始数值，未缩放）。"""
+    name, size, signed = type_info
     if len(raw) < size:
         raise DriverBug(f'值长度不足：要 {size} 字节，只有 {len(raw)}')
+    if name[:1] == 'R':
+        fmt = {4: '<f', 8: '<d'}.get(size)
+        if fmt is None:
+            raise DriverBug(f'不支持的浮点键长：{size}')
+        return struct.unpack(fmt, raw[:size])[0]
     if size == 1:
         return struct.unpack('<b' if signed else '<B', raw[:1])[0]
     if size == 2:
         return struct.unpack('<h' if signed else '<H', raw[:2])[0]
     if size == 4:
         return struct.unpack('<i' if signed else '<I', raw[:4])[0]
+    if size == 8:
+        return struct.unpack('<q' if signed else '<Q', raw[:8])[0]
     raise DriverBug(f'不支持的键长：{size}')
 
 
@@ -265,8 +302,12 @@ class ZEDF9PDriver(BaseDriver):
         **一次一条 VALSET，等一个 ACK**（§3.1.1）：一条里塞多个 key 是合法的，
         多个 key 共享同一个 ACK；但两条 VALSET 之间必须等上一条的 ACK。
 
-        `layers` 默认同时写 RAM 和 Flash：只写 RAM 掉电就丢，
-        只写 Flash 要重启才生效，两个都写才是"立刻生效且断电不丢"。
+        `layers` 默认写全部三层（RAM|BBR|Flash = 0x07），与 pyubx2 官方
+        `f9p_basestation.py` 的写法一致：只写 RAM 掉电就丢，只写 Flash 要重启
+        才生效，三层全写才是"立刻生效、断电不丢、断电前也留在后备 RAM"。
+
+        **单条 key 数上限 64**（`K.MAX_KEYS_PER_VALSET`，pyubx2 里同样卡这个数）。
+        超了模块直接 NAK，且 NAK 不告诉你是哪个键，所以在这里先拦。
 
         ## 载荷头是 **4 字节**，不是 3 字节（真机踩过的坑）
 
@@ -286,9 +327,13 @@ class ZEDF9PDriver(BaseDriver):
         这个坑只在写侧暴露。
         """
         if layers is None:
-            layers = K.LAYER_RAM | K.LAYER_FLASH
+            layers = K.LAYER_ALL
         if not items:
             return True, '无需写入', {'keys': 0}
+        if len(items) > K.MAX_KEYS_PER_VALSET:
+            raise DriverBug(
+                f'一条 VALSET 最多 {K.MAX_KEYS_PER_VALSET} 个键，收到 {len(items)} 个；'
+                f'请拆成多条分批下发')
 
         # version=0x00, layer, transaction=0x00, reserved0=0x00
         payload = bytearray([0x00, layers & 0xFF, 0x00, 0x00])
@@ -298,9 +343,11 @@ class ZEDF9PDriver(BaseDriver):
             if rec is None:
                 raise DriverBug(f'配置键 {name!r} 不在键表里（ubx_keys.py）')
             key_id, type_info, scale, _note = rec
-            # 缩放：调用方给物理值（cm / mm / deg），这里换算成原始整数
-            raw_value = int(round(float(value) / scale)) if scale != 1.0 \
-                else int(round(float(value)))
+            # 缩放：调用方给物理值（cm / mm / deg），这里换算成原始值。
+            # 浮点键（R4/R8）不取整，保留小数；整数键必须 round 成 int，
+            # 否则 pack_value 的 int(round()) 会把 1e-7 度之类的残差抹掉。
+            scaled = float(value) / scale if scale != 1.0 else float(value)
+            raw_value = scaled if type_info[0][:1] == 'R' else int(round(scaled))
             payload += struct.pack('<I', key_id)
             payload += pack_value(type_info, raw_value)
             written.append((name, value, key_id))
@@ -363,6 +410,42 @@ class ZEDF9PDriver(BaseDriver):
             pos += size
             values[name] = raw_value * scale if scale != 1.0 else raw_value
         return values, layer
+
+    def _valdel(self, key_names, layers=None):
+        """删掉一组配置键（UBX-CFG-VALDEL，0x06/0x8C）。
+
+        载荷与 VALSET **同构，但只有 key 没有 value**：
+            `version(1) | layer(1) | transaction(1) | reserved0(1) | key(4) ...`
+
+        用途：把某个键从 Flash/BBR 里删掉，让它回落到默认值或上一层的值。
+        **不能作用于 RAM 层** —— 删 RAM 没有语义（RAM 本来就是易失的），
+        模块对 `layer=RAM` 的 VALDEL 直接 NAK。所以这里默认
+        `BBR|Flash`，并且显式拒绝只带 RAM 的调用。
+        """
+        if layers is None:
+            layers = K.LAYER_BBR | K.LAYER_FLASH
+        if layers & K.LAYER_RAM and not (layers & ~K.LAYER_RAM):
+            raise DriverBug('CFG-VALDEL 不能只作用于 RAM 层（模块会 NAK）；'
+                            '请改用 LAYER_BBR | LAYER_FLASH')
+        names = [n for n in key_names if K.lookup(n) is not None]
+        if not names:
+            return True, '无需删除', {'keys': 0}
+        if len(names) > K.MAX_KEYS_PER_VALSET:
+            raise DriverBug(
+                f'一条 VALDEL 最多 {K.MAX_KEYS_PER_VALSET} 个键，收到 {len(names)} 个')
+
+        payload = bytearray([0x00, layers & 0xFF, 0x00, 0x00])
+        deleted = []
+        for name in names:
+            key_id = K.lookup(name)[0]
+            payload += struct.pack('<I', key_id)
+            deleted.append((name, key_id))
+        ok, message = self._send_ubx(*K.MSG_CFG_VALDEL, bytes(payload))
+        data = {'keys': len(deleted), 'layers': layers,
+                'items': [{'key': n, 'key_id': f'0x{i:08X}'} for n, i in deleted]}
+        if not ok:
+            data['error'] = 'nak' if message == 'NAK' else 'timeout'
+        return ok, message, data
 
     # ==================== 识别 ====================
     def detect(self):
@@ -731,50 +814,93 @@ class ZEDF9PDriver(BaseDriver):
         return self.set_mode('disabled', persist=persist, restart=restart)
 
     # ==================== 报文速率 / RTCM ====================
+    @staticmethod
+    def _resolve_msg_key(name):
+        """把报文名翻成键表里的键名。返回 `(key_name, err)`，`err` 非空即失败。
+
+        支持四类写法（不区分大小写，`RTCM3-` / `RTCM-` / `RTCM` 前缀可省）：
+            1005 / RTCM3-1005          → `RTCM_1005`
+            NAVSVIN / NAV_SVIN         → `NAVOUT_NAV_SVIN`
+            GGA / NMEA-GGA             → `NMEAMOUT_GGA`
+            RAWX / RXM-RAWX            → `RXMOUT_RXM_RAWX`
+
+        **设置和读取共用这一个函数**：以前两处各写一份 if/elif，
+        加一个报文类型就得记着改两个地方，漏一个就表现为"能设不能读"。
+        """
+        token = str(name).strip().upper()
+        for prefix in ('RTCM3-', 'RTCM-', 'RTCM', 'NMEA-', 'NMEA', 'RXM-', 'UBX-'):
+            if token.startswith(prefix):
+                token = token[len(prefix):]
+                break
+        token = token.strip('-_')
+
+        # 4072.0 / 4072.1 带小数点，不满足 isdigit，得先单独识别，
+        # 否则会被归成"不认识的名字"，用户看不出是固件不支持。
+        if '.' in token:
+            try:
+                frac = float(token)
+            except ValueError:
+                return None, f'F9P 驱动不认识报文名 {name!r}'
+            if frac in K.UNSUPPORTED_RTCM:
+                return None, f'RTCM {token} {K.UNSUPPORTED_RTCM[frac]}'
+            if frac in K.RTCM_4072_KEYS:
+                return None, (f'RTCM {token} 的键（{K.RTCM_4072_KEYS[frac]:#010x}）'
+                              f'在键表里，但本机固件实测 VALGET 静默不回、'
+                              f'不确认能否输出，暂不下发')
+            return None, f'F9P 不支持输出 RTCM {token}'
+
+        if token.isdigit():
+            num = int(token)
+            if num in K.RTCM_OUT:
+                return f'RTCM_{num}', None
+            if num in K.RTCM_INPUT_ONLY:
+                return None, (f'RTCM {num} 在 ZED-F9P 上只支持输入、不支持输出'
+                              f'（底噪/天线相位中心等基准站元数据类报文）')
+            if num in K.RTCM_NO_KEY:
+                return None, (f'RTCM {num} 在 ZED-F9P 上没有对应的配置键：'
+                              f'{K.RTCM_NO_KEY[num]}')
+            return None, f'F9P 不支持输出 RTCM {num}'
+
+        if token in K.NAV_OUT:
+            return f'NAVOUT_{token}', None
+        # NMEA 常写成 GGA / GPGGA / NMEA-GGA，剥掉 2 字母 talker 前缀再认一次
+        nmea = token[2:] if len(token) == 5 and token[:2].isalpha() else token
+        if nmea in K.NMEA_OUT:
+            return f'NMEAMOUT_{nmea}', None
+
+        # 归一化兜底：把两边的下划线全去掉再比，让 `NAVSVIN` / `NAV_SVIN`
+        # 与 `RAWX` / `RXM_RAWX` 都能命中。**不做前缀穷举** —— 键表里
+        # 每个组的前缀不一样（NAVOUT_/RXMOUT_/NMEAMOUT_），穷举必漏。
+        flat = token.replace('_', '').replace('-', '')
+        for group, prefix, strip in (
+                (K.NAV_OUT, 'NAVOUT_', 'NAV_'),
+                (K.RXM_OUT, 'RXMOUT_', 'RXM_'),
+                (K.NMEA_OUT, 'NMEAMOUT_', ''),
+                (K.NAV_OUT_USB, 'NAVOUT_', 'NAV_')):
+            for key in group:
+                candidates = {key.replace('_', ''),
+                              key[len(strip):].replace('_', '') if strip else None}
+                if flat in candidates:
+                    return f'{prefix}{key}', None
+        return None, f'F9P 驱动不认识报文名 {name!r}'
+
     def set_message_rate(self, name, rate, port=None, **kwargs):
         """配某条报文的输出速率。
 
-        `name` 支持三种写法：
-            'RTCM3-1005' / '1005'      → CFG-MSGOUT-RTCM_3X_TYPE1005_UART1
-            'RTCM3-NAVSVIN' / 'NAVSVIN' → CFG-MSGOUT-UBX_NAV_SVIN_UART1
-            'GGA' / 'NMEA-GGA'          → CFG-MSGOUT-NMEA_ID_GGA_UART1（本驱动不含，见下）
+        `name` 的写法见 `_resolve_msg_key()`：
+            'RTCM3-1005' / '1005'  → CFG-MSGOUT-RTCM_3X_TYPE1005_UART1
+            'NAVSVIN' / 'NAV_SVIN' → CFG-MSGOUT-UBX_NAV_SVIN_UART1
+            'GGA' / 'NMEA-GGA'     → CFG-MSGOUT-NMEA_ID_GGA_UART1
+            'RAWX'                 → CFG-MSGOUT-RXM_RAWX_UART1
         `rate` = 每历元输出次数（Hz），0 = 关闭。
 
         流程层只会用 `COORD_MSG` 里的名字（'RTCM3-1005'）来"表达要播坐标"，
         本驱动把它翻成 1005 的 MSGOUT 键 —— 和 LC29H(BS) 把
         `set_message_rate('RTCM3-1005', 1)` 翻成 PAIR434 是同一件事。
         """
-        token = str(name).strip().upper()
-        for prefix in ('RTCM3-', 'RTCM-', 'RTCM'):
-            if token.startswith(prefix):
-                token = token[len(prefix):]
-                break
-        key_name = None
-        msg_num = None
-        # 4072.0 / 4072.1 带小数点，不满足 isdigit，得先单独识别，
-        # 否则会被归成"不认识的名字"，用户看不出是固件不支持。
-        try:
-            if '.' in token:
-                frac = float(token)
-                if frac in K.UNSUPPORTED_RTCM:
-                    return False, (f'RTCM {token} {K.UNSUPPORTED_RTCM[frac]}'), {
-                        'error': 'unsupported', 'msg': token}
-        except ValueError:
-            pass
-        if token.isdigit():
-            msg_num = int(token)
-            if msg_num not in K.RTCM_OUT:
-                if msg_num in (1006, 1007, 1033):
-                    return False, (f'RTCM {msg_num} 在 ZED-F9P 上只支持输入、'
-                                   f'不支持输出'), {'error': 'unsupported', 'msg': msg_num}
-                return False, f'F9P 不支持输出 RTCM {msg_num}', {
-                    'error': 'unsupported', 'msg': msg_num,
-                    'supported': sorted(K.RTCM_OUT)}
-            key_name = f'RTCM_{msg_num}'
-        elif token in K.NAV_OUT:
-            key_name = f'NAVOUT_{token}'
-        else:
-            return False, f'F9P 驱动不认识报文名 {name!r}', {'error': 'unknown_msg'}
+        key_name, err = self._resolve_msg_key(name)
+        if key_name is None:
+            return False, err, {'error': 'unsupported', 'msg': name}
 
         try:
             value = max(0, int(rate))
@@ -789,18 +915,10 @@ class ZEDF9PDriver(BaseDriver):
         return True, f'{name} 速率已设为 {value}', data
 
     def get_message_rate(self, name, msg_ver=None):
-        """查某条报文的输出速率。"""
-        token = str(name).strip().upper()
-        for prefix in ('RTCM3-', 'RTCM-', 'RTCM'):
-            if token.startswith(prefix):
-                token = token[len(prefix):]
-                break
-        if token.isdigit():
-            key_name = f'RTCM_{int(token)}'
-        elif token in K.NAV_OUT:
-            key_name = f'NAVOUT_{token}'
-        else:
-            return False, f'F9P 驱动不认识报文名 {name!r}', {'error': 'unknown_msg'}
+        """查某条报文的输出速率。解析规则与 `set_message_rate` 完全一致。"""
+        key_name, err = self._resolve_msg_key(name)
+        if key_name is None:
+            return False, err, {'error': 'unsupported', 'msg': name}
         values, _ = self._valget([key_name])
         if key_name not in values:
             return False, f'读取 {name} 速率失败（无应答）', {'error': 'timeout'}
@@ -1012,14 +1130,74 @@ class ZEDF9PDriver(BaseDriver):
         """
         # UBX-CFG-CFG 载荷：clearMask(4) saveMask(4) loadMask(4) deviceMask(1)
         # saveMask bit0=IO  bit1=MSG  bit2=INF  bit3=NAV  bit4=RINV
-        # 我们只保存配置类（IO/MSG/NAV），不清除任何东西。
-        save_mask = 0x17          # bit0|bit1|bit2|bit4 ... 保守取 0x1F 覆盖全部配置
-        payload = struct.pack('<IIII', 0, save_mask, 0, 0x11)  # deviceMask bit0=BBR bit4=Flash
+        # 我们只保存配置类（IO/MSG/INF/NAV/RINV），不清除任何东西。
+        save_mask = K.CFG_CFG_LOAD_MASK       # 0x1F1F：低字节 lproto、高字节 classes
+        # deviceMask：bit0=BBR  bit1=Flash  bit2=EEPROM。F9P 只有 BBR + Flash。
+        # **旧代码写的 0x11 是错的** —— 那是 bit0|bit4，bit4 在 F9P 上无意义。
+        # 载荷固定 13 字节（最后 1 字节是 deviceMask），写成 `<IIII` 会多 3 个 0。
+        payload = struct.pack('<IIIB', 0, save_mask, 0, K.CFG_CFG_DEV_BBR_FLASH)
         ok, message = self._send_ubx(*K.MSG_CFG_CFG, payload)
         if not ok:
             return False, f'保存配置失败（{message}）', {
                 'error': 'nak' if message == 'NAK' else 'timeout'}
-        return True, '配置已固化到 Flash', {'save_mask': hex(save_mask)}
+        return True, '配置已固化到 Flash', {'save_mask': hex(save_mask),
+                                         'device_mask': hex(K.CFG_CFG_DEV_BBR_FLASH)}
+
+    def factory_reset(self, clear_flash=True, reboot_after=True):
+        """恢复出厂设置（UBX-CFG-CFG 带 clearMask + loadMask）。
+
+        **这是"清空并重载"，不是 save**：`clearMask = loadMask = 0x1F1F`
+        表示"IO/msgconf/navconf/tpconf 全清掉，再按默认值重载"。
+        pyubx2 的 `ubxfactoryreset.py` 用的就是这一对值。
+
+        ## 两个必须提醒调用方的后果
+
+        1. **波特率会回到 38400**。如果当前跑在别的档位，下发完这条命令
+           就再也收不到模块的回话了 —— 所以本方法先 `_send_ubx` 再
+           主动把通道波特率改回 `DEFAULT_BAUD`。
+        2. **Survey-in / 定点坐标全部丢失**。基准站标定场景里这是"从零开始"，
+           流程层如果只是想把配置存盘，应该用 `save()` 而不是这个方法。
+
+        `clear_flash=False` 时不清 Flash，只把 RAM/BBR 恢复默认 ——
+        用于"配置改坏了，先回到能动起来的状态，但保留 Flash 里的老配置"。
+        """
+        device = K.CFG_CFG_DEV_BBR | (K.CFG_CFG_DEV_FLASH if clear_flash else 0)
+        # 载荷是 13 字节：clearMask(4) saveMask(4) loadMask(4) deviceMask(1)。
+        # **最后一个字段只有 1 字节** —— 写成 4 字节会多出 3 个 0，
+        # 模块按错位解析整个载荷，直接 NAK。
+        payload = struct.pack('<IIIB',
+                              K.CFG_CFG_CLEAR_MASK,        # clearMask：清掉
+                              0,                           # saveMask：不存
+                              K.CFG_CFG_LOAD_MASK,         # loadMask：重载默认值
+                              device)                      # 清哪些存储介质
+        ok, message = self._send_ubx(*K.MSG_CFG_CFG, payload, timeout=3.0, retries=2)
+        data = {'clear_mask': hex(K.CFG_CFG_CLEAR_MASK),
+                'load_mask': hex(K.CFG_CFG_LOAD_MASK),
+                'device_mask': hex(device),
+                'clear_flash': bool(clear_flash)}
+        if not ok:
+            data['error'] = 'nak' if message == 'NAK' else 'timeout'
+            return False, f'恢复出厂设置失败（{message}）', data
+
+        # 复位后波特率回默认档，本端口必须跟着切，否则后面全是乱码
+        time.sleep(0.3)
+        if self.channel.baud != self.DEFAULT_BAUD:
+            try:
+                self.channel.baud = self.DEFAULT_BAUD
+                if self.channel.is_open:
+                    self.channel._serial.baudrate = self.DEFAULT_BAUD
+            except Exception as e:                          # noqa: BLE001
+                logging.debug(f'恢复出厂后切波特率失败（忽略）：{e}')
+        data['baud'] = self.channel.baud
+
+        if reboot_after:
+            # CFG-CFG 的清除动作在模块重启后才真正生效
+            r_ok, r_msg = self.reboot()
+            data['reboot'] = r_msg
+            if not r_ok:
+                data['error'] = 'reboot_incomplete'
+                return False, f'配置已清除，但重启未确认（{r_msg}）', data
+        return True, '已恢复出厂设置', data
 
     def reboot(self):
         """软重启（UBX-CFG-RST）。

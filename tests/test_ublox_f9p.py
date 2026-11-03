@@ -251,7 +251,10 @@ class TestDriverSemantics(unittest.TestCase):
         # 4 字节的键（TMODE_ECEF_X / UART1_BAUDRATE / FIXED_POS_ACC）会全 NAK。
         self.assertEqual(len(payload), 4 + 4 + 1, '载荷头必须 4 字节')
         self.assertEqual(payload[0], 0x00)                    # version
-        self.assertEqual(payload[1], K.LAYER_RAM | K.LAYER_FLASH)   # RAM + Flash
+        # 默认写全部三层（RAM|BBR|Flash = 0x07），与 pyubx2 官方示例一致。
+        # 只写 RAM 掉电就丢，只写 Flash 要重启才生效，三层全写才一步到位。
+        self.assertEqual(payload[1], K.LAYER_ALL)
+        self.assertEqual(payload[1], 0x07)
         self.assertEqual(payload[2], 0x00)                    # transaction
         self.assertEqual(payload[3], 0x00)                    # reserved0
         self.assertEqual(struct.unpack('<I', payload[4:8])[0], 0x20030001)
@@ -282,6 +285,115 @@ class TestDriverSemantics(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(msg, 'NAK')
         self.assertEqual(data['error'], 'nak')
+
+    def test_valset_rejects_over_64_keys(self):
+        """一条 VALSET 最多 64 个键。超了模块直接 NAK，且不告诉你是哪个键，
+        所以必须在下发前拦住 —— 否则现场只看到一串无信息的 NAK。"""
+        drv, _ch, _s = make_f9p()
+        ok = [('TMODE_MODE', 0)] * (K.MAX_KEYS_PER_VALSET + 1)
+        with self.assertRaises(Exception) as ctx:
+            drv._valset(ok)
+        self.assertIn('64', str(ctx.exception))
+
+    def test_valset_accepts_exactly_64_keys(self):
+        seen = []
+
+        def on_write(data):
+            seen.append(bytes(data))
+            return _ack_ack()
+
+        drv, _ch, _s = make_f9p(on_write)
+        ok, msg, data = drv._valset([('TMODE_MODE', 0)] * K.MAX_KEYS_PER_VALSET)
+        self.assertTrue(ok, msg)
+        self.assertEqual(data['keys'], 64)
+        # 边界值必须一次发完，不能悄悄截断
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(struct.unpack('<H', seen[0][4:6])[0],
+                         4 + 64 * (4 + 1), '载荷长度 = 4 字节头 + 64 × (4 字节 key + 1 字节值)')
+
+    def test_valdel_frame(self):
+        """CFG-VALDEL 载荷与 VALSET 同构，但**只有 key 没有 value**。"""
+        seen = []
+
+        def on_write(data):
+            seen.append(bytes(data))
+            return _ack_ack()
+
+        drv, _ch, _s = make_f9p(on_write)
+        ok, msg, data = drv._valdel(['TMODE_MODE', 'UART1_BAUDRATE'])
+        self.assertTrue(ok, msg)
+        frame = seen[0]
+        self.assertEqual(frame[:4], b'\xb5\x62\x06\x8c', '0x06/0x8C')
+        payload = frame[6:-2]
+        # 4 字节头 + 2 × 4 字节 key，没有 value
+        self.assertEqual(len(payload), 4 + 8)
+        self.assertEqual(payload[1], K.LAYER_BBR | K.LAYER_FLASH)
+        keys = [struct.unpack('<I', payload[i:i + 4])[0] for i in (4, 8)]
+        self.assertEqual(keys, [0x20030001, 0x40520001])
+        self.assertEqual(data['keys'], 2)
+
+    def test_valdel_rejects_ram_only(self):
+        """VALDEL 不能只作用 RAM —— 模块对 layer=RAM 会 NAK，提前拦住。"""
+        drv, _ch, _s = make_f9p()
+        with self.assertRaises(Exception) as ctx:
+            drv._valdel(['TMODE_MODE'], layers=K.LAYER_RAM)
+        self.assertIn('RAM', str(ctx.exception))
+
+    def test_factory_reset_frame(self):
+        """CFG-CFG 恢复出厂：clearMask = loadMask = 0x1F1F（与 pyubx2 一致）。
+
+        deviceMask 是**单独一字节**，bit0=BBR bit1=Flash bit2=EEPROM，
+        和 clearMask 那套 IO/MSG/NAV 位完全不是一回事。
+        """
+        seen = []
+
+        def on_write(data):
+            seen.append(bytes(data))
+            return _ack_ack()
+
+        drv, ch, _s = make_f9p(on_write)
+        ch.baud = 115200          # 出厂复位会把波特率打回 38400
+        drv.factory_reset(clear_flash=True, reboot_after=False)
+
+        cfg = [f for f in seen if f[2:4] == b'\x06\x09'][0]
+        payload = cfg[6:-2]
+        self.assertEqual(len(payload), 13, 'clear(4)+save(4)+load(4)+device(1)')
+        clear, save, load = struct.unpack('<III', payload[:12])
+        device = payload[12]
+        self.assertEqual(clear, 0x1F1F)
+        self.assertEqual(save, 0, '恢复出厂不保存任何东西')
+        self.assertEqual(load, 0x1F1F)
+        self.assertEqual(device, K.CFG_CFG_DEV_BBR | K.CFG_CFG_DEV_FLASH)
+        self.assertEqual(ch.baud, 38400, '复位后通道必须跟到默认波特率')
+
+    def test_factory_reset_keeps_flash_when_asked(self):
+        """clear_flash=False 只清 BBR，不动 Flash —— 用于"先回到能动的状态"。"""
+        seen = []
+
+        def on_write(data):
+            seen.append(bytes(data))
+            return _ack_ack()
+
+        drv, _ch, _s = make_f9p(on_write)
+        ok, _msg, data = drv.factory_reset(clear_flash=False, reboot_after=False)
+        self.assertTrue(ok)
+        self.assertEqual(data['device_mask'], hex(K.CFG_CFG_DEV_BBR))
+
+    def test_pack_value_eight_byte(self):
+        """8 字节键（X8，例如 USB_*_STR 系列）必须能打包，不能抛"不支持的键长"。"""
+        raw = F9P.pack_value(K.X8, 0x1122334455667788)
+        self.assertEqual(len(raw), 8)
+        self.assertEqual(raw, bytes.fromhex('8877665544332211'), '小端')
+        self.assertEqual(F9P.unpack_value(K.X8, raw), 0x1122334455667788)
+
+    def test_pack_value_float_keys_keep_fraction(self):
+        """浮点键（R4/R8）不能 round 成整数 —— 0.5 Hz 会被抹成 0。"""
+        raw = F9P.pack_value(K.R8, 0.5)
+        self.assertEqual(len(raw), 8)
+        self.assertAlmostEqual(F9P.unpack_value(K.R8, raw), 0.5)
+        raw4 = F9P.pack_value(K.R4, 1.5)
+        self.assertEqual(len(raw4), 4)
+        self.assertAlmostEqual(F9P.unpack_value(K.R4, raw4), 1.5, places=6)
 
     def test_layers_persist_flag(self):
         """persist=False 只写 RAM 层 —— 断电丢，但改完立刻生效。"""
@@ -386,13 +498,25 @@ class TestDriverSemantics(unittest.TestCase):
         self.assertTrue(any('GPS' in p for p in problems))
 
     def test_rtcm_output_rejects_input_only(self):
-        """1006/1007/1033 写速率必须**明确拒绝**，不能"配了但没播"。"""
+        """1006/1007 写速率必须**明确拒绝**，不能"配了但没播"。
+
+        1006/1007 与 1033 是两种不同的"不支持"，文案不能混：
+          · 1006/1007 —— 键存在、能 VALGET 到 0，但模块不输出 → "只支持输入"
+          · 1033      —— **键根本不存在**（pyubx2 1343 键里没有），
+                         写它必 NAK → 文案要直接指向"改用 1230"
+        """
         drv, ch, _s = make_f9p(lambda d: _ack_ack())
-        for num in (1006, 1007, 1033):
+        for num in (1006, 1007):
             ok, message, data = drv.set_message_rate(f'RTCM3-{num}', 1)
             self.assertFalse(ok, f'{num} 不该被接受')
             self.assertEqual(data.get('error'), 'unsupported')
             self.assertIn('只支持输入', message)
+        # 1033 是"没这个键"，报错要说清楚换 1230，而不是让人去改输入
+        ok, message, data = drv.set_message_rate('RTCM3-1033', 1)
+        self.assertFalse(ok)
+        self.assertEqual(data.get('error'), 'unsupported')
+        self.assertIn('1230', message)
+        self.assertIn(1033, K.RTCM_NO_KEY)
         # 通道上不应该有任何字节被发出去
         self.assertEqual(ch._serial.written, [])
 
@@ -409,6 +533,52 @@ class TestDriverSemantics(unittest.TestCase):
             self.assertEqual(data.get('error'), 'unsupported')
             self.assertIn('HPG 1.32', message)
         self.assertEqual(ch._serial.written, [], '拒绝时一个字节都不能发')
+
+    def test_message_rate_accepts_nmea_and_rxm(self):
+        """NMEA / RXM 报文也要能配速率 —— 键表里有，驱动以前没接。
+
+        NMEA 常被写成 `GGA` / `GPGGA` / `NMEA-GGA` 三种形式，都要认。
+        """
+        seen = []
+
+        def on_write(data):
+            seen.append(bytes(data))
+            return _ack_ack()
+
+        drv, _ch, _s = make_f9p(on_write)
+        cases = {
+            'GGA': 'NMEAMOUT_GGA',
+            'NMEA-GGA': 'NMEAMOUT_GGA',
+            'GPGGA': 'NMEAMOUT_GGA',        # 带 talker 前缀
+            'RMC': 'NMEAMOUT_RMC',
+            'RAWX': 'RXMOUT_RXM_RAWX',
+            'RXM-RAWX': 'RXMOUT_RXM_RAWX',
+            'NAVSVIN': 'NAVOUT_NAV_SVIN',
+            'NAV_SVIN': 'NAVOUT_NAV_SVIN',
+            'RTCM3-1005': 'RTCM_1005',
+            '1005': 'RTCM_1005',
+        }
+        for name, want in cases.items():
+            ok, msg, data = drv.set_message_rate(name, 1)
+            self.assertTrue(ok, f'{name}: {msg}')
+            self.assertEqual(data['key'], want, name)
+            self.assertEqual(K.lookup(want)[2], 1.0, f'{want} 的 scale')
+        self.assertEqual(len(seen), len(cases))
+
+    def test_resolve_msg_key_shares_one_parser(self):
+        """`set_message_rate` 与 `get_message_rate` 必须用同一个解析器。
+
+        以前两处各抄一份 if/elif，加一种报文就得改两个地方，
+        漏一个的表现是"能设不能读"——这种 bug 很难从现象反推。
+        """
+        cases = {'1005': 'RTCM_1005', 'GGA': 'NMEAMOUT_GGA',
+                 'NAVSVIN': 'NAVOUT_NAV_SVIN', 'RAWX': 'RXMOUT_RXM_RAWX'}
+        for name, want in cases.items():
+            self.assertEqual(F9P.ZEDF9PDriver._resolve_msg_key(name)[0], want)
+        # 不认识的必须给出 err，而不是抛异常
+        key, err = F9P.ZEDF9PDriver._resolve_msg_key('NOT_A_MSG')
+        self.assertIsNone(key)
+        self.assertTrue(err)
 
     def test_rtcm_out_has_only_live_keys(self):
         """RTCM_OUT 里只能有真机验证过的 10 个键（4072.* 已被剔除）。"""
@@ -493,6 +663,54 @@ class TestKeyTable(unittest.TestCase):
         self.assertEqual(K.lookup('TMODE_LAT_HP')[0], 0x2003000C)
         self.assertEqual(K.lookup('UART1_BAUDRATE')[0], 0x40520001)
         self.assertEqual(K.lookup('RTCM_1005')[0], 0x209102BE)
+        # 2026-11 修正的三个"端口后缀错位"错误 ID（原来抄的是 I2C 那一行）：
+        # MSGOUT 端口偏移固定 I2C→UART1→UART2→USB→SPI，UART1 = I2C+1、USB = I2C+3。
+        self.assertEqual(K.lookup('RTCM_1230')[0], 0x20910304, '1230 原来是 0x20910303（I2C）')
+        self.assertEqual(K.lookup('NAVOUT_NAV_SVIN')[0], 0x20910089, 'SVIN 原来是 0x20910088（I2C）')
+        self.assertEqual(K.lookup('NAVOUT_NAV_EOE')[0], 0x20910160, 'EOE 原来的 0x20910263 不存在')
+
+    def test_i2c_address_is_one_byte(self):
+        """I2C_ADDRESS 是 U1（0x20510001）。写成 U2 会多带一个 0x00，
+        模块按错位解析后 NAK —— 这也是抄表时容易顺手写成 2 字节的键。"""
+        rec = K.lookup('I2C_ADDRESS')
+        self.assertEqual(rec[0], 0x20510001)
+        self.assertEqual(rec[1][0], 'U1')
+        self.assertEqual(rec[1][1], 1)
+
+    def test_matches_pyubx2_authoritative_table(self):
+        """全表与 pyubx2 的 `UBX_CONFIG_DATABASE` 交叉校验（1343 个键）。
+
+        pyubx2 是**可选**的参考库：拿不到就跳过，不能让主仓库因缺它而红。
+        校验的是 ID 与「类型类别 + 字节长度」，**不校验 scale** ——
+        权威表没有物理单位信息，scale 是我们自己按手册补的。
+        """
+        import os
+        for cand in (os.environ.get('PYUBX2_SRC'),
+                     os.path.join(os.path.dirname(os.path.dirname(
+                         os.path.abspath(__file__))), '..', 'pyubx2', 'src'),
+                     r'E:\GitHub\pyubx2\src'):
+            if cand and os.path.isdir(os.path.join(cand, 'pyubx2')) \
+                    and cand not in sys.path:
+                sys.path.insert(0, cand)
+                break
+        try:
+            from pyubx2 import ubxtypes_configdb as CD
+        except ImportError:
+            self.skipTest('未安装 pyubx2，跳过交叉校验')
+        by_id = {}
+        for _full, (aid, att) in CD.UBX_CONFIG_DATABASE.items():
+            by_id.setdefault(aid, set()).add((att[0], int(att[1:])))
+        bad = []
+        for name, rec in K.ALL_KEYS.items():
+            key_id, type_info, _scale, _note = rec
+            if key_id not in by_id:
+                bad.append((str(name), f'{key_id:#010x}', '权威表里没有这个 ID'))
+                continue
+            want = (type_info[0][0], type_info[1])
+            if want not in by_id[key_id]:
+                bad.append((str(name), f'{key_id:#010x}',
+                            f'我们={want[0]}{want[1]} 权威={sorted(by_id[key_id])}'))
+        self.assertEqual(bad, [], f'{len(bad)} 个键与 pyubx2 不一致：{bad[:10]}')
 
     def test_scale_values(self):
         self.assertEqual(K.lookup('TMODE_LAT')[2], 1e-7)
@@ -514,19 +732,20 @@ class TestKeyTable(unittest.TestCase):
         self.assertFalse(K.lookup('UART1_BAUDRATE')[1][2], '波特率是无符号')
 
     def test_no_duplicate_ids(self):
-        """键 ID 不能重复 —— 同 ID 挂两个名字，写入时必有一个走错组。
+        """键 ID 不能重复 —— 同 ID 挂两个**不同的键**，写入时必有一个走错组。
 
-        NAV_OUT 是有意的例外：同一批 ID 既以 `NAV_PVT` 出现在 `NAV_OUT` 表里
-        （给通用查询用），又以 `NAVOUT_NAV_PVT` 出现在 `ALL_KEYS` 里
-        （给 set_message_rate 用）。这是设计，不是笔误，所以按 ID 白名单放行。
+        别名（`NAV_PVT` / `NAVOUT_NAV_PVT`、`RXM_RAWX` / `RXMOUT_RXM_RAWX`、
+        `GGA` / `NMEAMOUT_GGA`、`1005` / `RTCM_1005`）是设计：裸名给通用查询用，
+        带前缀的名给 `set_message_rate` 用。它们的 canonical 名相同，按 ID
+        分组后只剩一个 canon，不算撞车 —— 与 `ubx_keys._self_check()` 同一判据。
         """
-        allowed = {rec[0] for rec in K.NAV_OUT.values()}
         seen = {}
         for name, rec in K.ALL_KEYS.items():
-            seen.setdefault(rec[0], []).append(name)
-        dups = {hex(k): v for k, v in seen.items()
-                if len(v) > 1 and k not in allowed}
-        self.assertEqual(dups, {}, f'键 ID 重复：{dups}')
+            seen.setdefault(rec[0], {}).setdefault(
+                K._canonical(str(name)), []).append(name)
+        dups = {hex(k): sorted(by_canon) for k, by_canon in seen.items()
+                if len(by_canon) > 1}
+        self.assertEqual(dups, {}, f'键 ID 撞车（不同键共用一个 ID）：{dups}')
 
 
 if __name__ == '__main__':
