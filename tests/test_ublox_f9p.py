@@ -19,6 +19,10 @@ from rtkserver.calibration.drivers import ublox_zed_f9p as F9P
 from rtkserver.calibration.drivers.base import (
     Channel, ubx_checksum, ubx_frame, ubx_parse)
 
+# 帧里出现的 (cls, id) 二元组，写短名省得每处都带 `K.` 前缀
+VALSET = K.MSG_CFG_VALSET
+VALGET = K.MSG_CFG_VALGET
+
 
 # ==================== 假串口 ====================
 class FakeSerial:
@@ -310,6 +314,32 @@ class TestDriverSemantics(unittest.TestCase):
         self.assertEqual(len(seen), 1)
         self.assertEqual(struct.unpack('<H', seen[0][4:6])[0],
                          4 + 64 * (4 + 1), '载荷长度 = 4 字节头 + 64 × (4 字节 key + 1 字节值)')
+
+    def test_valset_transaction_drives_version_byte(self):
+        """`transaction != 0` 时 version 字节要变 1（pyubx2 config_set 的规则）。
+
+        `version` 和 `transaction` 是两个字节，光看 transaction 位看不出
+        有没有跟着改 version —— 服务器漏改这一位时，模块仍会 ACK，
+        但事务语义根本没生效。所以两个字节都要钉。
+        """
+        seen = []
+
+        def on_write(data):
+            seen.append(bytes(data))
+            return _ack_ack()
+
+        drv, _ch, _s = make_f9p(on_write)
+
+        drv._valset([('TMODE_MODE', 0)])
+        body = seen[-1][6:-2]                  # 去掉 B5 62 同步头 + 长度 + 校验
+        self.assertEqual(body[0], 0x00, 'transaction=0 时 version 必须是 0')
+        self.assertEqual(body[2], 0x00)
+
+        seen.clear()
+        drv._valset([('TMODE_MODE', 0)], transaction=7)
+        body = seen[-1][6:-2]
+        self.assertEqual(body[0], 0x01, 'transaction!=0 时 version 必须变 1')
+        self.assertEqual(body[2], 7)
 
     def test_valdel_frame(self):
         """CFG-VALDEL 载荷与 VALSET 同构，但**只有 key 没有 value**。"""
@@ -640,6 +670,150 @@ class TestDriverSemantics(unittest.TestCase):
         self.assertEqual(F9P.MODE_ALIASES['rover'], F9P.MODE_DISABLED)
         self.assertEqual(F9P.MODE_ALIASES['base'], F9P.MODE_FIXED)
         self.assertEqual(F9P.MODE_ALIASES['survey_in'], F9P.MODE_SURVEY_IN)
+
+    def test_get_mode_returns_triple_and_keeps_svin_detail(self):
+        """`get_mode()` 必须回三元组，且不能把 survey_in 和 fixed 都压成 base。
+
+        曾经 `return 'base'`（裸字符串），流程层 `mode.get('mode')` 直接
+        AttributeError —— 崩在 ok 已经是真值之后，报错信息跟驱动层毫无关系。
+        这里同时钉死三级口径：`mode` 给流程层的 rover/base，
+        `svin_mode` 给前端的 survey_in/fixed，两个字段都要有。
+
+        还要钉死 `mode_code` 的**跨型号口径**：必须是 1=rover / 2=base，
+        不能直接透传 TMODE 枚举。TMODE=1 是 Survey-in（基站），透传出去
+        会让 `backup.usable()` 和 `writer` 都当成流动站，一块已经配成
+        基站的模块会被拉去连 CORS。原始值只能放在 `tmode_code` 里。
+        """
+        for code, want_svin, want_mode, want_code in (
+                (0, 'disabled', 'rover', 1),
+                (1, 'survey_in', 'base', 2),
+                (2, 'fixed', 'base', 2)):
+            payload = struct.pack('<I', K.lookup('TMODE_MODE')[0])
+            payload += bytes([code])
+
+            def on_write(data, _p=payload):
+                cls, msg_id, _pl = ubx_parse(data)
+                if (cls, msg_id) == VALSET:
+                    return _ack_ack()
+                if (cls, msg_id) == VALGET:
+                    return ubx_frame(0x06, 0x8B, bytes([0x01, 0x00, 0x00, 0x00]) + _p)
+                return b''
+
+            drv, _ch, _s = make_f9p(on_write)
+            result = drv.get_mode()
+            self.assertIsInstance(result, tuple, f'TMODE_MODE={code} 返回了裸值 {result!r}')
+            self.assertEqual(len(result), 3)
+            ok, _message, data = result
+            self.assertIsInstance(data, dict)
+            self.assertTrue(ok)
+            self.assertEqual(data['mode'], want_mode)
+            self.assertEqual(data['mode_code'], want_code,
+                             f'TMODE_MODE={code} 的 mode_code 必须报跨型号角色码 '
+                             f'{want_code}（1=rover 2=base），不能透传 TMODE '
+                             f'（透传值 {code} 会让 backup/writer 认错角色）')
+            self.assertEqual(data['tmode_code'], code,
+                             f'TMODE_MODE={code} 的原始枚举要原样留在 tmode_code')
+            self.assertEqual(data['svin_mode'], want_svin,
+                             f'TMODE_MODE={code} 应报 {want_svin}，'
+                             f'报成 {data.get("svin_mode")} 会让前端分不清收敛中还是定点')
+
+    def test_get_mode_without_reply_is_unknown_triple(self):
+        """读不到 TMODE_MODE 时也必须回三元组，`ok=False`，不能抛。"""
+        drv, _ch, _s = make_f9p()
+        ok, message, data = drv.get_mode()
+        self.assertFalse(ok)
+        self.assertEqual(data['mode'], 'unknown')
+        self.assertEqual(data['error'], 'timeout')
+
+    def test_windows_bitlen_is_ten_bits_per_byte(self):
+        """`windows_bitlen` 按 8N1 的 10 bit/字节 折算一个超时窗口的容量。
+
+        38400 → 3840 字节/秒。这个数只做诊断和批量下发的间隔估算，
+        **不**用来调超时——超时随流量抖动会更难查。
+        """
+        self.assertEqual(F9P.windows_bitlen(38400), 3840)
+        self.assertEqual(F9P.windows_bitlen(921600), 92160)
+        self.assertEqual(F9P.windows_bitlen(0), 0)
+        self.assertEqual(F9P.windows_bitlen(-1), 0)
+        self.assertEqual(F9P.windows_bitlen(None), 0)
+        self.assertEqual(F9P.windows_bitlen('115200'), 11520)
+
+    def test_valget_uses_poll_layer_not_set_layer(self):
+        """VALGET 的 layer 是 poll 口径（0=RAM 1=BBR 2=Flash），不是 VALSET 那套。
+
+        `ubxconfigdb.py` 顶部注释明说 "SET and DEL use different memory layer
+        values to POLL"。两套都有个 1，含义却从 RAM 变成 BBR —— 拿 set 常量
+        去 poll，读 BBR 会读成 RAM、读 Flash 会读成"默认值"，**读回来的数
+        看着正常，却根本不是那一层**，这是最难在真机上发现的一类错。
+        """
+        seen = []
+
+        def on_write(data, _s=seen):
+            cls, msg_id, payload = ubx_parse(data)
+            if (cls, msg_id) == VALGET:
+                _s.append(bytes(payload))
+            return b''
+
+        drv, _ch, _s = make_f9p(on_write)
+
+        # 默认（不传 layer）必须是 poll RAM = 0x00，而不是 set RAM = 0x01
+        drv._valget(['TMODE_MODE'])
+        self.assertEqual(seen[-1][1], 0x00,
+                         f'默认层应为 poll RAM(0x00)，实际 {seen[-1][1]:#04x}')
+
+        # 显式读 Flash 层：poll 口径是 2
+        seen.clear()
+        drv._valget(['TMODE_MODE'], layer=K.POLL_LAYER_FLASH)
+        self.assertEqual(seen[-1][1], 0x02)
+
+        # 误传 VALSET 的 LAYER_FLASH(4) 必须当场拦下，而不是发出一个非法请求
+        seen.clear()
+        with self.assertRaises(Exception) as ctx:
+            drv._valget(['TMODE_MODE'], layer=K.LAYER_FLASH)
+        self.assertIn('poll', str(ctx.exception))
+        self.assertEqual(seen, [], '非法 layer 不该真的发出去')
+
+    def test_verify_persisted_compares_per_key(self):
+        """`verify_persisted` 按键比较，不按整表比。
+
+        模块对没写过的键会回默认值；整表比会把"这个键本来就是默认值"
+        误判成失败，也会把"少回了一个键"当成"值不符"。
+        """
+        mode_key = K.lookup('TMODE_MODE')[0]
+        rtcm_key = K.lookup('RTCM_1005')[0]
+
+        def on_write(data):
+            cls, msg_id, _pl = ubx_parse(data)
+            if (cls, msg_id) == VALGET:
+                # 应答带 version|layer|position 头，layer 回 Flash(2) 表示取自耗时层
+                body = bytes([0x01, 0x02, 0x00, 0x00])
+                body += struct.pack('<IB', mode_key, 2)      # TMODE=fixed
+                body += struct.pack('<IB', rtcm_key, 1)      # 1005 开
+                return ubx_frame(0x06, 0x8B, body)
+            return b''
+
+        drv, _ch, _s = make_f9p(on_write)
+        ok, message, data = drv.verify_persisted({'TMODE_MODE': 2, 'RTCM_1005': 1})
+        self.assertTrue(ok, message)
+        self.assertEqual(data['mismatch'], {})
+
+        # 值不符要报出来，并指出是哪个键
+        ok, message, data = drv.verify_persisted({'TMODE_MODE': 2, 'RTCM_1005': 5})
+        self.assertFalse(ok)
+        self.assertIn('RTCM_1005', data['mismatch'])
+        self.assertNotIn('TMODE_MODE', data['mismatch'])
+
+        # 少回一个键是"缺失"，不能混进"值不符"
+        ok, message, data = drv.verify_persisted({'TMODE_MODE': 2, 'RTCM_1230': 1})
+        self.assertFalse(ok)
+        self.assertIn('RTCM_1230', data['mismatch'])
+
+    def test_verify_persisted_without_reply_fails_softly(self):
+        """读不到 Flash 层时必须回三元组 `ok=False`，不能抛。"""
+        drv, _ch, _s = make_f9p()
+        ok, message, data = drv.verify_persisted({'TMODE_MODE': 2})
+        self.assertFalse(ok)
+        self.assertEqual(data['error'], 'timeout')
 
     def test_optional_surface_never_raises(self):
         """流程层会无条件调用每个可选方法，一个漏实现就是一个 500。"""

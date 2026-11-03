@@ -22,6 +22,46 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 
+class _SilentSerial:
+    """只会"收下命令、永不回话"的串口替身。
+
+    契约测试要用真实的 `Channel` 跑驱动的失败路径，但真串口打不开、
+    假模块又要为每种型号写应答脚本。这里退一步：`read` 立刻返回空，
+    让 `read_line()` 自然跑到 deadline 返回 None —— 于是每条驱动都
+    老老实实走"命令无应答"分支，正好用来校验失败时的返回值形状。
+    """
+
+    def __init__(self, port='SILENT', baudrate=38400):
+        self.port = port
+        self.baudrate = baudrate
+        self.is_open = True
+        self.written = []
+
+    def write(self, data):
+        self.written.append(bytes(data))
+        return len(data)
+
+    def flush(self):
+        return None
+
+    def reset_input_buffer(self):
+        return None
+
+    def reset_output_buffer(self):
+        return None
+
+    def read(self, size=256):
+        return b''
+
+    @property
+    def in_waiting(self):
+        return 0
+
+    def close(self):
+        self.is_open = False
+
+
+
 # ==================== 独立参考实现（用于交叉验证） ====================
 def crc24q_reference(data: bytes) -> int:
     """逐位实现的 CRC-24Q，与被测的表驱动实现互为验证。
@@ -1171,6 +1211,65 @@ class TestCalibrationScenarios(unittest.TestCase):
         # 收尾必须放在 finally：成功、失败、用户中止三条路径都要恢复
         self.assertIn('_restore_memory_mode()', branch)
         self.assertIn('finally:', branch)
+
+    def test_save_persist_check_marks_unsupported_honestly(self):
+        """没声明 `persist_check` 的型号，报告里必须写"没查"，不能写成"查过了"。
+
+        SAVE 之后读一次 RAM 是**证明不了落盘**的（RAM 里本来就是刚写的值）。
+        F9P 能 poll Flash 层，所以多查一层；其它 ASCII 型号没有这套命令，
+        这里必须显式标 `checked: False` —— 如果写成 `{'ok': True}`，
+        看日志的人会以为持久化被验证过，而实际上根本没查。
+        """
+        from rtkserver.calibration.writer import CoordinateWriter, WritePlan
+
+        plan = WritePlan.build_cors(host='h', port=8002, mountpoint='MP',
+                                    method='external_rover')
+
+        class _NoPersist:
+            CAPS = {}
+
+        writer = CoordinateWriter(driver=_NoPersist(), channel=None)
+        result = writer._verify_persisted_after_save(plan)
+        self.assertIs(result.get('checked'), False)
+        self.assertEqual(result.get('reason'), 'unsupported')
+        self.assertNotIn('ok', result, '没查过就不能出现 ok 字段')
+
+    def test_save_persist_check_downgrades_mismatch_to_warning(self):
+        """持久层不一致只告警、不抛 —— 硬判据留给重启后的 VERIFY_MODE。
+
+        理由：Flash 写入偶发失败（模块忙、供电抖动）重启后还能重试，
+        当场判死会让用户白丢一次已经收敛好的坐标。
+        """
+        from rtkserver.calibration.writer import CoordinateWriter, WritePlan
+
+        plan = WritePlan.build_cors(host='h', port=8002, mountpoint='MP',
+                                    method='external_rover')
+        plan.mode = 'base'
+
+        class _Driver:
+            CAPS = {'persist_check': True}
+            MODE_VALUE = {'disabled': 0, 'survey_in': 1, 'fixed': 2}
+
+            def __init__(self):
+                self.seen = None
+
+            def verify_persisted(self, expected=None):
+                self.seen = expected
+                return False, 'Flash 层有 1 个键不符：TMODE_MODE 要 2 实际 0', {
+                    'layer': 2, 'mismatch': {'TMODE_MODE': {'want': 2, 'got': 0}}}
+
+        driver = _Driver()
+        writer = CoordinateWriter(driver=driver, channel=None)
+        warnings = []
+        writer._warn = lambda message, *a, **k: warnings.append(message)
+
+        result = writer._verify_persisted_after_save(plan)
+        self.assertTrue(result['checked'])
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['mismatch']['TMODE_MODE']['got'], 0)
+        self.assertEqual(len(warnings), 1, '不一致必须留下一条告警，不能静默')
+        # base 要翻成 TMODE 的 fixed(2)，不能把 'base' 原样丢给驱动
+        self.assertEqual(driver.seen, {'TMODE_MODE': 2})
 
     def test_readonly_mode_blocks_savepar(self):
         """即使有人把 SAVE 加进只测不写分支，也必须在发命令之前炸掉（附录D.3）。"""
@@ -3831,6 +3930,49 @@ class TestDriverProtocolSurface(unittest.TestCase):
                     callable(getattr(cls, name, None)),
                     f'{cls.__name__}（{key}）缺少 {name}()：'
                     f'流程层会无条件调用它，缺了就是一次 500')
+
+    def test_every_driver_get_mode_returns_triple(self):
+        """**每个具体驱动的 `get_mode()` 都必须回三元组，第三项是 dict。**
+
+        这条是补上的漏洞：ZED-F9P 曾经 `return 'base'`（裸字符串），
+        而 `service.py` 写的是 `ok, message, mode = driver.get_mode()`
+        再 `mode.get('mode')` —— 真机一走到"读模块信息"就 AttributeError。
+
+        旧用例 `test_base_defaults_return_triples_not_exceptions` 只校验了
+        基类默认实现，子类覆盖后返回什么完全没管，所以这个错漏到了真机。
+
+        这里不连串口：给每条驱动挂一个"永远没数据"的假串口，
+        让 `get_mode()` 真真正正走完"发命令 → 等应答 → 超时"的完整路径。
+        这样校验的不是签名，而是**失败路径的返回值形状**——恰恰是
+        真机上第一个被调用、也最容易被写成裸值的分支。
+        """
+        classes = self._driver_classes()
+        self.assertGreater(len(classes), 2)
+        from rtkserver.calibration.drivers.base import BaseDriver, Channel
+
+        for key, cls in classes:
+            if cls.get_mode is BaseDriver.get_mode:
+                continue        # 没覆盖的走基类默认实现，已被上一条用例覆盖
+            channel = Channel(serial_instance=_SilentSerial())
+            driver = cls(channel)
+            try:
+                result = driver.get_mode()
+            except Exception as err:            # noqa: BLE001
+                # 缺件/表错这类 DriverBug 属于另一类问题，不在这里判；
+                # 但 AttributeError 一定说明驱动与基类契约不一致（曾经的 `return 'base'`）。
+                self.assertNotIsInstance(
+                    err, AttributeError,
+                    f'{cls.__name__}（{key}）.get_mode() 内部有 AttributeError：{err}')
+                continue
+            self.assertIsInstance(
+                result, tuple,
+                f'{cls.__name__}（{key}）.get_mode() 必须返回三元组，'
+                f'实际返回 {type(result).__name__}：{result!r}')
+            self.assertEqual(len(result), 3,
+                             f'{cls.__name__}（{key}）.get_mode() 三元组长度不对')
+            self.assertIsInstance(
+                result[2], dict,
+                f'{cls.__name__}（{key}）.get_mode() 第三项必须是 dict（流程层会 .get()）')
 
     def test_base_defaults_return_triples_not_exceptions(self):
         """基类默认实现必须返回 `(False, 原因, {...})`，不能抛异常。"""

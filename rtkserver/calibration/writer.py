@@ -2865,8 +2865,57 @@ class CoordinateWriter:
                     f'保存后回读与写入值不一致（模式={readback.get("mode")}，'
                     f'最大轴差 {verdict["delta"]["max_axis"]:.4f} m）。'
                     f'配置可能没有真正写进 NVM', readback)
+
+        # 上面读的是**运行态（RAM）**：RAM 里本来就是刚写进去的值，哪怕 NVM
+        # 一个字没落盘也照样读得对。pyubx2 的 `ubxconfigdb.py` 用六步演示专门
+        # 讲这件事（VALGET RAM → VALGET BBR → VALSET → VALGET BBR → VALDEL → VALGET）。
+        # 所以对**声明了 `persist_check` 能力**的型号，再 poll 一次持久层：
+        # 这一枪打的是 Flash 里的副本，对得上才说明真的存进去了。
+        #
+        # 校验失败**不阻断流程**，只降级为告警：Flash 写入偶发失败（模块忙、
+        # 供电抖动）重启后还能重试，直接判死会让用户白丢一次已经收敛好的坐标；
+        # 真正的硬判据在后面的 VERIFY_MODE（重启后回读）。这里的作用是
+        # **把问题提前暴露到日志里**，而不是等重启完才发现。
+        persist = self._verify_persisted_after_save(plan)
         self._record_step('SAVE', True, '已保存，内存态回读一致',
-                          {'readback': readback, 'attempt': attempt})
+                          {'readback': readback, 'attempt': attempt,
+                           'persist': persist})
+
+    def _verify_persisted_after_save(self, plan):
+        """保存后 poll 持久层，返回可直接塞进步骤记录的字典。
+
+        能力不存在（大多数 ASCII 型号没有 CFG-VALSET 这一套）时回
+        `{'checked': False, 'reason': 'unsupported'}` —— 显式标注"没查"，
+        而不是回 `{'ok': True}` 假装查过了。报告里这两种状态必须能分开，
+        否则看日志的人会以为持久化被验证过。
+        """
+        caps = getattr(self.driver, 'CAPS', None) or {}
+        if not caps.get('persist_check'):
+            return {'checked': False, 'reason': 'unsupported'}
+        checker = getattr(self.driver, 'verify_persisted', None)
+        if not callable(checker):
+            return {'checked': False, 'reason': 'no_method'}
+
+        expected = {}
+        mode = getattr(plan, 'mode', None)
+        if mode in ('rover', 'base'):
+            # 流程层用角色名（rover/base），驱动内部翻成 TMODE；这里给的是
+            # `verify_persisted` 期望的**物理值**，所以用驱动自己的别名表翻一次。
+            aliases = getattr(self.driver, 'MODE_VALUE', None) or {}
+            label = 'fixed' if mode == 'base' else 'disabled'
+            if label in aliases:
+                expected['TMODE_MODE'] = aliases[label]
+        try:
+            ok, message, data = checker(expected or None)
+        except Exception as e:                   # noqa: BLE001 - 校验异常不该打断标定
+            return {'checked': False, 'reason': f'{type(e).__name__}: {e}'}
+
+        if ok:
+            return {'checked': True, 'ok': True, 'layer': data.get('layer'),
+                    'message': message}
+        self._warn(f'持久层回读不一致（不阻断流程，重启后仍会再校验一次）：{message}')
+        return {'checked': True, 'ok': False, 'layer': data.get('layer'),
+                'message': message, 'mismatch': data.get('mismatch') or {}}
 
     # ---------- 步骤 5：重启（§8.1 第 5 步 / §8.5） ----------
     def _step_restart(self, plan, attempt=1):

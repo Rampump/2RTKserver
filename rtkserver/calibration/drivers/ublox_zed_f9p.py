@@ -111,6 +111,7 @@ CAPS = {
     'err3': False,          # UBX 用 ACK-NAK 表达拒绝，没有"错误码 3"这套
     'valdel': True,         # CFG-VALDEL 删键（只能作用 BBR/Flash，不能作用 RAM）
     'factory_reset': True,  # CFG-CFG clear+load，注意会把波特率打回 38400
+    'persist_check': True,  # 能 poll Flash 层回读，证明配置真的落盘（不是只读 RAM）
 }
 
 # TMODE_MODE 取值（§3.1.5 + ubx_keys 注释）
@@ -144,12 +145,61 @@ REQUIRED_RTCM = (1005, 1230)
 OBSERVATION_RTCM = (1074, 1077, 1084, 1087, 1094, 1097, 1124, 1127)
 MSM_TIER = {4: (1074, 1084, 1094, 1124), 7: (1077, 1087, 1097, 1127)}
 
+# 持久化自检的默认键集（`verify_persisted()` 不传参时用它）。
+# 只挑"标定流程每次都会写、且值可预期"的键：
+#   · TMODE_MODE    —— 模式，写错的后果最严重（基站当流动站、反之亦然）
+#   · RTCM_1005     —— 基准站必开（坐标系基准）
+#   · RTCM_1230     —— 基准站必开（GLONASS 偏差，不开只能浮点）
+# 注意用 `RTCM_1005` 这种**键表里的名字**，不是 `MSGOUT_RTCM_3X_TYPE1005_UART1`
+# （那是 pyubx2 的叫法，本项目的 `ubx_keys.ALL_KEYS` 里只有前者）。
+# 不选 MSM 观测报文：档位（MSM4/7）会随方案变，写死会让自检假报不符。
+PERSIST_CHECK_KEYS = (
+    'TMODE_MODE',
+    'RTCM_1005',
+    'RTCM_1230',
+)
+
 # ACK 等待上限。F9P 处理一条 VALSET 是毫秒级（实测 <50 ms），
 # 但刚开机时要等 Flash 读完，给 1.5 s 足够宽。
 ACK_TIMEOUT = 1.5
 # 读 VALGET 应答的上限：一条 VALGET 最多回 1~2 KB，38400 下约 0.5 s，
 # 但若同时有 RTCM 流在抢带宽，得留余量。
 VALGET_TIMEOUT = 2.0
+
+
+def windows_bitlen(baud):
+    """这个波特率下，一个 Windows 读超时窗口最多装多少个字节（近似）。
+
+    来源是 pyubx2 `examples/ubxsetrates.py` 那条看似多余的 `sleep(1)`：
+    它逐条下发 CFG-MSG 并每条等 1 秒。作者的解释是"等 ACK"，但真机上的
+    实际作用是**给串口留出收发窗口**——38400 下一个 1 s 窗口只装得下
+    约 3.8 KB，而 CFG-MSG 每条 10 字节、应答 10 字节。
+
+    ## 为什么本项目需要这个数
+
+    `Channel.read_line(timeout)` 的超时语义是"等这么久没有新字节就返回"，
+    所以**只要模块一直在吐数据（RTCM/NMEA 流），单次读就不会超时**。
+    也就是说，`VALGET_TIMEOUT = 2.0` 在满负荷 RTCM 输出下根本不会到期，
+    读循环会一直转——它统计的是"有没有数据"，不是"有没有 VALGET 应答"。
+
+    真正把循环从"空转"里拉出来的是 `ubx_last()` 查缓存那一句；
+    而 `windows_bitlen` 给的是一个**上界参考**：如果要在 timeout 窗口里
+    收完 n 字节，窗口至少要 `n * 10 / baud` 秒（10 bit/字节，8N1）。
+
+    本驱动**不**用这个值去调超时（那样会随流量抖动），只
+    （a）在 `set_message_rate` 之类批量下发后按它算"多久之内不该再发下一帧"，
+    （b）在诊断日志里解释"为什么 38400 + RTCM 满负荷时 VALGET 容易读不到"。
+    与 `set_baud` 的 100 ms 抖动要求是同一类"物理层时间预算"，
+    但那个是手册硬指标（§3.8.1），这个是纯算术近似。
+    """
+    try:
+        baud = int(baud)
+    except (TypeError, ValueError):
+        return 0
+    if baud <= 0:
+        return 0
+    # 10 bit/字节（1 起始 + 8 数据 + 1 停止）
+    return baud // 10
 
 
 def pack_value(type_info, value):
@@ -296,7 +346,7 @@ class ZEDF9PDriver(BaseDriver):
             return False, 'NAK'
         return False, 'timeout'
 
-    def _valset(self, items, layers=None):
+    def _valset(self, items, layers=None, transaction=0):
         """写一组配置。`items` = [(key_name, 物理值), ...]。
 
         **一次一条 VALSET，等一个 ACK**（§3.1.1）：一条里塞多个 key 是合法的，
@@ -325,9 +375,20 @@ class ZEDF9PDriver(BaseDriver):
 
         VALGET 那边本来就是 4 字节（`position` 占 2 字节），所以读一直正常，
         这个坑只在写侧暴露。
+
+        ## `transaction` 会影响 `version` 字节
+
+        pyubx2 的 `UBXMessage.config_set()` 写的是
+        `version = 0 if transaction == 0 else 1`。也就是说：
+            transaction = 0 → version 0（单条写，每条独立生效）
+            transaction ≠ 0 → version 1（多条同号事务，模块一次提交）
+        默认 0 与现有全部调用方一致；保留参数是为了在"一组键必须同时生效"
+        的场景（比如模式 + 坐标必须一起切，不能中间出现 base 却没坐标）里
+        能发同一个事务号，而不是靠调用方自己拼帧。
         """
         if layers is None:
             layers = K.LAYER_ALL
+        transaction = int(transaction or 0) & 0xFF
         if not items:
             return True, '无需写入', {'keys': 0}
         if len(items) > K.MAX_KEYS_PER_VALSET:
@@ -335,8 +396,9 @@ class ZEDF9PDriver(BaseDriver):
                 f'一条 VALSET 最多 {K.MAX_KEYS_PER_VALSET} 个键，收到 {len(items)} 个；'
                 f'请拆成多条分批下发')
 
-        # version=0x00, layer, transaction=0x00, reserved0=0x00
-        payload = bytearray([0x00, layers & 0xFF, 0x00, 0x00])
+        # version: 0=单条写  1=带事务号（pyubx2 config_set 的同一规则）
+        version = 0x00 if transaction == 0 else 0x01
+        payload = bytearray([version, layers & 0xFF, transaction, 0x00])
         written = []
         for name, value in items:
             rec = K.lookup(name)
@@ -360,17 +422,42 @@ class ZEDF9PDriver(BaseDriver):
             data['error'] = 'nak' if message == 'NAK' else 'timeout'
         return ok, message, data
 
-    def _valget(self, key_names):
+    def _valget(self, key_names, layer=None):
         """读一组配置，返回 `({name: 物理值}, layer_flags)`。
 
         VALGET 请求：`version(1) | layer(1) | position(2) | key(4)...`
         VALGET 应答：`version(1) | layer(1) | position(2) | (key(4) + value(N))...`
         `position=0` 表示从第一个 key 开始；一小批一次拿全。
+
+        ## `layer` 的取值是 **poll 口径**，和 VALSET 不是一套
+
+        pyubx2 `ubxconfigdb.py` 顶部那行注释（"SET and DEL messages use
+        different memory layer values to POLL"）说的就是这里：
+
+            poll（本方法）：0=RAM  1=BBR  2=Flash  7=Default
+            set （`_valset`）：1=RAM  2=BBR  4=Flash
+
+        两套都叫 1，含义却从 RAM 变成 BBR —— 拿 VALSET 的常量去 poll，
+        读 BBR 会读成 RAM，读 Flash 会读成 BBR，**读回来的值看着正常但根本不是那一层**。
+        所以本方法默认 `K.POLL_LAYER_RAM`，传入 VALSET 的 layer 常量会被明确拒绝。
+
+        `layer=None` 走 RAM 层（当前运行值）。要确认"重启后还在不在"，
+        必须显式 poll BBR 或 Flash —— `save()` 之后读 RAM 永远是对的，
+        只有读回持久层才能证明真的落盘了（`ubxconfigdb.py` 的六步演示就是这个流程）。
         """
+        if layer is None:
+            layer = K.POLL_LAYER_RAM
+        if layer not in (K.POLL_LAYER_RAM, K.POLL_LAYER_BBR, K.POLL_LAYER_FLASH,
+                         K.POLL_LAYER_DEFAULT):
+            raise DriverBug(
+                f'CFG-VALGET 的 layer 是 poll 口径（0=RAM 1=BBR 2=Flash 7=Default），'
+                f'收到 {layer:#04x}；'
+                f'VALSET 的 4=Flash 在这里是非法值 —— 拿 set 常量去 poll 会把 '
+                f'Flash 读成"默认值"、BBR 读成 RAM，读回来的数看着正常却不是那一层')
         names = [n for n in key_names if K.lookup(n) is not None]
         if not names:
             return {}, 0
-        payload = bytearray([0x00, 0x00, 0x00, 0x00])
+        payload = bytearray([0x00, layer & 0xFF, 0x00, 0x00])
         by_id = {}
         for name in names:
             key_id = K.lookup(name)[0]
@@ -526,16 +613,59 @@ class ZEDF9PDriver(BaseDriver):
 
     # ==================== 模式 ====================
     def get_mode(self):
-        """'rover' / 'base' / 'unknown'。
+        """读工作模式，返回 `(ok, message, data)`，与其它型号驱动同一契约。
 
-        F9P 没有独立的"模式"寄存器：TMODE_MODE=0 就是流动站，
-        1/2 都是基准站。这里统一映射成流程层认的两个值。
+        ## 曾经返回裸字符串 —— 真机上必然 AttributeError
+
+        本方法早先 `return 'base'`，而流程层（`service.py`）写的是
+        `ok, message, mode = driver.get_mode()` 之后 `mode.get('mode')`。
+        裸字符串没有 `.get()`，只要走到"读模块信息"这一步就崩，
+        而且崩在 `ok` 已经是真值之后，报出来是 AttributeError 而不是
+        "读取工作模式失败"，很难往驱动层想。契约测试当时只校验了基类默认
+        实现的三元组，没校验各具体驱动的返回结构，所以漏了。
+
+        ## 三个状态要分清
+
+        F9P 没有独立的"模式"寄存器，只有一个 `TMODE_MODE`：
+            0 = 流动站（禁用 TMODE）
+            1 = Survey-in（基准站，自收敛）
+            2 = 定点   （基准站，用固定坐标）
+        `mode` 字段给流程层认的 `rover`/`base` 两级口径（基类文档约定），
+        `mode_code` 给原始枚举，`svin_mode` 给三级口径 —— 不把 1 和 2
+        一律压成 `base`，否则"当前是 Survey-in 还是定点"这个信息就丢了，
+        前端也就没法显示"基准站（Survey-in 收敛中）"。
+
+        ## `mode_code` 必须是跨型号统一口径，不能直接透传 TMODE
+
+        Quectel 全系的 `mode_code` 是**接收机角色**（1=流动站，2=基站）；
+        F9P 的 `TMODE_MODE` 是**TMODE 状态**（0=关，1=Survey-in，2=定点）。
+        两套枚举的 `2` 碰巧都是基站，`1` 却完全相反 —— 直接透传就会出两个错：
+            · `backup.usable()` 判 `code in (1, 2)`，F9P 处于流动站时报 0，
+              备份被判"工作模式不可识别，无法还原"；
+            · F9P 处于 Survey-in 时报 1，`writer` 拿 `mode_code` 当 rover 用，
+              一块已经配成基站的模块会被当成流动站去连 CORS。
+        所以对外只给 1/2 两级角色，原始 TMODE 值放 `tmode_code`
+        （前端要显示"Survey-in 收敛中"读 `svin_mode` / `tmode_code` 即可）。
         """
         values, _layer = self._valget(['TMODE_MODE'])
         if 'TMODE_MODE' not in values:
-            return 'unknown'
-        mode = int(values['TMODE_MODE'])
-        return 'base' if mode in (MODE_SURVEY_IN, MODE_FIXED) else 'rover'
+            return False, '读取工作模式失败（无 VALGET 应答）', {
+                'mode': 'unknown', 'mode_code': None, 'error': 'timeout'}
+
+        code = int(values['TMODE_MODE'])
+        label = MODE_LABEL.get(code, 'unknown')
+        is_base = code in (MODE_SURVEY_IN, MODE_FIXED)
+        data = {
+            'mode': 'base' if is_base else 'rover',
+            # 跨型号角色码：1=流动站 2=基站（与 Quectel 对齐，backup/前端都按这个认）
+            'mode_code': 2 if is_base else 1,
+            # 模块原始 TMODE 枚举：0/1/2，诊断与"收敛中/已定点"区分靠它
+            'tmode_code': code,
+            # 三级口径：disabled / survey_in / fixed / unknown
+            'svin_mode': label,
+            'source': 'TMODE_MODE',
+        }
+        return True, f'当前模式：{label}', data
 
     def set_mode(self, mode, persist=True, restart=True, verify=True):
         """切模式。
@@ -1142,6 +1272,69 @@ class ZEDF9PDriver(BaseDriver):
                 'error': 'nak' if message == 'NAK' else 'timeout'}
         return True, '配置已固化到 Flash', {'save_mask': hex(save_mask),
                                          'device_mask': hex(K.CFG_CFG_DEV_BBR_FLASH)}
+
+    def read_persisted(self, key_names=None):
+        """读 Flash 层的配置（poll 层 2），用来证明"真的落盘了"。
+
+        ## 为什么不能只读 RAM
+
+        `save()` 之后读 RAM 永远是对的 —— RAM 里本来就是刚写进去的值，
+        哪怕 Flash 写失败也读不出来。这正是 `ubxconfigdb.py` 六步演示
+        （VALGET RAM → VALGET BBR → VALSET BBR → VALGET BBR → VALDEL → VALGET）
+        要教的东西：**只有 poll 持久层，才能证明重启后还在**。
+
+        F9P 的持久层是 Flash（BBR 只保 SRAM 且在断电时机上更脆），
+        所以这里默认读 Flash。`layer=` 可以换成 `K.POLL_LAYER_BBR`
+        或 `K.POLL_LAYER_DEFAULT`（读默认值，用于确认"这个键出厂是多少"）。
+
+        返回 `(values, layer)`，与 `_valget` 一致；读不到时 `values` 为空 dict。
+        `key_names=None` 表示读 `CAPS` 里声明的那批常用键（`PERSIST_CHECK_KEYS`）。
+        """
+        if key_names is None:
+            key_names = self.PERSIST_CHECK_KEYS
+        return self._valget(list(key_names), layer=K.POLL_LAYER_FLASH)
+
+    def verify_persisted(self, expected=None):
+        """确认配置在 Flash 层与预期一致，返回 `(ok, message, data)`。
+
+        `expected` 是 `{键名: 期望物理值}`；不给就用 `read_persisted()` 的返回值
+        做一次"能读到就算过"的检查（这种情况只证明 Flash 里有值，不证明值对不对）。
+
+        比较**按键逐个比，不按整表比** —— 模块会对没写过的键回默认值，
+        整表比会把"这个键本来就是默认值"误判成失败。
+        浮点值按 1e-6 相对误差比，避免 1.2 与 1.1999999 互相判错。
+        """
+        values, layer = self.read_persisted(list(expected) if expected else None)
+        if not values:
+            return False, '读不到 Flash 层配置（无 VALGET 应答）', {
+                'error': 'timeout', 'layer': layer}
+
+        data = {'layer': layer, 'read': dict(values), 'mismatch': {}}
+        if not expected:
+            return True, f'Flash 层读到 {len(values)} 个键', data
+
+        missing = [name for name in expected if name not in values]
+        if missing:
+            data['mismatch'] = {name: {'want': expected[name], 'got': None}
+                                for name in missing}
+            return False, f'Flash 层缺少 {len(missing)} 个键：{", ".join(missing[:5])}', data
+
+        mismatch = {}
+        for name, want in expected.items():
+            got = values[name]
+            if isinstance(want, float) or isinstance(got, float):
+                same = abs(float(got) - float(want)) <= max(1e-6, abs(float(want)) * 1e-6)
+            else:
+                same = got == want
+            if not same:
+                mismatch[name] = {'want': want, 'got': got}
+        data['mismatch'] = mismatch
+        if mismatch:
+            head = list(mismatch.items())[:3]
+            detail = '；'.join(f'{name} 要 {item["want"]} 实际 {item["got"]}'
+                              for name, item in head)
+            return False, f'Flash 层有 {len(mismatch)} 个键不符：{detail}', data
+        return True, f'Flash 层 {len(expected)} 个键全部对上（已持久化）', data
 
     def factory_reset(self, clear_flash=True, reboot_after=True):
         """恢复出厂设置（UBX-CFG-CFG 带 clearMask + loadMask）。
