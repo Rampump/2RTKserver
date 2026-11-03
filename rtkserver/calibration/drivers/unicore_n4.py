@@ -274,6 +274,8 @@ class UnicoreN4Base(BaseDriver):
     BAUDS = BAUDS
     DEFAULT_BAUD = DEFAULT_BAUD
     BAUD_CMD_KEY = BAUD_CMD_KEY
+    # §4.1 `CONFIG` 查询：一次回三个口各一行，`read_port_config()` 已实现收集
+    BAUD_READ_KEY = 'get_baud'
 
     # 简化 ASCII：裸文本发出去，应答认 `$` 和 `#` 两种头（见文件头 "1." 与 "2."）
     FRAME_COMMANDS = False
@@ -1121,6 +1123,43 @@ class UnicoreN4Base(BaseDriver):
             return False, f'没有读到 {port} 的配置（读到 {sorted(data)}）', {
                 'error': 'port_missing', 'ports': data}
         return True, f'{port} 当前 {entry["baud"]}', entry
+
+    def read_uart(self, port=None):
+        """§4.1 `CONFIG` → 三个串口的波特率与帧格式（一条命令回三行）。
+
+        与 Quectel 的区别在这里最明显：LG290P 是"问当前这条口，回一条定长字段"，
+        N4 是"一条命令把 COM1/COM2/COM3 全报一遍"，还得自己把三行收齐。
+        所以 `read_uart()` 不能放在基类里用同一套解析 —— 只能各写各的。
+
+        返回里带上全部端口的字典（`ports`）：基站的差分口通常是 COM2，
+        而命令口是 COM1，只报一个口容易让人拿错值去改。
+        """
+        ok, message, data = self.read_port_config()
+        if not ok:
+            return False, message, data
+
+        ports = {str(k).upper(): dict(v) for k, v in (data or {}).items() if v}
+        if not ports:
+            return False, f'CONFIG 没有返回任何端口配置：{message}', {
+                'error': 'port_missing', 'raw': message}
+
+        want = str(port).upper() if port else ''
+        if want not in ports:
+            want = sorted(ports)[0]          # 默认 COM1，没有就取字典序第一个
+        entry = dict(ports[want])
+        info = {
+            'port': want,
+            'baud': entry.get('baud'),
+            'databits': entry.get('databits'),
+            'parity': entry.get('parity'),
+            'stopbits': entry.get('stopbits'),
+            'frame': '{}{}{}'.format(entry.get('databits') or '?',
+                                     entry.get('parity') or '?',
+                                     entry.get('stopbits') or '?'),
+            'ports': ports,
+            'raw': message,
+        }
+        return True, f'{want} 当前 {info["baud"]} {info["frame"]}', info
 
     def set_baud(self, baud, port=None, databits=None, parity=None, stopbits=None):
         """§4.2 改串口波特率：`CONFIG <port> <baud>` （帧格式可选）。

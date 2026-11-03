@@ -191,6 +191,8 @@ class LG290PDriver(BaseDriver):
     BAUDS = (9600, 115200, 230400, 460800, 921600)
     DEFAULT_BAUD = 115200
     BAUD_CMD_KEY = 'set_baud'
+    # §6.8 的回读命令 `$PQTMCFGUART,R` —— 有它就优先问模块，别逐档盲试。
+    BAUD_READ_KEY = 'get_baud'
 
     # 必须挂在**类**上：流程层写的是 `getattr(driver_instance, 'MSM_CONSTELLATIONS')`。
     # 只在模块级定义过一次，取到 None 后静默退化成"只开 107X"，
@@ -911,6 +913,58 @@ class LG290PDriver(BaseDriver):
         return False, message, data
 
     # ---------- 波特率 ----------
+    # §6.8 <Parity> 的数字取值 → 常规帧格式写法，只用于展示（配置里照抄原文回写）
+    PARITY_TEXT = {0: 'N', 1: 'O', 2: 'E', 3: 'M', 4: 'S'}
+
+    def read_uart(self, port=None):
+        """§6.8 `$PQTMCFGUART,R[,<Index>]` → 模块自报的串口参数。
+
+        应答：`$PQTMCFGUART,OK,<Index>,<BaudRate>,<DataBit>,<Parity>,<StopBit>,<FlowCtrl>`
+        （示例 `$PQTMCFGUART,OK,1,115200,8,0,1,0*5F`）。
+
+        注意字段顺序：**Index 在最前面**，不在最后。按"最后一个数字当波特率"
+        之类的经验写法取，会拿到流控标志 0，表现为"模块说波特率是 0"。
+
+        不指定 port 时问的是当前这条口 —— 上位机正插着的那条，正是要问的答案。
+        """
+        key = 'get_baud_port' if port else 'get_baud'
+        kwargs = {'port': int(port)} if port else {}
+        ok, message, data = self.request(key, **kwargs)
+        if not ok:
+            return False, message, data
+
+        fields = data.get('fields') or []
+        if len(fields) < 2:
+            # 只回 `$PQTMCFGUART,OK` 不带参数时拿不到任何有用信息，按失败处理：
+            # 宁可让上层退回"按候选表试"，也不要编一个波特率出来记住。
+            return False, f'PQTMCFGUART 应答缺少参数：{data.get("raw", "")}', {
+                'error': 'bad_reply', 'raw': data.get('raw', '')}
+
+        index = _to_int(fields[0])
+        baud = _to_int(fields[1])
+        if not baud:
+            return False, f'PQTMCFGUART 应答里的波特率无法解析：{data.get("raw", "")}', {
+                'error': 'bad_reply', 'raw': data.get('raw', '')}
+
+        databits = _to_int(fields[2]) if len(fields) > 2 else None
+        parity_code = _to_int(fields[3]) if len(fields) > 3 else None
+        stopbits = _to_int(fields[4]) if len(fields) > 4 else None
+        flow = _to_int(fields[5]) if len(fields) > 5 else None
+        parity = self.PARITY_TEXT.get(parity_code, '') if parity_code is not None else ''
+        info = {
+            'port': index,
+            'baud': baud,
+            'databits': databits,
+            'parity': parity,
+            'parity_code': parity_code,
+            'stopbits': stopbits,
+            'flow': flow,
+            'frame': f'{databits or "?"}{parity or "?"}{stopbits or "?"}',
+            'raw': data.get('raw', ''),
+        }
+        label = f'UART{index}' if index else '当前串口'
+        return True, f'{label} 当前 {baud} {info["frame"]}', info
+
     def set_baud(self, baud, port=None):
         """§2.3.10 改串口波特率。
 

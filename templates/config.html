@@ -324,6 +324,7 @@
   </footer>
 
   <script src="/static/i18n.js"></script>
+  <script src="/static/picker.js"></script>
   <script>
     document.getElementById('year').textContent = new Date().getFullYear();
 
@@ -525,6 +526,9 @@
           'ok'
         );
         if (!mpInput.value.trim()) mpInput.focus();
+        // 候选刚填进 datalist，直接把面板摊开在输入框下面：
+        // 原生 datalist 只在「再次点击输入框」时才会弹，用户会以为按钮没生效。
+        if (window.Picker) Picker.open(mpInput, mpInput.value.trim());
       } catch (err) {
         mpList.replaceChildren();
         setMpStatus(I18N.t('cfg.mount_fail', { msg: err.message }), 'error');
@@ -618,6 +622,12 @@
           hintEl.textContent = data.ports.length
             ? I18N.t('cfg.port_count', { n: data.ports.length })
             : I18N.t('cfg.port_none');
+        }
+        // 扫描结果直接摊开在输入框下面。原来只写进 datalist，
+        // 而原生弹层要"再点一次输入框"才出来，用户会以为扫描失败了。
+        if (data.ports.length && window.Picker) {
+          const input = document.getElementById(target === 'serial' ? 'serial_port' : 'radio_port');
+          if (input) Picker.open(input);
         }
       } catch (err) {
         listEl.replaceChildren();

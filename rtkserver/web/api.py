@@ -47,21 +47,29 @@ def api_serial_ports():
         前端据此把它在下拉里禁用，避免把数传电台选到 GNSS 模块那个口上。
       - radio_port：当前已配置为数传输出的串口（radio_port）。
     串口列表只反映"此刻插着哪些设备"，用户仍可手动填写列表外的路径。
+
+    枚举失败与"确实没有设备"必须能分开：前者是权限/驱动问题（要改 udev 或加
+    dialout 组），后者是线没插好。前端把两者都显示成"没有扫描到串口"时，
+    现场只能盲猜。所以异常时 `ok=False` 并带上原因。
     """
+    error = ''
+    items = []
     try:
-        ports = serial.tools.list_ports.comports()
-        items = []
-        for p in ports:
+        for p in serial.tools.list_ports.comports():
             items.append({
                 'device': p.device,
                 'description': (p.description or '').strip(),
                 'hwid': getattr(p, 'hwid', '') or '',
             })
-    except Exception as e:
+    except Exception as e:                          # noqa: BLE001
         logging.error(f"枚举串口失败：{e}")
+        error = f'{type(e).__name__}: {e}'
         items = []
     cfg = get_config()
     return jsonify({
+        'ok': not error,
+        'error': error,
+        'count': len(items),
         'ports': items,
         'gnss_port': (cfg.get('serial_port') or '').strip(),
         'radio_port': (cfg.get('radio_port') or '').strip(),

@@ -259,7 +259,7 @@ and on failure shows the reason plus a clear note that the previous version was 
 ### One single source for the version number
 
 The version lives in the `VERSION` file at the program root (a single `major.minor.patch`
-line such as `3.0.0`):
+line such as `3.1.1`):
 
 - Maintenance page shows `v<version> · <commit>`: the version comes from `VERSION`,
   the commit from `.version`;

@@ -62,11 +62,14 @@
     hwTaskId: '',
     bannerClosed: false,
     lastSnap: null,
-    // 本机（当前模块 SN）最近一次标定记录 —— 「复用坐标」只认这一条。
-    // 全库最近几条只用于展示，不能当复用来源：拿别的设备的坐标写进来，
-    // 1005 校验会照常通过，现场却播的是别人家的位置。
-    ownSn: '',
-    ownHistory: null,
+    // 「复用坐标」的来源：库内最近一条标定记录，**不按模块/SN 过滤**。
+    // 坐标描述的是天线相位中心这个物理点，换模块、换固件都不影响它 ——
+    // 真机上就是因为按 SN 过滤，换成 LC29H(BS) 之后复用按钮被锁死，
+    // 而同一根天线半小时前刚测过。页面把型号/SN/时间一并显示，由用户核对
+    // "是不是同一根天线"：程序并不知道天线有没有被挪过，替用户判定才是错的。
+    reuseHistory: null,
+    // 最近一次扫描到的串口候选（供 chip 重绘，避免每次重扫才刷新选中态）
+    ports: [],
     history: null
   };
 
@@ -141,9 +144,19 @@
     var bauds = currentModuleBauds();
 
     if (!raw || raw.toLowerCase() === 'auto') {
-      hint.textContent = bauds.length
-        ? t('cal.baud.auto_tip', { list: bauds.join(' / ') })
-        : t('cal.baud.auto_tip_plain');
+      var remembered = currentModuleRememberedBaud();
+      if (remembered) {
+        // 这条提示是本轮真机测试的直接产物：用户抱怨"为什么要一档档试"。
+        // 模块自己报过的值就在库里，先说清楚"优先用它"，再列官方档位兜底。
+        hint.textContent = t('cal.baud.auto_remembered', {
+          baud: remembered,
+          list: bauds.length ? bauds.join(' / ') : t('cal.baud.auto_tip_plain')
+        });
+      } else {
+        hint.textContent = bauds.length
+          ? t('cal.baud.auto_tip', { list: bauds.join(' / ') })
+          : t('cal.baud.auto_tip_plain');
+      }
       hint.classList.remove('is-warn');
       return;
     }
@@ -161,10 +174,34 @@
     hint.classList.remove('is-warn');
   }
 
+  // 型号选择的即时解释：这一格到底改变什么流程。
+  // 后端两条路差别很大（只问一个 vs 挨个问），页面上只给一个下拉框，
+  // 用户根本看不出自己选不选会影响什么 —— 真机测试时就有人问"一键标定好像没有
+  // 选择模块型号"，其实是有的，只是没有任何文字说明它存在。
+  function refreshModuleHint() {
+    var box = $('cal-module-hint');
+    if (!box) return;
+    var mod = selectedModule();
+    if (!mod) {
+      box.textContent = t('cal.module.hint.auto');
+    } else {
+      box.textContent = t('cal.module.hint.fixed', { name: mod.name });
+    }
+  }
+
   // 当前所选型号的官方波特率档位（自动探测时返回空数组 = 不限制）。
   function currentModuleBauds() {
     var mod = selectedModule();
     return (mod && mod.bauds) ? mod.bauds : [];
+  }
+
+  // 这块型号上次"模块自报"的波特率（0 = 没有记录，别拿 0 当有效值）。
+  // 选「自动探测」时用全库最近一次回读的值，提示里仍然标明它是"上次回读"。
+  function currentModuleRememberedBaud() {
+    var mod = selectedModule();
+    if (mod && Number(mod.remembered_baud) > 0) return Number(mod.remembered_baud);
+    var d = (STATE.options && STATE.options.defaults) || {};
+    return Number(d.remembered_baud) > 0 ? Number(d.remembered_baud) : 0;
   }
 
   // 型号切换时刷新 datalist 候选与提示文案
@@ -218,6 +255,8 @@
         if (!data || !data.ok) throw new Error((data && data.error) || 'options failed');
         STATE.options = data;
         fillModules(data.modules);
+        // 先定「可复用坐标」再渲染列表：列表渲染读的就是这条记录
+        fillReuseHistory(data.reuse_history);
         fillHistory(data.history);
         if (data.defaults && data.defaults.cors_port && $('cal-cors-port')) {
           $('cal-cors-port').value = data.defaults.cors_port;
@@ -228,6 +267,7 @@
         STATE.ready = true;
         applyCapabilities();
         refreshBaudOptions();
+        refreshModuleHint();
         if (data.running) startPolling();
         return data;
       })
@@ -347,9 +387,16 @@
     } else if (caps.fixed === false) {
       locks.manual = t('cal.lock.manual_caps', { name: name });
     }
-    // 只测不写**对任何模块都开放**：它不写 NVM、不需要命令集，
-    // 无命令集的第三方模块正是它的主要用途（后端 start_cors(measure_only=True)
-    // 也不查 command_count / caps）。所以这里永远不加锁，别把它和写路径捆在一起。
+    // 只测不写**不写 NVM、不需要命令集**，所以对"未知模块"永远开放 ——
+    // 无命令集的第三方流动站正是它的主要用途。
+    // 但它要能**收改正数**：靠 CORS 差分算出本机天线位置，前提是这块模块
+    // 能当流动站。单基准站型号（LC29H(BS)：dual_mode=false，连模式命令都没有）
+    // 接上 CORS 也只能给单点解，跑满 3 分钟得到一个米级坐标 —— 那是最坏的
+    // 一种"成功"：用户会把这个米级坐标写进基准站。
+    // 所以：选了具体型号、且该型号没有流动站能力 → 锁掉；未选型号（未知模块）→ 放开。
+    if (writable && mod && !mod.dual_mode) {
+      locks.external_rover = t('cal.lock.measure_dual', { name: name });
+    }
     return locks;
   }
 
@@ -412,9 +459,9 @@
   // 注意：manual 下"选了历史"必须有记录才算数 —— 否则页面上写着"复用"，
   // buildPayload 却拿不到坐标，点开始就报"请填写坐标"。
   function reuseActive() {
-    if (STATE.method === 'cors') return STATE.corsSource === 'history' && !!STATE.ownHistory;
+    if (STATE.method === 'cors') return STATE.corsSource === 'history' && !!STATE.reuseHistory;
     if (STATE.method === 'manual') {
-      return STATE.coordSource === 'history' && !!STATE.ownHistory;
+      return STATE.coordSource === 'history' && !!STATE.reuseHistory;
     }
     return false;
   }
@@ -481,7 +528,7 @@
     toggle('cal-rtcm-card', canRtcm);
 
     // --- ⑤ 历史来源可用性 ---
-    var hasHistory = !!STATE.ownHistory;
+    var hasHistory = !!STATE.reuseHistory;
     var srcHist = $('src-history');
     if (srcHist) {
       var radio = srcHist.querySelector('input[name="cal-coord-src"]');
@@ -580,15 +627,13 @@
   // ---------------- 历史坐标列表 ----------------
   function fillHistory(items) {
     STATE.history = (items && items.length) ? items[0] : null;
-    // 全库最近几条只在"还没读到本机 SN"时兜底展示；能复用的一律以 ownHistory 为准
-    if (!STATE.ownHistory && STATE.history) STATE.ownHistoryFallback = STATE.history;
     renderHistoryList();
   }
 
   function renderHistoryList() {
     var list = $('cal-hist-list');
     if (!list) return;
-    var record = STATE.ownHistory;
+    var record = STATE.reuseHistory;
     if (!record) {
       list.innerHTML = '<div class="cal-muted">' + escapeHtml(t('cal.history.none')) +
         '<br>' + escapeHtml(t('cal.history.none_hint')) + '</div>';
@@ -599,6 +644,13 @@
     var accuracy = record.accuracy ? (Number(record.accuracy) * 100).toFixed(1) + ' cm' : '—';
     var methodKey = 'cal.method.short.' + String(record.method || '');
     var methodText = hasKey(methodKey) ? t(methodKey) : (record.method || '—');
+    // 两组坐标都显示：ECEF 是真正写进模块、真正播发出去的那组数，
+    // 经纬高是人看坐标时唯一能核对的东西（"是不是这根天线"只能靠它）。
+    // 库里两组同时保存（见 store._normalize_record 的双向换算），这里不必现算。
+    var geo = (record.lat != null && record.lon != null)
+      ? (Number(record.lat).toFixed(9) + ', ' + Number(record.lon).toFixed(9) +
+         (record.height != null ? ' · ' + Number(record.height).toFixed(3) + ' m' : ''))
+      : '';
     list.innerHTML =
       '<label class="cal-hist-item is-active" data-id="' + escapeHtml(record.id || '') + '">' +
         '<div class="h-main">' +
@@ -606,7 +658,9 @@
           '<div class="h-meta">' +
             escapeHtml(t('cal.history.method')) + '：' + escapeHtml(methodText) +
             ' · ' + escapeHtml(t('cal.history.accuracy')) + '：' + escapeHtml(accuracy) +
+            ' · ' + escapeHtml(record.module_model || '—') +
           '</div>' +
+          (geo ? '<div class="h-sn">' + escapeHtml(geo) + '</div>' : '') +
           '<div class="h-sn">' +
             'X ' + escapeHtml(fmtNum(record.ecef_x, 4, '')) +
             '  Y ' + escapeHtml(fmtNum(record.ecef_y, 4, '')) +
@@ -623,43 +677,121 @@
     }
   }
 
-  // 「可复用」的历史坐标只认本机 SN 的记录。
-  // 全库最近几条只是展示用 —— 拿另一块模块的坐标写进这台机器，
-  // 1005 校验会照常通过（它只核对"写入=播发"），现场却播的是别人家的位置。
-  function fillOwnHistory(items) {
-    STATE.ownHistory = (items && items.length) ? items[0] : null;
-    // 本机没记录时不能拿全库记录顶上：那可能是别的天线/别的模块的坐标
-    if (!STATE.ownHistory && STATE.method === 'cors' && STATE.corsSource === 'history') {
+  // 「可复用」的历史坐标：库内最近一条，不区分模块型号/SN（见 STATE.reuseHistory）。
+  function fillReuseHistory(items) {
+    STATE.reuseHistory = (items && items.length) ? items[0] : null;
+    if (!STATE.reuseHistory && STATE.method === 'cors' && STATE.corsSource === 'history') {
       STATE.corsSource = 'measure';
     }
-    if (!STATE.ownHistory && STATE.coordSource === 'history') {
+    if (!STATE.reuseHistory && STATE.coordSource === 'history') {
       STATE.coordSource = 'typing';
       var radio = document.querySelector('input[name="cal-coord-src"][value="typing"]');
       if (radio) radio.checked = true;
     }
     var histRadio = document.querySelector('input[name="cal-coord-src"][value="history"]');
-    if (histRadio) histRadio.checked = !!STATE.ownHistory && histRadio.checked;
+    if (histRadio) histRadio.checked = !!STATE.reuseHistory && histRadio.checked;
     syncMethod();
   }
 
   // ---------------- 串口扫描 ----------------
+  // 结果就地反馈：提示写在串口输入框下面的 field-hint，候选渲染成 chip 贴在旁边。
+  // 全程不依赖浮层 —— 真机上"点了扫描没反应"就是浮层没弹、而错误又写在页面底部
+  // 全局框里的结果。浮层仍然会顺手打开（键盘操作更快），但不再是唯一出口。
+  function setPortHint(text, kind) {
+    var hint = $('cal-port-hint');
+    if (!hint) return;
+    hint.textContent = text || '';
+    hint.classList.remove('is-info', 'is-ok', 'is-error');
+    if (kind) hint.classList.add(kind);
+  }
+
+  function pickPort(device) {
+    var input = $('cal-port');
+    if (!input) return;
+    input.value = device || '';
+    // 联动都挂在 input/change 上（波特率提示、型号能力重算），必须补派发
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    renderPortChips();
+  }
+
+  function renderPortChips(items) {
+    var box = $('cal-port-chips');
+    if (!box) return;
+    if (items) STATE.ports = items;
+    var ports = STATE.ports || [];
+    box.innerHTML = '';
+    if (!ports.length) { box.classList.add('is-hidden'); return; }
+
+    var current = ($('cal-port') && $('cal-port').value.trim()) || '';
+    ports.forEach(function (p) {
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'port-chip' + (p.device === current ? ' is-current' : '');
+      btn.dataset.device = p.device;
+      btn.title = p.description || p.device;
+
+      var main = document.createElement('span');
+      main.className = 'port-chip-main';
+      main.textContent = p.device;
+      btn.appendChild(main);
+
+      if (p.description && p.description !== p.device) {
+        var sub = document.createElement('span');
+        sub.className = 'port-chip-sub';
+        sub.textContent = p.description;
+        btn.appendChild(sub);
+      }
+      btn.addEventListener('click', function () { pickPort(p.device); });
+      box.appendChild(btn);
+    });
+    box.classList.remove('is-hidden');
+  }
+
   function scanPorts() {
+    var btn = $('cal-scan');
+    if (btn) btn.disabled = true;
+    setPortHint(t('cal.port.scanning'), 'is-info');
     fetch('/api/serial_ports', { credentials: 'same-origin' })
-      .then(function (r) { return r.json(); })
-      .then(function (data) {
-        var list = $('cal-port-list');
-        if (!list) return;
-        list.innerHTML = '';
-        (data.ports || data || []).forEach(function (p) {
-          var opt = document.createElement('option');
-          opt.value = p.device;
-          opt.label = p.description || p.device;
-          list.appendChild(opt);
-        });
-        if (!list.childElementCount) showError(t('cal.err.no_ports'));
-        else showError('');
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
       })
-      .catch(function (err) { showError(t('cal.err.ports') + ': ' + err.message); });
+      .then(function (data) {
+        var ports = (data && data.ports) || [];
+        var list = $('cal-port-list');
+        if (list) {
+          list.innerHTML = '';
+          ports.forEach(function (p) {
+            var opt = document.createElement('option');
+            opt.value = p.device;
+            opt.label = p.description || p.device;
+            list.appendChild(opt);
+          });
+        }
+        renderPortChips(ports);
+
+        var input = $('cal-port');
+        if (!ports.length) {
+          setPortHint(t('cal.err.no_ports'), 'is-error');
+          showError(t('cal.err.no_ports'));
+          return;
+        }
+        // 只有一个口就直接填上：现场换完 USB 口最想看到的就是"它认到了"，
+        // 而不是"扫出来了，请你自己再点一次"。
+        if (input && ports.length === 1 && !input.value.trim()) pickPort(ports[0].device);
+        renderPortChips(ports);
+        setPortHint(t('cal.port.found', { n: ports.length }), 'is-ok');
+        showError('');
+        if (window.Picker) Picker.open(input);
+      })
+      .catch(function (err) {
+        // 失败原因写在输入框下面，而不是只丢到页面底部的全局错误框
+        var message = t('cal.err.ports') + ': ' + err.message;
+        setPortHint(message, 'is-error');
+        showError(message);
+      })
+      .then(function () { if (btn) btn.disabled = false; });
   }
 
   // ---------------- 读取模块信息（只读诊断，不写任何配置） ----------------
@@ -704,10 +836,19 @@
     // i18n 里没有这个键时 t() 会原样返回键名，这时退回模块报的原始模式串
     var modeLabel = t('cal.hw.mode.' + mode);
     if (modeLabel === 'cal.hw.mode.' + mode) modeLabel = String(mode);
+    // 模块自报的串口参数（LG290P 是 PQTMCFGUART,R，N4 是 CONFIG）。
+    // 拿不到就显示「—」而不是空着：空着会像"页面漏了一行"。
+    var uart = mod.uart || {};
+    var uartText = '—';
+    if (uart.baud) {
+      uartText = (uart.port ? ('UART' + uart.port + ' ') : '') +
+        uart.baud + (uart.frame ? (' ' + uart.frame) : '');
+    }
     var rows = [
       ['cal.hw.firmware', mod.firmware || '—'],
       ['cal.hw.sn', mod.sn || '—'],
       ['cal.hw.mode', modeLabel],
+      ['cal.hw.uart', uartText],
       ['cal.hw.uniq', mod.uniq_id || '—']
     ];
     box.innerHTML = rows.map(function (row) {
@@ -716,20 +857,10 @@
     }).join('');
     box.classList.remove('is-hidden');
 
-    // 拿到 SN 才能判断"这台设备自己标定过没有"。
-    // 页面初次加载时还没读模块，`own_history` 是空的；
-    // 这里补一次带 SN 的请求，把「复用坐标」的来源限定在本机记录上。
-    if (mod.sn && mod.sn !== STATE.ownSn) {
-      STATE.ownSn = mod.sn;
-      fetch('/api/calibration/options?sn=' + encodeURIComponent(mod.sn),
-        { credentials: 'same-origin', cache: 'no-store' })
-        .then(function (r) { return r.json(); })
-        .then(function (data) {
-          if (!data || !data.ok) return;
-          fillOwnHistory(data.own_history);
-        })
-        .catch(function () { /* 取不到就当本机没记录：宁可不复用，也不能拿错坐标 */ });
-    }
+    // 读模块信息后**不再**按 SN 重新拉历史：复用来源是全库最近一条，
+    // 与当前插的是哪块模块无关（同一根天线换模块是最常见的场景）。
+    // 页面上已经把"这条坐标是哪块模块、什么时候测的"显示出来，由用户核对。
+    renderHistoryList();
   }
 
   // ---------------- 挂载点 ----------------
@@ -768,9 +899,15 @@
           opt.label = mp.mountpoint + ' · ' + (mp.format || '') + ' · ' + (mp.nav || '');
           list.appendChild(opt);
         });
-        if (typed) return;                       // 手填优先，不动它
+        if (typed) {
+          // 手填优先，不覆盖它 —— 但仍把候选摊开：用户填的可能只是个近似值，
+          // 让他一眼看到服务器上真实存在的挂载点，比默默什么都不做强。
+          if (window.Picker) Picker.open(input, typed);
+          return;
+        }
         if (!items.length) { showError(t('cal.err.mounts_empty')); return; }
         input.value = items[0].mountpoint || '';
+        if (window.Picker) Picker.open(input);
       })
       .catch(function (err) { showError(t('cal.err.mounts') + ': ' + err.message); })
       .then(function () { btn.disabled = false; });
@@ -1136,12 +1273,11 @@
   }
 
   // ---------------- payload 组装 ----------------
-  // 复用坐标的**唯一**来源：STATE.ownHistory（按本机 SN 过滤后的那一条）。
-  // STATE.history 是全库最近几条，可能是别的模块、别的天线的坐标 —— 绝不能用，
-  // 否则写进 NVM 后 1005 校验照常通过（它只核对"写入值 == 播发值"），
-  // 现场表现是"基准站一直在播别人家的位置"，而且不报任何错。
+  // 复用坐标的来源：STATE.reuseHistory（库内最近一条）。
+  // 复用前请确认那条记录确实是**同一根天线、同一个安装位置**——
+  // 页面把型号/SN/时间/坐标都列出来了，这是唯一可靠的判据，程序替不了。
   function historyCoord() {
-    var r = STATE.ownHistory;
+    var r = STATE.reuseHistory;
     if (!r) return null;
     var x = Number(r.ecef_x), y = Number(r.ecef_y), z = Number(r.ecef_z);
     if (!isFinite(x) || !isFinite(y) || !isFinite(z)) return null;
@@ -1188,8 +1324,8 @@
       } else {
         // A1 复用分支：后端整段跳过测量，直接把这组历史坐标写进 NVM。
         // 历史记录的 ecef_* 就是当年**写进模块的那组坐标**，原样传，不做换算。
-        // 值只能来自 STATE.ownHistory —— 不能是 STATE.history（全库最近几条）。
-        if (!STATE.ownHistory) return payload;
+        // 值来自 STATE.reuseHistory（库内最近一条，任意模块）
+        if (!STATE.reuseHistory) return payload;
         var coord = historyCoord();
         if (coord) payload.reuse_arp = coord;
       }
@@ -1399,6 +1535,7 @@
     on($('cal-module'), 'change', function () {
       applyCapabilities();
       refreshBaudOptions();
+      refreshModuleHint();
     });
     on($('cal-baud'), 'input', checkBaud);
     on($('cal-baud'), 'change', checkBaud);

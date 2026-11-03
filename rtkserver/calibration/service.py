@@ -468,6 +468,22 @@ class CalibrationService:
             error = _reject_without_caps(module, *need)
             if error:
                 return False, error, self.status()
+        else:
+            # 「只测坐标」靠 CORS/NTRIP 的差分数据算出**本机天线**的位置，
+            # 前提是这块模块能当流动站收改正数。单基站模块（Quectel LC29H(BS)）
+            # 文档里连流动站模式命令都没有，接上 CORS 也只能给单点解 ——
+            # 让它白跑满整档采集、最后吐一个米级坐标，比直接说"这块型号做不了"
+            # 糟糕得多：用户会以为"标定成功了"，然后把这个米级坐标写进基准站。
+            # 未指定型号时放行：未知模块完全可能就是一台现成的流动站，
+            # 那正是这条路径存在的主要理由。
+            info = _module_caps(module)
+            if info and info['command_count'] > 0 and not info['caps'].get('dual_mode'):
+                return False, (
+                    f'{info["name"]} 是单基准站模块，没有流动站模式，'
+                    f'无法接收 CORS 差分数据测量天线坐标。请改用「Survey-in 自收敛」'
+                    f'或「写入已知坐标」；若要用 CORS 测量，请换一块支持流动站模式的模块'
+                    f'（如 LG290P），或用「只测坐标」配一块已处于流动站模式的未知模块'), \
+                    self.status()
 
         try:
             plan = WritePlan.build_cors(
@@ -641,6 +657,9 @@ class CalibrationService:
             LC29H(BS) 反而支持 4800/3000000，全局表里根本没这两档。
           - 自动探测（only 为空）→ 各已注册驱动的官方档位并集，再补全局兜底表。
 
+        两种情况下都会把「上次回读到的波特率」插在手填值之后（`remembered`）：
+        那是模块自报的值，比按官方档位降序盲试准得多。
+
         两种情况都把**当前打开用的这个波特率**放在候选表首位（`current`）：
         用户在手填框里写的值即使不是官方档位，也是现场依据，
         先按它试一轮，别先花四五轮超时再回到用户早说过的话。
@@ -653,7 +672,10 @@ class CalibrationService:
         """
         channel = lease.channel
         original = channel.baud
-        for baud in self._baud_candidates(only, current=original):
+        # 上次连这台设备时**模块自己报**的波特率。有它就排在候选表最前面，
+        # 没有（第一次装）就老实按官方档位试 —— 不能假装知道。
+        remembered = store.remembered_baud(only[0] if only else None)
+        for baud in self._baud_candidates(only, current=original, remembered=remembered):
             if int(baud) == int(original):
                 continue
             self._set_stage('DETECT', f'识别失败，改用 {baud} 波特率重试')
@@ -686,7 +708,7 @@ class CalibrationService:
         return None
 
     @staticmethod
-    def _baud_candidates(only, current=None):
+    def _baud_candidates(only, current=None, remembered=None):
         """采集/识别该试哪些波特率（按优先级，已去重）。
 
         - 指定了型号 → 该型号厂商文档写的官方档位（降序，高的先试；
@@ -715,6 +737,15 @@ class CalibrationService:
                 head = [int(current)]
         except (TypeError, ValueError):
             head = []
+
+        # 这台设备上次**回读**到的波特率，紧跟在用户手填值后面。
+        # 它比任何"官方档位降序"都更接近真相 —— 官方表让 921600 永远排第一，
+        # 而真机大概率是 115200，每错一档白等 2 秒。
+        try:
+            if remembered and int(remembered) > 0 and int(remembered) not in head:
+                head.append(int(remembered))
+        except (TypeError, ValueError):
+            pass
 
         if only:
             merged = []
@@ -880,15 +911,17 @@ class CalibrationService:
                         '读取备份并准备还原' if is_restore else '读取模块身份并备份标定前配置')
         ok, message, info = driver.info()
         if ok:
+            uart = self._read_uart(driver)
             plan.module = {
                 'sn': info.get('sn') or '',
                 'model_key': info.get('model_key') or driver.MODEL_KEY,
                 'firmware': info.get('firmware') or '',
                 'display_name': info.get('display_name') or driver.DISPLAY_NAME,
+                'uart': uart or {},
             }
             lease.set_module(model=info.get('display_name'), firmware=info.get('firmware'),
                              sn=info.get('sn'))
-            self._save_profile(driver, info)
+            self._save_profile(driver, info, uart)
         else:
             # 读不到身份仍然允许写（现场常见：用户就是要覆盖一块读不出 SN 的模块），
             # 只是记录里会缺 SN/固件 —— 必须告诉用户，否则以后按 SN 查历史会查不到。
@@ -1105,9 +1138,15 @@ class CalibrationService:
                 'uniq_id': info.get('uniq_id'),
                 'caps': info.get('caps') or {},
             }
+            # 串口参数：模块自报的波特率/帧格式，记下来也展示出来。
+            # 报告里同时有 `baud`（本次连接用的）和 `uart.baud`（模块自报的），
+            # 两者不一致时现场一眼就能看出"接的不是你以为的那条口"。
+            uart = self._read_uart(driver)
+            if uart:
+                report['module']['uart'] = uart
             lease.set_module(model=info.get('display_name'),
                              firmware=info.get('firmware'), sn=info.get('sn'))
-            self._save_profile(driver, info)
+            self._save_profile(driver, info, uart)
         else:
             warn(f'读取模块信息失败：{message}')
             report['module'] = {'display_name': driver.DISPLAY_NAME,
@@ -1226,13 +1265,39 @@ class CalibrationService:
         return last
 
     @staticmethod
-    def _save_profile(driver, info):
-        """把驱动里的能力矩阵同步进 module_profiles（页面没连硬件时也能列型号）。"""
+    def _read_uart(driver):
+        """回读模块自报的串口参数；不支持/失败一律返回 None（不影响标定）。
+
+        为什么放在识别之后立刻做：这是唯一能拿到"模块自己认为的波特率"的时机，
+        而且只要一条查询。把它记进 module_profiles 之后，下次连同一台设备
+        就能把这一档排到候选表最前面，不必从 115200 一档档往上试。
+        """
+        reader = getattr(driver, 'read_uart', None)
+        if reader is None:
+            return None
+        try:
+            ok, message, data = reader()
+        except Exception as e:                       # noqa: BLE001 - 回读失败不能拖垮任务
+            logging.debug(f'串口参数回读异常（忽略）：{e}')
+            return None
+        if not ok:
+            logging.debug(f'{getattr(driver, "DISPLAY_NAME", "模块")} 串口参数回读失败（忽略）：{message}')
+            return None
+        return dict(data or {})
+
+    @staticmethod
+    def _save_profile(driver, info, uart=None):
+        """把驱动里的能力矩阵同步进 module_profiles（页面没连硬件时也能列型号）。
+
+        `uart` 有值就顺手把"模块自报的串口参数"记住（store 侧只在 baud>0 时覆盖，
+        所以"这次没读到"不会把上次的记录抹掉）。
+        """
         try:
             store.save_profile(driver.MODEL_KEY,
                                display_name=driver.DISPLAY_NAME,
                                match_prefix=driver.MATCH_PREFIX,
-                               caps=info.get('caps') or driver.runtime_caps)
+                               caps=info.get('caps') or driver.runtime_caps,
+                               uart=uart)
         except store.StoreError as e:
             logging.debug(f'型号能力落库失败（忽略）：{e}')
         except Exception as e:                       # noqa: BLE001

@@ -50,6 +50,31 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(str(password), str(stored))
 
 
+# 出厂默认管理员。登录页要靠这两个常量判断"该不该提示默认口令"，
+# 所以只能有一处定义 —— 写在模板里一份、写在 core/config.py 里一份，
+# 早晚会出现"提示说默认、实际已改过"或反过来的情况。
+DEFAULT_ADMIN_USER = 'admin'
+DEFAULT_ADMIN_PASSWORD = 'admin'
+
+
+def is_default_admin(cfg) -> bool:
+    """管理员是否仍在用出厂默认的用户名+口令（只读判断，不改任何状态）。
+
+    登录页据此决定要不要显示「默认账号 admin / admin」的提示条：
+      - 还开着默认口令 → 显示，并提醒正式部署前必须改；
+      - 已经改过       → 不显示，否则等于在登录页上贴一个错误的账号密码。
+    口令可能以 PBKDF2 哈希或历史明文两种形式存放，一律交给 verify_password 判。
+    """
+    try:
+        user = str((cfg or {}).get('admin_user') or '')
+        stored = str((cfg or {}).get('admin_password') or '')
+    except AttributeError:
+        return False
+    if user != DEFAULT_ADMIN_USER:
+        return False
+    return verify_password(DEFAULT_ADMIN_PASSWORD, stored)
+
+
 def get_or_create_secret_key() -> str:
     """session 签名密钥：环境变量优先，否则首次启动随机生成并写入独立文件。
 

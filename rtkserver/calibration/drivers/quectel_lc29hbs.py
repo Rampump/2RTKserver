@@ -123,6 +123,13 @@ PAIR_RESULT = {
 RATE_TARGETS = ('PQTMSVINSTATUS', 'PQTMEPE')
 RATE_RANGE = (1, 20)          # §2.2.5：Rate 取值 1~20
 
+# 每条语句的 `<MsgVer>`。**不能统一写 1**：PQTMEPE 的版本是 2，
+# 写成 1 会被模块回 ERROR,1（"参数无效"），而错误信息完全看不出是版本号错了。
+MSG_VER = {
+    'PQTMSVINSTATUS': 1,
+    'PQTMEPE': 2,
+}
+
 # RTCM 输出模式（§2.3.2 <Mode>）
 RTCM_MODE_LABEL = {-1: '禁用', 0: 'MSM4', 1: 'MSM7'}
 
@@ -434,23 +441,177 @@ class LC29HBSDriver(BaseDriver):
             return False, f'RTCM 输出部分失败：{detail}', {'results': results}
         return True, f'RTCM 输出已设为 {label}', {'mode': m, 'results': results}
 
+    @staticmethod
+    def _pair_value(data, key='mode'):
+        """取 PAIR 查询应答的值：`$PAIR433,0*3E` → `0`。
+
+        必须从 `fields[0]` 取，不能读 `data['mode']`：`request()` 返回的是
+        `{'fields': [...], 'raw': ...}`，`parse_line()` 里那套 `{type, mode}`
+        只写进 channel 的缓存，不会出现在这个字典里。
+        早先这里就是读错了地方，`get_rtcm_output()` 的 mode 恒为 None ——
+        页面/诊断显示"RTCM 模式 unknown"，看着像模块没配过，其实是取错了字段。
+        """
+        fields = (data or {}).get('fields') or []
+        if fields:
+            value = _to_int(fields[0])
+            if value is not None:
+                return value
+        return (data or {}).get(key)
+
     def get_rtcm_output(self):
         """回读 RTCM 三件套状态，用于"下发值 == 回读值"自检。"""
         data = {}
         ok, message, r = self.request('get_rtcm_mode')
         if not ok:
             return False, message, data
-        data['mode'] = (r or {}).get('mode')
+        data['mode'] = self._pair_value(r, 'mode')
 
         ok, _m, a = self.request('get_ant_pnt')
         if ok:
-            data['ant_pnt'] = (a or {}).get('enable')
+            data['ant_pnt'] = self._pair_value(a, 'enable')
 
         ok, _m, e = self.request('get_ephemeris')
         if ok:
-            data['ephemeris'] = (e or {}).get('enable')
+            data['ephemeris'] = self._pair_value(e, 'enable')
 
         return True, f'RTCM 模式 {data.get("mode")}', data
+
+    # ---------- 与流程层约定的"RTCM 配置回读" ----------
+    def read_rtcm_config(self):
+        """回读 RTCM 播发配置，**对上层返回统一的 `msm_type` 语义**。
+
+        为什么不是直接 `return self.get_rtcm_output()`：
+        诊断报告、备份、还原都按 `msm_type`（3~7）这一个口径判断"MSM 开在哪一档"。
+        LC29H(BS) 只有一个全局开关（PAIR432 Mode：-1 禁用 / 0 MSM4 / 1 MSM7），
+        没有 LG290P 那种七字段配置。这里把它翻译成 `msm_type`，同时保留原始
+        `mode` —— 上层不必知道每个型号的命令长什么样，这正是驱动该做的事。
+
+        `fields` 故意返回空表：这台型号没有"可原样放回的七字段"，
+        还原时应该按 `msm_type` 重新下发，而不是回放一串并不存在的字段。
+        """
+        ok, message, data = self.get_rtcm_output()
+        if not ok:
+            return False, message, {'error': 'no_reply'}
+        mode = data.get('mode')
+        msm = {0: 4, 1: 7}.get(mode)
+        return True, f'RTCM 输出 {RTCM_MODE_LABEL.get(mode, "未知")}', {
+            'msm_type': msm,
+            'mode': mode,
+            'mode_label': RTCM_MODE_LABEL.get(mode, '未知'),
+            'ant_pnt': data.get('ant_pnt'),
+            'ephemeris': data.get('ephemeris'),
+            'fields': [],
+            'raw': f'PAIR433={mode}',
+        }
+
+    def restore_rtcm_config(self, fields):
+        """LC29H(BS) 没有七字段配置，无法"原样放回"。"""
+        return False, (f'{self.DISPLAY_NAME} 的 RTCM 配置只有一个全局 MSM 开关，'
+                       '没有可原样回写的字段结构；请按 MSM 档位重新下发'), {
+            'error': 'unsupported', 'hint': 'use_config_rtcm'}
+
+    def config_rtcm(self, msm_type=4, persist=True, **kwargs):
+        """§2.3.2 `PAIR432`：MSM 档位。
+
+        本型号**只有 MSM4 / MSM7 两档**（Mode 0/1），没有 MSM3/5/6。
+        用户选 5 或 6 时明确拒绝："这个型号没有这一档"比"悄悄按 MSM4 下发"
+        诚实得多 —— 后者会让页面上选 MSM6 的人以为真的开了 MSM6。
+        """
+        msm = _to_int(msm_type)
+        mode = {4: 0, 7: 1}.get(msm)
+        if mode is None:
+            return False, (f'{self.DISPLAY_NAME} 只支持 MSM4 / MSM7 两档'
+                           f'（PAIR432 只有 0/1 两个值），收到 MSM{msm}'), {
+                'error': 'unsupported', 'supported': [4, 7], 'msm_type': msm}
+        ok, message, data = self.request('rtcm_mode', mode=mode)
+        if not ok:
+            return False, message, data
+        if persist:
+            saved, save_message, save_data = self.save()
+            if not saved:
+                return False, f'MSM 档位已切换但保存失败：{save_message}', save_data
+        return True, f'RTCM 输出已设为 {RTCM_MODE_LABEL[mode]}', {
+            'msm_type': msm, 'mode': mode}
+
+    # ---------- 报文速率（§2.2.5，只有两条，且必须带 MsgVer） ----------
+    def _rate_ver(self, name, msg_ver=None):
+        """取这条语句的 `<MsgVer>`；不认识的语句返回 None。"""
+        if msg_ver is not None:
+            return _to_int(msg_ver)
+        return MSG_VER.get(name)
+
+    def get_message_rate(self, name, msg_ver=None):
+        """查询报文速率（§2.2.5 `PQTMCFGMSGRATE,R,<name>,<MsgVer>`）。
+
+        本型号只认 `PQTMSVINSTATUS` / `PQTMEPE` 两条；其余语句发查询必然
+        `ERROR,1`，这里直接拒绝并说明，省掉一次 2 秒超时白等。
+        """
+        name = str(name or '').strip().upper()
+        if name not in RATE_TARGETS:
+            return False, (f'{self.DISPLAY_NAME} 只能查询 {"、".join(RATE_TARGETS)} '
+                           f'两条语句的速率，不支持 {name or "(空)"}'), {
+                'error': 'unsupported', 'supported': list(RATE_TARGETS)}
+        ver = self._rate_ver(name, msg_ver)
+        if ver is None:
+            return False, f'不知道 {name} 的 MsgVer，无法查询', {'error': 'unknown_msg_ver'}
+        ok, message, data = self.request('get_msg_rate_ver', name=name, ver=ver)
+        if not ok:
+            return False, message, data
+        fields = (data or {}).get('fields') or []
+        # 应答形如 `$PQTMCFGMSGRATE,OK,PQTMSVINSTATUS,1,1`：
+        # 第 1 段是语句名，第 2 段才是 Rate（第 3 段是 MsgVer）。
+        rate = None
+        for index, item in enumerate(fields):
+            if str(item).strip().upper() == name:
+                rate = _to_int(fields[index + 1]) if index + 1 < len(fields) else None
+                break
+        if rate is None and fields:
+            rate = _to_int(fields[1] if len(fields) > 1 else fields[0])
+        return True, message, {'name': name, 'rate': rate, 'fields': fields, 'msg_ver': ver}
+
+    def set_message_rate(self, name, rate, port=None, msg_ver=None):
+        """配置报文速率（§2.2.5）。`rate` 取值 1~20，0 表示关闭。
+
+        与 LG290P 不同：这台型号**没有 NMEA/RTCM 语句的速率开关**，
+        只有这两条私有语句。所以对 `GGA` / `RTCM3-1005` 之类一律返回
+        "不支持"——上层据此跳过，而不是把一整条链路的失败算到模块头上。
+        """
+        name = str(name or '').strip().upper()
+        if name not in RATE_TARGETS:
+            return False, (f'{self.DISPLAY_NAME} 不支持配置 {name or "(空)"} 的速率'
+                           f'（只支持 {"、".join(RATE_TARGETS)}）'), {
+                'error': 'unsupported', 'supported': list(RATE_TARGETS)}
+        value = _to_int(rate)
+        if value is None:
+            return False, '速率必须是整数', {'error': 'bad_rate'}
+        if value != 0 and not (RATE_RANGE[0] <= value <= RATE_RANGE[1]):
+            return False, (f'{name} 的速率必须在 {RATE_RANGE[0]}~{RATE_RANGE[1]} 之间'
+                           f'（0 表示关闭），收到 {value}'), {
+                'error': 'bad_rate', 'range': list(RATE_RANGE)}
+        ver = self._rate_ver(name, msg_ver)
+        if ver is None:
+            return False, f'不知道 {name} 的 MsgVer，无法配置', {'error': 'unknown_msg_ver'}
+        key = 'rate_svin' if name == 'PQTMSVINSTATUS' else 'rate_epe'
+        ok, message, data = self.request(key, rate=value)
+        return ok, message, data
+
+    def disable_survey_in(self, persist=True, restart=False):
+        """§2.2.1 `PQTMCFGSVIN,W,0,...`：停用 Survey-in / 固定坐标。
+
+        标定前先置成"不自动收敛"，否则上一轮的 Survey-in 会继续收敛，
+        把旧均值当成这一轮的结果写进模块 —— 那种错误 1005 校验查不出来
+        （写进去的和播出来的一致），只有事后比对坐标才发现整个站飘了。
+        """
+        ok, message, data = self.request('disable_svin')
+        if not ok:
+            return False, message, data
+        if persist:
+            saved, save_message, save_data = self.save()
+            if not saved:
+                return False, f'停用 Survey-in 成功但保存失败：{save_message}', save_data
+        if restart:
+            return self.reboot()
+        return True, '已停用 Survey-in / 固定坐标配置', data
 
     # ==================== 五、天线信息 ====================
     def set_antenna_info(self, desc, setup_id, sn):

@@ -29,7 +29,7 @@ from ..paths import BASE_DIR
 # 与 2RTKserver.db 同级。放模块级而不是常量写死，是为了自测能整体改成临时文件。
 CALIBRATION_DB = os.path.join(BASE_DIR, 'calibration.db')
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # 每 SN 保留条数 / 全库上限（方案 §12.4）
 KEEP_PER_SN = 50
@@ -40,6 +40,12 @@ VERIFY_STATES = (0, 1, 2)          # 0=未校验 1=通过 2=通过但有警告
 # NVM 三态（方案 §8.4）：这条记录到底有没有真的写进模块的持久存储。
 # 事后排查"坐标用了几天自己变回去了"时，只有这个字段能给出结论。
 NVM_STATES = ('', 'saved', 'reverted', 'unknown', 'not_written')
+
+# 经纬度 ↔ ECEF 一致性容差（米，三轴最大差）。
+# 5 cm 是刻意留宽的：入口给的经纬度常常只有 7~9 位小数、或来自不同大地基准
+# （CGCS2000 与 WGS84 差不到 1 cm，可以忽略），换算回来几毫米的差属于正常量化。
+# 超过 5 cm 就不是舍入误差了 —— 那是两组来自不同地方的数字被拼在同一行里。
+GEO_CONSISTENCY_TOLERANCE = 0.05
 
 RECORD_FIELDS = (
     'module_sn', 'module_model', 'firmware', 'method',
@@ -177,11 +183,25 @@ _DDL_V4 = (
     'ALTER TABLE calibration_records ADD COLUMN gga_jump_dropped INTEGER',
 )
 
+# v5（2026-11）：记住"模块自己报的串口参数"。
+# 波特率不是猜出来的：厂商给了回读命令（LG290P `$PQTMCFGUART,R`、N4 `CONFIG`），
+# 识别成功后回读一次，把结果按型号记住。下次连同一台设备就能把这一档排在候选表
+# 最前面，不必再从 115200 开始一档档试、每错一档白等 2 秒超时。
+# 只存"最近一次真实回读到的值"，不存用户手填值 —— 手填值只在当次任务里有意义，
+# 记下来会在换模块/换线之后变成一条没人敢删的错误默认值。
+# `uart_info` 存整段 JSON（端口号/数据位/校验/停止位/流控/原始应答），
+# 排查"为什么这块板子只认 460800"时，光有一个波特率数字是不够的。
+_DDL_V5 = (
+    'ALTER TABLE module_profiles ADD COLUMN uart_baud INTEGER NOT NULL DEFAULT 0',
+    "ALTER TABLE module_profiles ADD COLUMN uart_info TEXT NOT NULL DEFAULT ''",
+)
+
 _MIGRATIONS = {
     1: lambda conn: [conn.execute(stmt) for stmt in _DDL_V1],
     2: lambda conn: [conn.execute(stmt) for stmt in _DDL_V2],
     3: lambda conn: [conn.execute(stmt) for stmt in _DDL_V3],
     4: lambda conn: [conn.execute(stmt) for stmt in _DDL_V4],
+    5: lambda conn: [conn.execute(stmt) for stmt in _DDL_V5],
 }
 
 # 初始型号表。**能力矩阵的权威来源是驱动（drivers/*.py 的 CAPS）**，
@@ -364,6 +384,47 @@ def _normalize_record(record):
                 row['height'] = height
         except Exception as e:                   # 反算失败不该拦住落库
             logging.warning(f'标定记录反算经纬度失败（保留空值）：{e}')
+
+    # 反向：模块/用户只给了经纬高（NMEA、厂家上位机界面、手抄的 CORS 成果表），
+    # 库里必须同时有 ECEF —— 写进模块、播进 1005 的永远是 ECEF，
+    # 只存经纬度的话"复用这条坐标"时还得现场再算一次，而每次算的人不同就会漂。
+    elif (row['lat'] is not None and row['lon'] is not None) \
+            and None in (row['ecef_x'], row['ecef_y'], row['ecef_z']):
+        from .geo import geodetic_to_ecef
+        try:
+            x, y, z = geodetic_to_ecef(row['lat'], row['lon'], row['height'] or 0.0)
+            # 与写入链路同样的量化：0.1 mm。先截断再记，避免库里出现
+            # "经纬度反算回来差 0.03 mm"这种永远对不齐的尾数。
+            row['ecef_x'], row['ecef_y'], row['ecef_z'] = (
+                round(x, 4), round(y, 4), round(z, 4))
+            if None in (row['arp_x'], row['arp_y'], row['arp_z']):
+                row['arp_x'], row['arp_y'], row['arp_z'] = (
+                    row['ecef_x'], row['ecef_y'], row['ecef_z'])
+        except Exception as e:                   # noqa: BLE001
+            logging.warning(f'标定记录由经纬度换算 ECEF 失败（保留空值）：{e}')
+
+    # 两组都给齐时核对一致性：ECEF 是**权威值**（真正写进模块、播发出去的那组），
+    # 经纬度是从它反算的展示值。两者对不上说明调用方把不同来源的数混在一行里了，
+    # 这时以 ECEF 为准重算经纬度并告警 —— 否则页面显示的位置与实际播发的位置不一致，
+    # 而这种偏差在 1005 校验里查不出来（它只核对"写入 == 播发"）。
+    if None not in (row['ecef_x'], row['ecef_y'], row['ecef_z'],
+                    row['lat'], row['lon']):
+        from .geo import ecef_to_geodetic, geodetic_to_ecef, max_axis_delta
+        try:
+            back = geodetic_to_ecef(row['lat'], row['lon'], row['height'] or 0.0)
+            delta = max_axis_delta(row['ecef_x'], row['ecef_y'], row['ecef_z'], *back)
+            if delta is not None and delta > GEO_CONSISTENCY_TOLERANCE:
+                lat, lon, height = ecef_to_geodetic(
+                    row['ecef_x'], row['ecef_y'], row['ecef_z'])
+                logging.warning(
+                    f'标定记录的经纬度与 ECEF 不一致（最大轴差 {delta:.3f} m），'
+                    f'已按 ECEF 重算经纬度：{row["lat"]:.9f},{row["lon"]:.9f} → '
+                    f'{lat:.9f},{lon:.9f}')
+                row['lat'], row['lon'] = lat, lon
+                if row['height'] is None:
+                    row['height'] = height
+        except Exception as e:                   # noqa: BLE001
+            logging.warning(f'标定记录坐标一致性核对失败（保留原值）：{e}')
 
     return row
 
@@ -584,6 +645,17 @@ def prune_records():
 
 
 # ==================== 型号能力表 ====================
+def _parse_uart(item):
+    """把 uart_info 的 JSON 解出来挂到 `item['uart']`；坏数据当作没有。"""
+    if item is None:
+        return None
+    try:
+        item['uart'] = json.loads(item.get('uart_info') or '{}')
+    except (TypeError, ValueError):
+        item['uart'] = {}
+    return item
+
+
 def list_profiles():
     """返回型号列表，caps 已解成 dict。"""
     try:
@@ -602,7 +674,7 @@ def list_profiles():
         except (TypeError, ValueError):
             logging.warning(f'型号 {item.get("model_key")} 的 caps 不是合法 JSON，按空能力处理')
             item['caps'] = {}
-        result.append(item)
+        result.append(_parse_uart(item))
     return result
 
 
@@ -623,25 +695,77 @@ def get_profile(model_key):
         item['caps'] = json.loads(item.get('caps') or '{}')
     except (TypeError, ValueError):
         item['caps'] = {}
-    return item
+    return _parse_uart(item)
 
 
-def save_profile(model_key, display_name='', match_prefix='', caps=None):
-    """新增/覆盖一个型号（阶段1由驱动在启动时同步自己的 CAPS，保证单一真相）。"""
+def save_profile(model_key, display_name='', match_prefix='', caps=None, uart=None):
+    """新增/覆盖一个型号（阶段1由驱动在启动时同步自己的 CAPS，保证单一真相）。
+
+    `uart`：传入 `read_uart()` 的回读结果就顺带记住这一档波特率；
+    不传（None）时**保留库里已有的值**，不能被"这次没读到"清空 ——
+    同步 CAPS 的启动钩子不带串口信息，一清就等于每次开机都把记忆抹掉。
+    """
     if not model_key:
         raise StoreError('model_key 不能为空')
     caps_json = json.dumps(caps or {}, ensure_ascii=False)
+    uart_baud = 0
+    uart_json = ''
+    if uart:
+        try:
+            uart_baud = int(uart.get('baud') or 0)
+        except (TypeError, ValueError):
+            uart_baud = 0
+        if uart_baud > 0:
+            uart_json = json.dumps(uart, ensure_ascii=False, default=str)
+        else:
+            # 回读成功但波特率解析不出来：不动旧值，别用 0 覆盖掉一条好记录
+            uart_baud = 0
+            uart_json = ''
     try:
         with _connect() as conn:
             conn.execute(
-                "INSERT INTO module_profiles (model_key, display_name, match_prefix, caps, updated_at) "
-                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(model_key) DO UPDATE SET "
+                "INSERT INTO module_profiles (model_key, display_name, match_prefix, caps, "
+                "uart_baud, uart_info, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(model_key) DO UPDATE SET "
                 "display_name=excluded.display_name, match_prefix=excluded.match_prefix, "
-                "caps=excluded.caps, updated_at=excluded.updated_at",
-                (str(model_key), str(display_name), str(match_prefix), caps_json, _now()))
+                "caps=excluded.caps, "
+                # 只有这次真的读到了才覆盖串口信息
+                "uart_baud=CASE WHEN excluded.uart_baud > 0 THEN excluded.uart_baud "
+                "ELSE module_profiles.uart_baud END, "
+                "uart_info=CASE WHEN excluded.uart_baud > 0 THEN excluded.uart_info "
+                "ELSE module_profiles.uart_info END, "
+                "updated_at=excluded.updated_at",
+                (str(model_key), str(display_name), str(match_prefix), caps_json,
+                 uart_baud, uart_json, _now()))
             conn.commit()
     except sqlite3.Error as e:
         raise StoreError(f'保存型号 {model_key} 失败：{e}') from e
+
+
+def remembered_baud(model_key=None):
+    """上次回读到的波特率；`model_key` 为空时取"最近更新过的那条"。
+
+    只用于给候选表排序，**不改变用户的显式输入**：用户填了 460800 就还按 460800。
+    """
+    try:
+        with _connect() as conn:
+            if model_key:
+                row = conn.execute(
+                    'SELECT uart_baud FROM module_profiles WHERE model_key = ? AND uart_baud > 0',
+                    (str(model_key),)).fetchone()
+            else:
+                row = conn.execute(
+                    'SELECT uart_baud FROM module_profiles WHERE uart_baud > 0 '
+                    'ORDER BY updated_at DESC LIMIT 1').fetchone()
+    except sqlite3.Error as e:
+        logging.warning(f'读取波特率记忆失败（已忽略）：{e}')
+        return 0
+    if not row:
+        return 0
+    try:
+        return int(row['uart_baud'] or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 # ==================== 阶段事件（P2 统计用，先落表不展示） ====================

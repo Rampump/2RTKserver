@@ -468,13 +468,31 @@ button.nav-link {
   gap: 16px;
 }
 
-/* 出口三件套：上传端 / 本地 Caster / 无线数传，桌面横向一排，窄屏竖排 */
+/* 出口三件套：上传端 / 本地 Caster / 无线数传，桌面横向一排，窄屏竖排。
+   `stretch`（默认值）而不是 `start`：三张卡的键值行数天生不同（7 / 4 / 6 行），
+   按内容各自撑高会得到三个参差不齐的框，并排看就像没对齐的表。
+   统一拉平后，底部说明贴底对齐（见下面的 margin-top:auto），
+   多出来的空白留在说明行上方，不会把某一列顶高。 */
 .grid-outlets {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 16px;
-  align-items: start;
+  align-items: stretch;
   margin-bottom: 16px;
+}
+
+/* 卡片自身纵向排布，才能让最后一行提示贴到底边。
+   注意本项目的卡片是 `class="card card-pad"` 同一个元素（不是嵌套），
+   所以这里不能写成 `.card > .card-pad`——那条选择器永远匹配不到。 */
+.grid-outlets > .card {
+  display: flex;
+  flex-direction: column;
+}
+
+/* 说明文字永远在卡片最底部：三张卡等高后，这三行对齐才看得出"是同一组" */
+.grid-outlets > .card > .field-hint:last-child {
+  margin-top: auto;
+  padding-top: 8px;
 }
 
 /* 三列时标题右侧的说明文字会被挤成一词一行，这里允许换行并按右侧对齐 */
@@ -826,6 +844,127 @@ select.form-input {
 .field-hint.is-ok { color: var(--success); }
 .field-hint.is-error { color: var(--danger); }
 
+/* ---------- 就地候选（扫描串口 / 读取挂载点） ----------
+   候选贴在被扫描的输入框下面，不依赖任何浮层。
+   浮层（.picker-panel）只是"顺手打开"的加速方式：它可能因为输入框被禁用、
+   分区折叠、视口太小而打不开，而"候选根本看不到"在真机上就会被当成
+   "点了扫描没反应"。所以两条路都给：浮层给键盘操作，这排 chip 给确定性。 */
+.port-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.port-chip {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 1px;
+  max-width: 100%;
+  padding: 5px 10px;
+  font: inherit;
+  text-align: left;
+  color: var(--ink);
+  background: var(--surface-2, #f8fafc);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.port-chip:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.port-chip.is-current {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.port-chip-main {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.port-chip-sub {
+  font-size: 11px;
+  color: var(--muted);
+  word-break: break-word;
+}
+
+.port-chip:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* ---------- 候选下拉面板（static/picker.js） ----------
+   必须挂在 body 下并 `position: fixed`、坐标由脚本现算：
+   卡片上的 .fade-in 动画（末帧仍带 transform）会让任何绝对定位的子元素
+   以卡片为包含块，原生 datalist 就是在这里算错的（列表飞到屏幕另一头）。
+   z-index 要高于标定页那条 sticky 错误条（60）和页头。 */
+.picker-panel {
+  position: fixed;
+  z-index: 9999;
+  padding: 4px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 12px 32px -12px rgba(15, 23, 42, 0.28), 0 2px 6px rgba(15, 23, 42, 0.06);
+}
+
+.picker-panel[hidden] {
+  display: none;
+}
+
+.picker-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  line-height: 1.35;
+}
+
+.picker-item.is-active,
+.picker-item:hover {
+  background: var(--accent-soft);
+}
+
+.picker-main {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  font-family: var(--mono);
+  word-break: break-all;
+}
+
+.picker-sub {
+  font-size: 11.5px;
+  color: var(--muted);
+  word-break: break-word;
+}
+
+.picker-item.is-active .picker-main {
+  color: var(--accent-600);
+}
+
+/* 不可选的候选（例如已被 GNSS 模块占用的串口）：仍然显示并写明原因，
+   只是点不动 —— 直接过滤掉会让人以为"扫描漏了一个口"。 */
+.picker-item.is-disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.picker-item.is-disabled:hover {
+  background: transparent;
+}
+
 /* ---------- 表单分段 / 开关 ---------- */
 .section-sep {
   height: 1px;
@@ -959,6 +1098,28 @@ select.form-input {
   background: #f0fdf7;
   border-color: #a7f3d0;
   color: #047857;
+}
+
+/* 提示/提醒（默认口令、临时状态）。与 error 区分开：这不是"出错了"，
+   用红框会让人以为登录失败，反而遮住真正的原因。 */
+.alert-warning {
+  background: #fffbeb;
+  border-color: #fcd34d;
+  color: #92400e;
+}
+
+.alert-hd {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.alert-body {
+  font-size: 12.5px;
+  line-height: 1.65;
+  font-weight: 400;
 }
 
 /* 说明块（SSH 重置提示等） */

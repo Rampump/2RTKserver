@@ -20,7 +20,8 @@ radio datalink — any combination, each with its own switch.
 
 - [What it does](#what-it-does)
 - [Features](#features)
-- [What's new in 3.0](#whats-new-in-30)
+- [Verified on real hardware](#verified-on-real-hardware)
+- [Release highlights](#release-highlights)
 - [Data flow](#data-flow)
 - [Hardware](#hardware)
 - [Requirements](#requirements)
@@ -74,7 +75,83 @@ no telemetry.
 > 20 km of useful range, sometimes 50 km with dual/multi-frequency receivers. It is not a
 > replacement for a national CORS network — it is what you build when you want your own.
 
-## What's new in 3.0
+## Verified on real hardware
+
+Every release is exercised end to end on an actual device, not only in unit tests. The two
+field reports below are the raw record — including the failures, their root causes, and the
+fixes that closed them. Both are worth reading before you trust the calibration page with a
+permanent antenna.
+
+| Report | What it covers |
+| --- | --- |
+| [Real-device full-chain test, 2026-11-03](docs/lg290p-realdevice-fullchain-2026-11-03.en.md) ([中文](docs/lg290p-realdevice-fullchain-2026-11-03.zh.md)) | Full lifecycle on an Armbian box with a Quectel LG290P: one-click upgrade 2.2.3 → 3.x, mDNS access, CORS calibration that reached **RTK fixed**, and the stream pushed to a public caster. Also records the six defects that only surface on hardware. |
+| [LG290P CORS field test, 2026-11-02](docs/lg290p-cors-field-test-2026-11-02.zh.md) | First outdoor attempt: why the receiver never left DGPS quality, what was wrongly blamed on the sky view, and the command that actually fixed it. |
+
+The short version of the 2026-11-03 run:
+
+- **Upgrade** — 2.2.3 → 3.x through `update.sh`, configuration and calibration databases kept
+  intact across three subsequent incremental upgrades.
+- **Calibration** — CORS/VRS method, RTK fixed after **17 s** with 24 satellites, PDOP 1.54;
+  60 samples over 63 s; result **1.1 cm** (E 3.1 mm / N 8.7 mm / U 6.1 mm); the coordinate read
+  back from RTCM 1005 differed by at most **0.10 mm**, i.e. the RTCM quantization step.
+- **Uplink** — authenticated and streaming on a public caster: 84 KB / 126 frames in two
+  minutes, 664 B/s, zero reconnects; the caster's own source table reported the same position.
+- **What hardware found that tests did not** — a 500 that fired on every *abort*, a misleading
+  error when a read-only diagnosis was interrupted, a `NaN cm` deviation in the 1005 broadcast
+  check, one bogus noise warning caused by mixing bytes with line counts, a stage timestamp
+  that showed the task start time on all 13 rows, and a dropdown that opened anywhere but
+  under its input. All fixed in 3.1, each with a regression test.
+
+## Release highlights
+
+**3.1** — usability and field fixes found by the run above:
+
+- **Baud rate is asked, not guessed.** The calibration page now reads the module's own UART
+  configuration (LG290P `PQTMCFGUART,R`, Unicore N4 `CONFIG`) right after identification,
+  stores the answer per model in `calibration.db`, and tries that value first next time —
+  instead of climbing 115200 → 230400 → 460800 and burning a 2 s timeout on every wrong step.
+  See [Serial port and baud rate](#serial-port-and-baud-rate).
+- **Candidate lists open under their input.** `Scan serial ports` and `Fetch mount points`
+  used to fill a native `<datalist>` whose popup the browser positioned anywhere it liked
+  (an ancestor `transform` from the card animation was enough to break it). Replaced with a
+  rendering-independent panel that hangs off `<body>` and is positioned from the input's own
+  rectangle; the results also open by themselves once fetched.
+- **The three outlet cards line up.** Upload / local caster / radio have 7, 4 and 6 rows
+  respectively; they now share one height with the footnote pinned to the bottom edge.
+- **The login page states the default credentials** (`admin` / `admin`) and tells you to
+  change them — and the hint disappears once the password is no longer the factory default.
+- **Module choice is explained.** The calibration page spells out what "auto detect" versus a
+  pinned model actually changes: one identification query per registered model until one
+  answers, or exactly one query with an explicit error naming the detected model on mismatch.
+
+**3.1.1** — five defects from the second field session, where the LG290P was swapped for an
+LC29H(BS) on a different USB port:
+
+- **A missing driver method no longer means a 500.** "Read module info" died with
+  `AttributeError: 'LC29HBSDriver' object has no attribute 'read_rtcm_config'`, because the
+  pipeline calls a documented surface of methods on every driver while nothing forced a driver
+  to provide them. The base class now answers `unsupported` for the whole optional surface, the
+  LC29H(BS) driver got the five methods it was actually missing (`read_rtcm_config`,
+  `config_rtcm`, `get/set_message_rate`, `disable_survey_in`), and a contract test asserts every
+  registered driver exposes the full surface.
+- **Port scan replies where you are looking.** Candidates and failure messages used to land in a
+  `<datalist>` popup and a page-bottom error bar respectively; after a USB swap this read as
+  "the button does nothing". Results now render as chips directly under the port input, a single
+  port is filled in automatically, and enumeration failure is distinguished from "no device".
+- **"Measure only" requires a rover.** It works by receiving CORS corrections, which a base-only
+  module cannot do — the LC29H(BS) would have collected for the full duration and returned a
+  metre-level coordinate that looks like a success. Now locked in the UI and rejected by the
+  service for base-only models; unknown modules stay allowed.
+- **Reusing a coordinate no longer depends on the module.** The reuse path was filtered by
+  `module_sn`, so after swapping to the LC29H(BS) the page claimed no history existed — for an
+  antenna that had been measured half an hour earlier. The phase-centre position belongs to the
+  antenna, not to the module that measured it.
+- **Coordinates are stored in both forms.** A record now always carries ECEF *and* lat/lon,
+  converting in either direction (whatever the module or the operator supplied), and a pair that
+  disagrees by more than 5 cm is corrected from ECEF with a warning, because ECEF is what actually
+  goes out in the 1005 message.
+
+**3.0** — the calibration subsystem:
 
 - **On-device calibration** — `/calibrate` measures and writes the antenna position, no vendor
   PC tool needed. CORS/VRS, Survey-in and manual entry; LG290P / LC29HBS / Unicore N4.
@@ -286,6 +363,44 @@ another program on the device (including a previous instance that has not exited
 holds the port you want to listen on. The settings page checks this before saving and, on
 Linux, names the process holding the port.
 
+### Serial port and baud rate
+
+Leaving the baud field **empty** on the calibration page means "figure it out", not "use
+115200". The order of attempts is fixed and every step is cheaper than the next:
+
+1. **What you typed**, if you typed anything. An explicit value is never overridden — it is on
+   screen, so silently ignoring it would be a lie.
+2. **What this device last read back from the module.** Stored per model in
+   `module_profiles.uart_baud`. This is the one that matters: a receiver reports its own UART
+   configuration, so the answer comes from the hardware rather than from a table.
+3. **The vendor's documented table**, highest first (LG290P: 921600 / 460800 / 230400 / 115200
+   / 9600).
+4. **A global fallback list**, only when the model is still unknown.
+
+Step 2 is why a second run on the same box connects immediately: identification succeeds, the
+driver issues `$PQTMCFGUART,R` (Quectel) or `CONFIG` (Unicore), and the reported value is
+remembered. The hardware panel then shows it as `UART1 115200 8N1` next to the firmware and
+serial number — if that line disagrees with `Port @ baud` in the task header, you are talking
+to a different port than you think.
+
+```bash
+# what has been remembered so far
+sqlite3 /opt/2RTKserver/calibration.db \
+  "select model_key, uart_baud, updated_at from module_profiles;"
+```
+
+Two honest limitations:
+
+- **Readback cannot replace the first connection.** A command sent at the wrong baud rate
+  cannot be answered, so the port still has to be opened at some candidate rate before asking.
+  Readback removes the *second and subsequent* guesses, not the first.
+- **Not every model can be asked.** LC29HBS only has a write command (`PAIR864`), so its row
+  stays empty and the documented table is used. The driver declares this instead of pretending.
+
+Frame format is not negotiable on these modules: LG290P reports and accepts 8N1 with no flow
+control, Unicore N4 accepts 8N1 only. If you see bytes arriving and no valid reply, the problem
+is wiring or flow control, not the baud rate — see [Troubleshooting](#troubleshooting).
+
 ## Read this first: antenna phase center
 
 Corrections are computed **relative to the antenna phase center (APC)**. If that coordinate is
@@ -308,6 +423,16 @@ the module, so you no longer need a vendor PC tool for the initial survey.
 | `cors` | You have a CORS/NTRIP account with RTK corrections | Caster host/port, mountpoint, credentials. Typically 3–10 min to a fix. |
 | `survey_in` | No external corrections available | Clear sky view; averages a single-point solution over 60 s – 15 min. Accuracy is **sub-meter**, not centimetre. |
 | `manual` | You already surveyed the APC (control point, static session) | Latitude/longitude/height or ECEF, entered by hand. |
+
+**Picking the module** — the select box is not decoration; it decides how identification runs:
+
+| Selection | What the program does | Use it when |
+| --- | --- | --- |
+| *Unknown · auto detect* | Sends one identification query per registered model, in registry order, and stops at the first that answers. Costs 1–2 s and also probes optional commands (e.g. whether this firmware supports `PQTMSN`). | You do not know what is plugged in, or you are swapping boards. |
+| A specific model | Sends exactly one query, for that model only. If the module answers but is a different model, the run fails with `Module mismatch: you selected X, detected Y` instead of writing base-station settings into a receiver it does not understand. | Repeat runs on a known installation — faster, and a wrong board can never be configured by accident. |
+
+Either way the *actual* firmware string, not the label you picked, is what gets stored in the
+calibration record and shown on the status page.
 
 **What it actually does**
 
@@ -479,11 +604,13 @@ Calibration design and field notes:
   deleted and the program still runs)
 - [docs/lg290p-cors-field-test-2026-11-02.zh.md](docs/lg290p-cors-field-test-2026-11-02.zh.md)
   — real-hardware field test report, including the failures and their root causes
+- [docs/lg290p-realdevice-fullchain-2026-11-03.en.md](docs/lg290p-realdevice-fullchain-2026-11-03.en.md)
+  — English version of the end-to-end run on an actual Armbian box (upgrade, mDNS, CORS
+  calibration to RTK fixed, NTRIP uplink verification, and the defects only hardware exposed)
 - [docs/lg290p-realdevice-fullchain-2026-11-03.zh.md](docs/lg290p-realdevice-fullchain-2026-11-03.zh.md)
-  — end-to-end run on an actual Armbian box: one-click upgrade 2.2.3 → 3.0.0, mDNS access,
-  a CORS calibration that reached **RTK fixed** (24 sats, PDOP 1.54, 1.1 cm), and the RTCM
-  stream pushed to a public caster. Also lists the five defects that only show up on real
-  hardware, each with root cause and the fix that closed it
+  — 同一次真机全链路测试的中文原始记录：一键升级 2.2.3 → 3.x、mDNS 访问、**拿到 RTK 固定解**的
+  CORS 标定（24 颗星、PDOP 1.54、1.1 cm），以及把 RTCM 推到公网 Caster 的实测数据；
+  并逐条列出六个只在真机上才暴露的缺陷、根因与修法
 
 ## License & credits
 
@@ -516,6 +643,39 @@ LC29HBS 与 Unicore N4 模块；测出来的 ECEF 存进 `calibration.db`，写�
 RTCM 1005 校验「写进去的 == 播出去的」。精度如实标注（固定解 / 浮动解 / 亚米级），
 天线被挡住只能拿到浮动解时不会假装成功，也不会直接判失败。
 
+**3.1 是本项目第一次真机全链路测试（2026-11-03，Armbian + LG290P）的产物**，报告见
+[docs/lg290p-realdevice-fullchain-2026-11-03.zh.md](docs/lg290p-realdevice-fullchain-2026-11-03.zh.md)
+（英文版：[.en.md](docs/lg290p-realdevice-fullchain-2026-11-03.en.md)）。那一轮实测中，
+一键升级、mDNS 访问、CORS 标定（17 秒固定解、1.1 cm）、NTRIP 上传全部跑通，同时暴露出六个
+只在真机上才出现的问题，3.1 逐条修完：
+
+- **波特率改成"问模块"，不再一档档盲试**：识别成功后立刻回读模块自报的串口参数
+  （Quectel `PQTMCFGUART,R`、Unicore `CONFIG`），按型号记进标定库，下次优先用这一档。
+- **候选列表回到输入框下面**：原来的原生 `<datalist>` 弹层会被卡片的 `transform` 动画影响、
+  出现在离输入框很远的地方；现在改成挂在 `<body>` 上的自绘面板，坐标现算，扫完/读完全自动展开。
+- **三个出口卡片等高**：上传 / 本地 Caster / 数传的行数本来就不一样（7 / 4 / 6），现在统一高度，
+  底部说明贴底对齐。
+- **登录页写明默认账号 `admin` / `admin`**，并提醒部署前改密；改过密码后这条提示自动消失。
+- **型号选择有了说明**：写清「自动探测」和「指定型号」在流程上的差别，以及选错时会怎样报错。
+
+**3.1.1 是第二轮真机测试（同一天，把 LG290P 拔掉、换 USB 口插上 LC29H(BS)）暴露的五个问题**：
+
+- **驱动少一个方法不再等于一次 500**：「读取模块信息」直接报
+  `AttributeError: 'LC29HBSDriver' object has no attribute 'read_rtcm_config'`。
+  根因不是命令写错，而是流程层会无条件调用一整组方法（诊断读 RTCM 配置、备份逐项回读），
+  而没有任何机制强制驱动实现它们。现在基类给整张可选协议面兜底（返回「不支持」而不是抛异常），
+  LC29H(BS) 补齐真正缺的 5 条命令，并加了一条契约测试：每个已注册驱动都必须暴露完整协议面。
+- **扫描串口的候选出现在你正在看的地方**：原来候选进 `<datalist>` 弹层、失败信息进页面底部
+  全局框，换完 USB 口点一下看起来就是「没反应」。现在候选直接渲染成输入框下面的 chip，
+  只有一个口时自动填入，并且把「枚举失败」和「确实没设备」分开报。
+- **「只测坐标」要求模块能当流动站**：它靠接收 CORS 改正数来算位置，单基准站模块做不到 ——
+  LC29H(BS) 会白跑整档采集再吐一个米级坐标，而那个坐标看起来像"成功"。
+  现在前端锁死、后端再拒一次；未指定型号的未知模块仍然放行。
+- **复用坐标不再看模块**：复用路径按 `module_sn` 过滤，换成 LC29H(BS) 后页面判定「本机没有历史
+  坐标」，而那是半小时前刚在同一根天线上测出来的。相位中心坐标属于天线，不属于测它的模块。
+- **坐标两种形态都落库**：一条记录必定同时有 ECEF 与经纬高，两个方向都能换算（取决于模块
+  或人工给的是哪一种）；两者相差超过 5 cm 时以 ECEF 为准重算并告警，因为真正播进 1005 的是 ECEF。
+
 安装、天线相位中心定位方法、故障排除见 [INSTALL.md](INSTALL.md)，本文件上方为英文说明。
 
 ### 一键安装
@@ -546,7 +706,7 @@ sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone 
 sudo rm -rf /tmp/2rtk-update && (sudo git clone --depth 1 https://gitcode.com/rampump/NTRIPserver.git /tmp/2rtk-update || (sudo rm -rf /tmp/2rtk-update && sudo git clone --depth 1 https://github.com/Rampump/2RTKserver.git /tmp/2rtk-update)) && sudo bash /tmp/2rtk-update/update.sh
 ```
 
-升级完成后浏览器里「系统维护」显示的版本应为 `3.0.0`。也可以在网页上点「检查更新 → 立即升级」，
+升级完成后浏览器里「系统维护」显示的版本应为 `3.1.1`。也可以在网页上点「检查更新 → 立即升级」，
 效果一致：它会先备份、换文件、装依赖、启动服务，任何一步失败自动回滚到原版本。
 
 > **从 2.x 升级特别注意**：3.0 首次启动会自动建 `calibration.db`（标定库）。旧的

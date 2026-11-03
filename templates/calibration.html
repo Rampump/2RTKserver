@@ -243,6 +243,12 @@
                   </button>
                 </div>
                 <datalist id="cal-port-list"></datalist>
+                <!-- 扫描结果**就地**列在输入框下面。真机上出现过"点了扫描没反应"：
+                     候选只进 datalist（要再点一次输入框才弹），而失败信息又写在页面
+                     最底部的全局错误框里，离这根输入框隔着好几屏 —— 现场看就是"没反应"。
+                     所以候选与结果都贴在这里，不依赖任何浮层。 -->
+                <p class="field-hint" id="cal-port-hint"></p>
+                <div class="port-chips is-hidden" id="cal-port-chips"></div>
               </div>
 
               <div class="cal-grid">
@@ -260,6 +266,9 @@
                 <div class="field">
                   <label class="form-label" for="cal-module" data-i18n="cal.module">模块型号</label>
                   <select id="cal-module" class="form-input"></select>
+                  <!-- 选型和"自动探测"在流程上是两条路（一条只问一个型号，一条挨个问），
+                       差别直接写在这儿。真机测试时这一格被当成装饰品忽略掉了。 -->
+                  <p class="field-hint" id="cal-module-hint"></p>
                 </div>
               </div>
             </div>
@@ -730,6 +739,7 @@
   </div>
 
   <script src="/static/i18n.js"></script>
+  <script src="/static/picker.js"></script>
   <script src="/static/calibration.js"></script>
 </body>
 </html>

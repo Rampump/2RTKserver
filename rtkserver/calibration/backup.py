@@ -117,10 +117,16 @@ def capture(driver, task_id='', port='', module=None):
         ok, message, data = False, f'{type(e).__name__}: {e}', {}
     if ok:
         fields = data.get('fields') or []
+        # MSM 档位优先取驱动翻译好的 `msm_type`：LG290P 的七字段里有它，
+        # LC29H(BS) 没有七字段（只有一个全局 PAIR432 开关），由驱动翻译成同一语义。
+        # 只看 `fields[0]` 的话，后者会得到 None，还原时把 MSM 档位丢掉。
+        msm_type = data.get('msm_type')
+        if msm_type is None and fields:
+            msm_type = _to_int(fields[0])
         backup['rtcm'] = {
             'fields': fields,
             'raw': data.get('raw', ''),
-            'msm_type': _to_int(fields[0]) if fields else None,
+            'msm_type': msm_type,
         }
     else:
         # rover 模式下部分固件回 ERROR,1（"从没配过"），不是故障，不降 ok

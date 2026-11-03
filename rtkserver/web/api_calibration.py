@@ -171,25 +171,35 @@ def api_calibration_options():
     否则加了新驱动前端就看不到。
     """
     modules = driver_manager.list_supported_modules()
+    # 把"这块型号上次回读到的串口参数"贴到型号条目上：页面据此提示
+    # "留空则优先试 115200"，而不是让用户面对一个空输入框猜。
+    # 放在 API 层合并、不放进 driver_manager：驱动注册表不该反过来依赖标定库。
+    try:
+        profiles = {item.get('model_key'): item for item in store.list_profiles()}
+    except Exception as e:                      # noqa: BLE001
+        profiles = {}
+        logging.warning(f'读取型号波特率记忆失败（忽略）：{e}')
+    for item in modules.get('all') or []:
+        prof = profiles.get(item.get('id')) or {}
+        try:
+            item['remembered_baud'] = int(prof.get('uart_baud') or 0)
+        except (TypeError, ValueError):
+            item['remembered_baud'] = 0
+        item['uart'] = prof.get('uart') or {}
+
     latest = []
     try:
         latest = store.list_records(limit=3)
     except Exception as e:                      # noqa: BLE001
         logging.warning(f'读取历史标定记录失败（忽略）：{e}')
-    # 历史坐标能不能被「复用」取决于它是不是**这台设备**的记录。
-    # 上面只取了全库最近 3 条（页面要展示），但复用时必须知道当前模块 SN 下
-    # 有没有记录 —— 否则会拿另一块模块/另一根天线的坐标往这台机器里写，
-    # 1005 校验照样"通过"（它只核对写入值与播发值一致），现场表现为
-    # "基准站播的是别人家的位置"，而且查不出任何异常。
-    # 这里把当前模块（页面选中的型号）的 SN 对应记录单独给一份，
-    # 前端只用这一份做复用，`history` 仍作展示用途。
-    module_sn = str(request.args.get('sn') or '').strip()
-    own_records = []
-    if module_sn:
-        try:
-            own_records = store.list_records(limit=1, module_sn=module_sn)
-        except Exception as e:                  # noqa: BLE001
-            logging.warning(f'读取本机历史坐标失败（忽略）：{e}')
+    # 「复用坐标」取全库最近一条，**不按模块 SN 过滤**。
+    # 这里曾经按当前模块 SN 过滤，真机上就卡住了：先用 LG290P 测出天线坐标，
+    # 换成 LC29H(BS) 想复用时，页面判定"本机还没有这块模块的历史坐标"直接把
+    # 复用按钮锁死 —— 明明同一根天线、同一个安装位置，只是换了块模块。
+    # 坐标描述的是**天线相位中心**这个物理点，跟谁去测、谁去播没关系。
+    # 页面把模块型号/SN/标定时间一并显示出来，让用户自己核对"是不是同一根天线"，
+    # 这比程序替他判定更可靠：程序根本不知道天线有没有被挪过。
+    reuse = latest[0] if latest else None
     snap = calib.status()
     return jsonify({
         'ok': True,
@@ -201,11 +211,14 @@ def api_calibration_options():
             for key, item in _SURVEY_PROFILES.items()
         ],
         'history': [_mask_obj(item) for item in latest],
-        # 仅供「复用坐标」用：当前模块 SN 的最近一条记录。空列表 = 这台设备没标定过
-        'own_history': [_mask_obj(item) for item in own_records],
+        # 供「复用坐标」用：全库最近一条（任意模块、任意 SN）。空 = 库里还没有坐标
+        'reuse_history': [_mask_obj(reuse)] if reuse else [],
         'backup': calib.backup_info(),
         'defaults': {
             'baud': 115200,
+            # 上次回读到的波特率（任意型号）。前端只在用户留空且选了具体型号时
+            # 才拿它当提示，不会覆盖用户的显式输入。
+            'remembered_baud': store.remembered_baud(),
             'duration': 'standard',
             # 2101 是通用 NTRIP 端口；国内移动 CORS 的 VRS 实测走 8002（WGS84）/
             # 8001（CGCS2000），2101 直接超时。默认给 8002，另在页面留候选。

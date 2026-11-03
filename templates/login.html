@@ -18,6 +18,20 @@
       </div>
       <p class="auth-sub" data-i18n="login.title">管理员登录</p>
 
+      {# 默认口令提示。只在**确实还是出厂口令**时显示（后端 is_default_admin 判定）：
+         新装的机器用户根本不知道该输什么；而改过口令后继续显示，等于在登录页上
+         贴一个错误的账号密码。 #}
+      {% if default_login %}
+        <div class="alert alert-warning" id="default-login-hint">
+          <div class="alert-hd"><i class="fa fa-info-circle" aria-hidden="true"></i>
+            <span data-i18n="login.default.title">默认账号：admin / admin</span></div>
+          <div class="alert-body" data-i18n="login.default.body">
+            当前仍在使用出厂默认账号与密码。首次登录请直接使用 admin / admin；
+            正式部署（尤其是映射到公网）前，请登录后立即在顶部导航的「修改密码」中更换。
+          </div>
+        </div>
+      {% endif %}
+
       {# 原先这里把提示写死成"用户名或密码错误"，模板根本不渲染后端传的 error 变量，
          导致限速（429）时用户看到的仍是"密码错误"，会误以为自己记错密码。 #}
       {% if error %}

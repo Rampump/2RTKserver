@@ -688,6 +688,9 @@ class BaseDriver:
     DEFAULT_BAUD = 115200
     # 波特率按哪个命令下发（CMD 里的键名）；没填则该型号不支持改波特率。
     BAUD_CMD_KEY = ''
+    # 波特率按哪个命令回读（CMD 里的键名）；没填 = 该型号没有回读命令。
+    # 回读是"优先问模块"的前提：没有它就只能按档位盲试。
+    BAUD_READ_KEY = ''
 
     # ---------- 串口帧格式（少数厂商不用 `$...*XX`） ----------
     # Quectel 全系命令都是 `$定长体*XX`，这两个值保持默认即可。
@@ -758,6 +761,21 @@ class BaseDriver:
             return int(baud) in table
         except (TypeError, ValueError):
             return False
+
+    def read_uart(self, port=None):
+        """回读模块自己报的串口配置（波特率/数据位/校验/停止位/流控）。
+
+        为什么要问模块而不是靠"逐档递增去试"：波特率是**模块持有的状态**，
+        厂商给了回读命令就应该是第一信息来源。真机上的差别很直观 ——
+        逐档探测每错一档要白等 2 秒超时（LG290P 五档最坏 8 秒以上），
+        而回读是一次 200 ms 的查询，还能顺带确认数据位/校验位有没有被人改过。
+
+        回读**不能替代首连**：串口参数不对时命令根本发不进去，所以流程仍是
+        「先按候选表把连接建立起来 → 立刻回读 → 用回读值校正并记住」。
+        回应格式各家不同（Quectel 一条定长字段、和芯星通三个口各回一行），
+        所以解析必须由驱动实现；基类只负责"没声明就别假装支持"。
+        """
+        return False, f'{self.DISPLAY_NAME} 不支持回读串口配置', {'error': 'unsupported'}
 
     def set_cap(self, key, value):
         """运行期改写能力位（错误码 3 时用，方案 §4.5）。返回是否发生了变化。"""
@@ -958,11 +976,11 @@ class BaseDriver:
 
     def get_mode(self):
         """'rover' / 'base' / 'unknown'。"""
-        raise NotImplementedError
+        return self._unsupported('读取工作模式')
 
     def set_mode(self, mode, persist=True, restart=True):
         """切模式（含可选保存 + 重启 + 回读）。"""
-        raise NotImplementedError
+        return self._unsupported(f'切换到 {mode} 模式')
 
     def set_mode_memory_only(self, mode):
         """**只改运行态**切模式：不 SAVEPAR、不重启、不碰 NVM（附录D）。
@@ -981,35 +999,82 @@ class BaseDriver:
 
     def get_fixed_ecef(self):
         """读固定坐标配置（注意：Survey-in 模式下是 0.0000，不是收敛结果）。"""
-        raise NotImplementedError
+        return self._unsupported('读取固定坐标')
 
     def set_fixed_ecef(self, x, y, z, persist=True, restart=True, verify=True):
         """写固定坐标（含可选回读校验）。"""
-        raise NotImplementedError
+        return self._unsupported('写入固定坐标')
 
     def config_survey_in(self, count, acc_limit, distance=None, persist=True, restart=True):
         """配 Survey-in。"""
-        raise NotImplementedError
+        return self._unsupported('配置 Survey-in')
 
     def survey_status(self):
         """读最近一条 `$PQTMSVINSTATUS`（模块主动输出，不能主动查询）。"""
-        raise NotImplementedError
+        return self._unsupported('读取 Survey-in 状态')
 
     def config_messages(self, **kwargs):
         """配 GGA / RTCM / MSM 的输出速率。"""
-        raise NotImplementedError
+        return self._unsupported('配置报文输出速率')
 
     def set_antenna_info(self, desc, setup_id=0, sn='', persist=True):
         """写 RTCM3-1033 用的天线信息。不支持时返回 success=False 并说明。"""
-        raise NotImplementedError
+        return self._unsupported('写入天线信息（1033）')
+
+    # ---------- 可选协议面：默认"不支持"，绝不允许 AttributeError ----------
+    # 下面这组方法不是每个型号都有对应命令，但**流程层会无条件调用**：
+    # 「读取模块信息」的诊断报告要读 RTCM 配置，备份/还原要逐项回读。
+    # 早先 LC29H(BS) 漏实现 `read_rtcm_config`，真机上点一次诊断就 500：
+    #   AttributeError: 'LC29HBSDriver' object has no attribute 'read_rtcm_config'
+    # 漏一个方法 = 一个 500；而"这个型号没有这条命令"本来是一件正常、可解释的事。
+    # 所以基类把整张可选协议面给全默认实现：子类有命令就覆盖，没有就继承，
+    # 上层永远拿到 `(False, '为什么不行', {...})` 而不是异常。
+    # 这也是新增驱动时的一方保险 —— 新驱动哪怕只实现 detect/info 也能跑完整条链路。
+    def _unsupported(self, what, hint=''):
+        message = f'{self.DISPLAY_NAME} 不支持{what}（驱动未实现该命令）'
+        if hint:
+            message = f'{message}；{hint}'
+        return False, message, {'error': 'unsupported', 'what': what}
+
+    def get_svin_config(self):
+        """读坐标/Survey-in 配置。没有该命令的型号继承默认实现。"""
+        return self._unsupported('读取坐标配置')
+
+    def read_rtcm_config(self):
+        """回读 RTCM 播发配置（诊断报告、备份都要用）。"""
+        return self._unsupported('查询 RTCM 配置')
+
+    def restore_rtcm_config(self, fields):
+        """把备份里的 RTCM 字段原样写回（还原专用）。"""
+        return self._unsupported('回写 RTCM 配置')
+
+    def config_rtcm(self, msm_type=4, persist=True, **kwargs):
+        """配置 RTCM 播发参数（MSM 档位等）。"""
+        return self._unsupported('配置 RTCM 参数')
+
+    def get_message_rate(self, name, msg_ver=None):
+        """查某条语句的输出速率。"""
+        return self._unsupported(f'查询报文 {name} 的速率')
+
+    def set_message_rate(self, name, rate, port=None, **kwargs):
+        """配某条语句的输出速率。"""
+        return self._unsupported(f'配置报文 {name} 的速率')
+
+    def disable_survey_in(self, persist=True, restart=False):
+        """停用 Survey-in / 固定坐标，避免旧配置继续收敛。"""
+        return self._unsupported('停用 Survey-in')
+
+    def read_antenna_info(self):
+        """回读天线信息（1033 用）。"""
+        return self._unsupported('读取天线信息')
 
     def save(self):
         """写 NVM。"""
-        raise NotImplementedError
+        return self._unsupported('保存参数到 NVM')
 
     def reboot(self):
         """软重启并等开机首帧（等哪一条由 `BOOT_FRAME` 声明，见 `_reboot_sequence`）。"""
-        raise NotImplementedError
+        return self._unsupported('重启模块')
 
     def parse_line(self, text):
         """解析一行。基类已覆盖 GGA/RMC/GLL/GSA/SVINSTATUS/VER，子类按需扩展。"""

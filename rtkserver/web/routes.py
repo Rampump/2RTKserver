@@ -11,9 +11,9 @@ from flask import (jsonify, redirect, render_template, request, session,
 from ..core import state
 from ..core.config import get_config, mask_config, save_config
 from ..core.constants import LOCAL_CASTER_HOST, LOCAL_CASTER_PORT
-from ..security import (clear_login_failures, hash_password, login_locked_seconds,
-                        login_required, record_login_failure, safe_next_url,
-                        verify_password)
+from ..security import (clear_login_failures, hash_password, is_default_admin,
+                        login_locked_seconds, login_required, record_login_failure,
+                        safe_next_url, verify_password)
 from ..utils.network import port_conflict_message, probe_tcp_port
 
 
@@ -26,6 +26,11 @@ def login():
     if session.get('logged_in'):
         return redirect(url_for('config_page'))
 
+    # 「默认口令还没改」是登录页必须让人看见的一条事实：新装机器的用户
+    # 不知道用户名口令是什么，只能去翻 README；而一旦改过口令，这条提示
+    # 又必须消失，否则页面等于在教人用错误的密码登录。
+    default_login = is_default_admin(get_config())
+
     if request.method == 'POST':
         client_ip = (request.remote_addr or 'unknown')
         locked = login_locked_seconds(client_ip)
@@ -33,6 +38,7 @@ def login():
             logging.warning(f"登录已被限速，来自 {client_ip} 的请求被拒绝（还需等待 {locked} 秒）")
             return render_template(
                 'login.html',
+                default_login=default_login,
                 error=f'登录失败次数过多，请 {locked} 秒后再试。'
             ), 429
 
@@ -49,9 +55,10 @@ def login():
                 return redirect(next_url)
             return redirect(url_for('config_page'))
         record_login_failure(client_ip)
-        return render_template('login.html', error='用户名或密码错误，请重试。')
+        return render_template('login.html', default_login=default_login,
+                               error='用户名或密码错误，请重试。')
 
-    return render_template('login.html')
+    return render_template('login.html', default_login=default_login)
 
 
 # 退出登录。原项目根本没有这个路由：登录后只能靠关浏览器或等 Session 过期，
