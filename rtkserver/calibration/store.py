@@ -197,11 +197,11 @@ _DDL_V5 = (
 )
 
 _MIGRATIONS = {
-    1: lambda conn: [conn.execute(stmt) for stmt in _DDL_V1],
-    2: lambda conn: [conn.execute(stmt) for stmt in _DDL_V2],
-    3: lambda conn: [conn.execute(stmt) for stmt in _DDL_V3],
-    4: lambda conn: [conn.execute(stmt) for stmt in _DDL_V4],
-    5: lambda conn: [conn.execute(stmt) for stmt in _DDL_V5],
+    1: _DDL_V1,
+    2: _DDL_V2,
+    3: _DDL_V3,
+    4: _DDL_V4,
+    5: _DDL_V5,
 }
 
 # 初始型号表。**能力矩阵的权威来源是驱动（drivers/*.py 的 CAPS）**，
@@ -285,12 +285,40 @@ def init_db():
     logging.debug(f'标定库就绪：{CALIBRATION_DB}（schema v{SCHEMA_VERSION}）')
 
 
+def _exec_ddl(conn, statement):
+    """执行一条迁移 DDL；"列/表已经存在"按"这一步已完成"处理，不报错。
+
+    为什么必须容忍重复：SQLite 里 DDL **不受 Python 的隐式事务保护**
+    （`sqlite3` 只在 INSERT/UPDATE/DELETE/REPLACE 前才开事务，`ALTER TABLE`
+    是立即提交的）。所以迁移跑到一半掉电/被 kill，会留下
+    "列已经加上、`PRAGMA user_version` 还停在旧值"的半成品库。
+    下次启动重跑同一步，第一条已存在的 ALTER 就撞 `duplicate column name`，
+    `init_db()` 抛异常 —— 这台设备的标定库从此**永久打不开**：
+    数据都还在，但页面上的标定、历史、备份全部失效，且没有任何界面能修。
+
+    做成幂等之后，半成品库下次启动会把剩下的列补完，版本号照常推进。
+    """
+    try:
+        conn.execute(statement)
+    except sqlite3.OperationalError as e:
+        text = str(e).lower()
+        if 'duplicate column name' in text or 'already exists' in text:
+            logging.warning(f'标定库迁移跳过已完成的语句（{e}）：{statement[:70]}')
+            return
+        raise
+
+
 def _migrate(conn, from_version):
     for target in range(from_version + 1, SCHEMA_VERSION + 1):
         step = _MIGRATIONS.get(target)
         if step is None:
             raise StoreError(f'缺少 v{target} 的迁移步骤')
-        step(conn)
+        # 迁移步骤默认是一串 DDL；将来若有需要搬数据的步骤，写成 callable 即可。
+        if callable(step):
+            step(conn)
+        else:
+            for statement in step:
+                _exec_ddl(conn, statement)
         # PRAGMA 不支持参数绑定，target 来自本模块常量，不是外部输入
         conn.execute(f'PRAGMA user_version = {int(target)}')
         conn.commit()
@@ -388,20 +416,29 @@ def _normalize_record(record):
     # 反向：模块/用户只给了经纬高（NMEA、厂家上位机界面、手抄的 CORS 成果表），
     # 库里必须同时有 ECEF —— 写进模块、播进 1005 的永远是 ECEF，
     # 只存经纬度的话"复用这条坐标"时还得现场再算一次，而每次算的人不同就会漂。
+    #
+    # 但**高程未知时不算**：`h=0` 不是"没给"，而是"天线在椭球面上海平面"，
+    # 内陆站常常因此差几十米，而这条记录接着会被当成"可复用的权威坐标"写进模块。
+    # 宁可留空，让使用者看见"这条记录没有 ECEF"，也不要造一个看起来完整的错值。
     elif (row['lat'] is not None and row['lon'] is not None) \
             and None in (row['ecef_x'], row['ecef_y'], row['ecef_z']):
-        from .geo import geodetic_to_ecef
-        try:
-            x, y, z = geodetic_to_ecef(row['lat'], row['lon'], row['height'] or 0.0)
-            # 与写入链路同样的量化：0.1 mm。先截断再记，避免库里出现
-            # "经纬度反算回来差 0.03 mm"这种永远对不齐的尾数。
-            row['ecef_x'], row['ecef_y'], row['ecef_z'] = (
-                round(x, 4), round(y, 4), round(z, 4))
-            if None in (row['arp_x'], row['arp_y'], row['arp_z']):
-                row['arp_x'], row['arp_y'], row['arp_z'] = (
-                    row['ecef_x'], row['ecef_y'], row['ecef_z'])
-        except Exception as e:                   # noqa: BLE001
-            logging.warning(f'标定记录由经纬度换算 ECEF 失败（保留空值）：{e}')
+        if row['height'] is None:
+            logging.warning(
+                '标定记录只有经纬度、没有高程，未反算 ECEF（h=0 会让整站低几十米）：'
+                f'{row["lat"]:.9f},{row["lon"]:.9f}')
+        else:
+            from .geo import geodetic_to_ecef
+            try:
+                x, y, z = geodetic_to_ecef(row['lat'], row['lon'], row['height'])
+                # 与写入链路同样的量化：0.1 mm。先截断再记，避免库里出现
+                # "经纬度反算回来差 0.03 mm"这种永远对不齐的尾数。
+                row['ecef_x'], row['ecef_y'], row['ecef_z'] = (
+                    round(x, 4), round(y, 4), round(z, 4))
+                if None in (row['arp_x'], row['arp_y'], row['arp_z']):
+                    row['arp_x'], row['arp_y'], row['arp_z'] = (
+                        row['ecef_x'], row['ecef_y'], row['ecef_z'])
+            except Exception as e:               # noqa: BLE001
+                logging.warning(f'标定记录由经纬度换算 ECEF 失败（保留空值）：{e}')
 
     # 两组都给齐时核对一致性：ECEF 是**权威值**（真正写进模块、播发出去的那组），
     # 经纬度是从它反算的展示值。两者对不上说明调用方把不同来源的数混在一行里了，
@@ -411,7 +448,14 @@ def _normalize_record(record):
                     row['lat'], row['lon']):
         from .geo import ecef_to_geodetic, geodetic_to_ecef, max_axis_delta
         try:
-            back = geodetic_to_ecef(row['lat'], row['lon'], row['height'] or 0.0)
+            # 高程缺失时先由 ECEF 反算出来再比。直接用 h=0 去比会得出"差了上百米"
+            # 的假结论 —— 一组本来完全一致的数据（经纬度 + 对应 ECEF，但没填高程）
+            # 会被判成冲突，然后打一条吓人的告警并把经纬度"修正"成它自己。
+            if row['height'] is None:
+                _, _, h_from_ecef = ecef_to_geodetic(
+                    row['ecef_x'], row['ecef_y'], row['ecef_z'])
+                row['height'] = h_from_ecef
+            back = geodetic_to_ecef(row['lat'], row['lon'], row['height'])
             delta = max_axis_delta(row['ecef_x'], row['ecef_y'], row['ecef_z'], *back)
             if delta is not None and delta > GEO_CONSISTENCY_TOLERANCE:
                 lat, lon, height = ecef_to_geodetic(
@@ -535,6 +579,30 @@ def get_latest_by_sn(module_sn):
             return _row_to_dict(row)
     except sqlite3.Error as e:
         logging.warning(f'按 SN 读取标定记录失败（已忽略）：{e}')
+        return None
+
+
+def get_latest_with_coord():
+    """取最近一条**带完整 ECEF** 的记录，供「复用历史坐标」用。
+
+    为什么不能直接拿「最近一条」：记录可以只有经纬度而没高程（这种行按现在的
+    约定不再反算 ECEF，见 `_normalize_record`），也可能来自一次失败/中断的运行。
+    这类行拿来复用等于让用户点完「复用坐标」却收到"请填写 ECEF"——
+    明明库里就有别的可用记录。这里只挑真的能用的那条。
+
+    与 `get_latest_by_sn` 的区别：这里**不按模块 SN 过滤**。坐标描述的是天线
+    相位中心这个物理点，跟谁测出来、谁去播发无关；页面会把型号/SN/时间一并
+    显示，由人核对"是不是同一根天线"。
+    """
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                'SELECT * FROM calibration_records '
+                'WHERE ecef_x IS NOT NULL AND ecef_y IS NOT NULL AND ecef_z IS NOT NULL '
+                'ORDER BY created_at DESC, id DESC LIMIT 1').fetchone()
+            return _row_to_dict(row)
+    except sqlite3.Error as e:
+        logging.warning(f'读取可复用标定记录失败（已忽略）：{e}')
         return None
 
 
