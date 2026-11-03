@@ -479,6 +479,11 @@ Calibration design and field notes:
   deleted and the program still runs)
 - [docs/lg290p-cors-field-test-2026-11-02.zh.md](docs/lg290p-cors-field-test-2026-11-02.zh.md)
   — real-hardware field test report, including the failures and their root causes
+- [docs/lg290p-realdevice-fullchain-2026-11-03.zh.md](docs/lg290p-realdevice-fullchain-2026-11-03.zh.md)
+  — end-to-end run on an actual Armbian box: one-click upgrade 2.2.3 → 3.0.0, mDNS access,
+  a CORS calibration that reached **RTK fixed** (24 sats, PDOP 1.54, 1.1 cm), and the RTCM
+  stream pushed to a public caster. Also lists the five defects that only show up on real
+  hardware, each with root cause and the fix that closed it
 
 ## License & credits
 
