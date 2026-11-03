@@ -506,12 +506,28 @@ The previous flow climbed the candidate list and paid a 2-second timeout on ever
   only has a write command.
 - The result is shown in the hardware panel (`UART1 115200 8N1`) and stored per model in
   `module_profiles.uart_baud` (schema v5).
-- The next run tries, in order: what you typed → what the module reported last time → the vendor
-  table (highest first) → a global fallback.
+- Candidate order is now: what you typed → what the module reported last time → the model's
+  `DEFAULT_BAUD` → the remaining vendor rates (highest first) → a global fallback.
 
-Measured effect on this device: the first run still had to find 115200 by scanning (5 candidates,
-worst case ~8 s of timeouts). Subsequent runs go straight to 115200, and the hardware panel
-confirms it came from the module rather than from a table.
+**The first run no longer guesses either.** This one was self-deception: `DEFAULT_BAUD` had been
+declared for a while, but `bauds()` only sorted descending — the constant never entered the
+ordering, so it was dead weight. The justification for pure descending order was "try the fast rate
+first; if it works, the cable and level shifting are fine", which sounds reasonable until you
+consider what you actually know about a brand-new module: **the value printed in the manual's
+examples** (every LG290P example uses 115200). So 921600 went first and a 115200 module burned
+three wrong steps before answering — **6 seconds of timeouts, every time**. The "climbing the
+candidate list" complaint was never fixed; it merely changed direction.
+
+`DEFAULT_BAUD` now goes first (a bet — lose it and the rest of the list still runs, cost zero),
+with the remaining rates still descending:
+
+```
+lg290p  →  115200, 921600, 460800, 230400, 9600
+```
+
+Measured effect on this device: **the first candidate hits, zero timeouts** (previously 3 × 2 s).
+From the second run on, the read-back value also applies, and the hardware panel proves the rate
+came from the module rather than from a table.
 
 ### 8.5 "One-click calibration has no module selection"
 

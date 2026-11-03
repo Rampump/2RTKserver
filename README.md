@@ -21,6 +21,7 @@ radio datalink — any combination, each with its own switch.
 - [What it does](#what-it-does)
 - [Features](#features)
 - [Verified on real hardware](#verified-on-real-hardware)
+- [Test suite](#test-suite)
 - [Release highlights](#release-highlights)
 - [Data flow](#data-flow)
 - [Hardware](#hardware)
@@ -109,6 +110,31 @@ The short version of the 2026-11-03 run:
   only the coordinate form the module happened to output. All fixed in 3.1.1, with contract tests
   that now fail if any registered driver is missing part of the protocol surface.
 
+## Test suite
+
+`tests/test_contract.py` ships with the repository: **241 assertions**, standard library and this
+project's own modules only — nothing to `pip install` beyond what the app already needs. Run it
+on the device or on your laptop:
+
+```bash
+python -m unittest discover -s tests -t . -q     # 241 tests, ~3 s, 1 skipped when not on Linux
+```
+
+These are not "does the function return what it returned yesterday" tests. Each one pins a defect
+that only showed up on hardware, so it cannot come back:
+
+| Assertion | The field failure behind it |
+| --- | --- |
+| Every registered driver exposes the full 19-method protocol surface | one missing method = a 500 on *Read module info* |
+| A base-only module is never offered *CORS measure* | LC29HBS ran a full CORS pass and produced a metre-level "success" |
+| Coordinates round-trip between ECEF and lat/lon within 5 cm | records kept only whichever form the module happened to output |
+| A stored antenna coordinate is reusable by any module | swapping the receiver made the page claim there was no history |
+| The candidate baud list starts with the model's `DEFAULT_BAUD` | pure descending order burned 3 × 2 s timeouts on every fresh module |
+| The candidate panel is attached to `<body>`, `position: fixed` | a native `<datalist>` opened anywhere but under its input |
+
+The upgrade executor runs the same suite before installing anything (`rtkserver/upgrade/runner.py`,
+step 3 of `verify()`): if the new version fails these assertions, the upgrade is refused and the
+running install is left untouched. A release that breaks a contract cannot reach a device.
 
 ## Release highlights
 
@@ -118,6 +144,11 @@ The short version of the 2026-11-03 run:
   configuration (LG290P `PQTMCFGUART,R`, Unicore N4 `CONFIG`) right after identification,
   stores the answer per model in `calibration.db`, and tries that value first next time —
   instead of climbing 115200 → 230400 → 460800 and burning a 2 s timeout on every wrong step.
+  The **first** run no longer guesses either: the model's `DEFAULT_BAUD` now leads the candidate
+  list (`lg290p → 115200, 921600, 460800, 230400, 9600`), so a factory-fresh module answers on
+  the first try. The manual states no factory default at all — it tells you to read the value
+  back — so 115200 here is a bet backed by the manual's examples and the measured device, not a
+  claim about the hardware.
   See [Serial port and baud rate](#serial-port-and-baud-rate).
 - **Candidate lists open under their input.** `Scan serial ports` and `Fetch mount points`
   used to fill a native `<datalist>` whose popup the browser positioned anywhere it liked
@@ -381,15 +412,19 @@ Leaving the baud field **empty** on the calibration page means "figure it out", 
 2. **What this device last read back from the module.** Stored per model in
    `module_profiles.uart_baud`. This is the one that matters: a receiver reports its own UART
    configuration, so the answer comes from the hardware rather than from a table.
-3. **The vendor's documented table**, highest first (LG290P: 921600 / 460800 / 230400 / 115200
-   / 9600).
-4. **A global fallback list**, only when the model is still unknown.
+3. **The model's `DEFAULT_BAUD`** — the value the manual's examples use and the measured device
+   ran at (LG290P: 115200). This is a bet, not a documented factory default: the protocol
+   specification lists the accepted rates but says the default must be read back with `Get`.
+4. **The rest of the vendor's documented table**, highest first (LG290P: 921600 / 460800 /
+   230400 / 9600).
+5. **A global fallback list**, only when the model is still unknown.
 
-Step 2 is why a second run on the same box connects immediately: identification succeeds, the
-driver issues `$PQTMCFGUART,R` (Quectel) or `CONFIG` (Unicore), and the reported value is
-remembered. The hardware panel then shows it as `UART1 115200 8N1` next to the firmware and
-serial number — if that line disagrees with `Port @ baud` in the task header, you are talking
-to a different port than you think.
+Step 3 is what makes the *first* run fast: a factory-fresh module answers on the first attempt
+instead of burning three 2-second timeouts on 921600 / 460800 / 230400. Step 2 then makes every
+later run instant: identification succeeds, the driver issues `$PQTMCFGUART,R` (Quectel) or
+`CONFIG` (Unicore), and the reported value is remembered. The hardware panel shows it as
+`UART1 115200 8N1` next to the firmware and serial number — if that line disagrees with
+`Port @ baud` in the task header, you are talking to a different port than you think.
 
 ```bash
 # what has been remembered so far
@@ -659,6 +694,9 @@ RTCM 1005 校验「写进去的 == 播出去的」。精度如实标注（固定
 
 - **波特率改成"问模块"，不再一档档盲试**：识别成功后立刻回读模块自报的串口参数
   （Quectel `PQTMCFGUART,R`、Unicore `CONFIG`），按型号记进标定库，下次优先用这一档。
+  **首轮也不猜**：该型号的 `DEFAULT_BAUD` 排在候选表第一位（`lg290p → 115200, 921600,
+  460800, 230400, 9600`），出厂全新的模块第一档就通。手册其实没写出厂默认值、只要求用
+  Get 命令回读，所以这个 115200 是"按手册示例和实测押注"，不是对硬件的断言。
 - **候选列表回到输入框下面**：原来的原生 `<datalist>` 弹层会被卡片的 `transform` 动画影响、
   出现在离输入框很远的地方；现在改成挂在 `<body>` 上的自绘面板，坐标现算，扫完/读完全自动展开。
 - **三个出口卡片等高**：上传 / 本地 Caster / 数传的行数本来就不一样（7 / 4 / 6），现在统一高度，
@@ -683,6 +721,27 @@ RTCM 1005 校验「写进去的 == 播出去的」。精度如实标注（固定
   坐标」，而那是半小时前刚在同一根天线上测出来的。相位中心坐标属于天线，不属于测它的模块。
 - **坐标两种形态都落库**：一条记录必定同时有 ECEF 与经纬高，两个方向都能换算（取决于模块
   或人工给的是哪一种）；两者相差超过 5 cm 时以 ECEF 为准重算并告警，因为真正播进 1005 的是 ECEF。
+
+### 测试套件
+
+`tests/test_contract.py` 随仓库分发，**241 条断言**，只依赖标准库和本项目自己的模块，
+不需要额外 `pip install` 任何东西。设备上和电脑上都能直接跑：
+
+```bash
+python -m unittest discover -s tests -t . -q     # 241 项，约 3 秒，非 Linux 跳过 1 项
+```
+
+这些测试不验证"函数今天和昨天返回值一样"，每一条都钉住一个**只在真机上才会出现**的缺陷：
+
+- 每个已注册驱动必须暴露完整的 19 方法协议面 —— 少一个方法就是一次 500（「读取模块信息」）；
+- 单基准站模块不许被允许「只测坐标」—— LC29HBS 曾白跑一整档 CORS 采集，最后吐一个米级"成功"；
+- 坐标必须在 ECEF 与经纬高之间双向换算、误差 5 cm 内 —— 曾经只保留模块碰巧输出的那一种形态；
+- 库里的天线坐标任何模块都能复用 —— 换个接收机后页面曾判定"本机没有历史坐标"；
+- 波特率候选表必须以该型号的 `DEFAULT_BAUD` 打头 —— 纯降序让每块新模块白等 3 次 × 2 秒超时；
+- 候选面板必须挂在 `<body>` 上并 `position: fixed` —— 原生 `<datalist>` 会开到离输入框很远的地方。
+
+升级执行器在安装任何东西之前会跑同一套测试（`rtkserver/upgrade/runner.py`，`verify()` 第 3 步）：
+新版本过不了这些断言就**拒绝升级**、保持当前安装不变。所以一个有契约缺陷的版本到不了设备。
 
 安装、天线相位中心定位方法、故障排除见 [INSTALL.md](INSTALL.md)，本文件上方为英文说明。
 
