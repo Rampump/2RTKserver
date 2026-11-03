@@ -311,8 +311,13 @@ def api_calibration_start():
 
 @login_required
 def api_calibration_abort():
-    """终止。在 SAVE/RESTART 阶段只做标记（方案 §9.2），不会硬中断写 NVM。"""
-    ok, message, payload = calib.abort()
+    """终止。在 SAVE/RESTART 阶段只做标记（方案 §9.2），不会硬中断写 NVM。
+
+    `service.abort()` 的契约是 `(ok, message)` 两元组（另外两处调用点也是这么解包的），
+    这里曾按三元组解包，真机上点「中止」必然 500——取消其实已经生效，但页面
+    只能看到"服务器错误"，用户会以为没停下来而反复点。快照另行取一次即可。
+    """
+    ok, message = calib.abort()
     return jsonify({'ok': bool(ok), 'message': _mask(message),
                     'status': _snapshot_payload()}), (200 if ok else 409)
 
