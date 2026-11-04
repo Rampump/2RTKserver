@@ -45,6 +45,23 @@ RATE_TARGETS = ('GGA', 'RMC', 'GSA', 'GLL',
 MODE_TEXT = {0: 'unknown', 1: 'rover', 2: 'base'}
 
 
+def _role_of(code, text=None):
+    """把"工作模式"归一化成角色：只返回 base / rover / unknown。
+
+    `code` 优先（1=rover、2=base 是 RCVRMODE 协议里的数字，三家驱动一致）；
+    code 缺失或不在表里时才看 `text`。**不接受** 'survey_in'/'fixed' 之类的
+    坐标模式值——那些属于 `get_svin_config()`，不是工作模式。
+    """
+    if code in (1, 2):
+        return MODE_TEXT[code]
+    value = str(text or '').strip().lower()
+    if value in ('base', '基站'):
+        return 'base'
+    if value in ('rover', 'mobile', '流动站', '移动站'):
+        return 'rover'
+    return 'unknown'
+
+
 def path():
     """备份文件路径。跟着 `workspace.STATE_DIR` 走（自测整体改指临时目录）。"""
     return os.path.join(workspace.STATE_DIR, BACKUP_NAME)
@@ -85,7 +102,20 @@ def capture(driver, task_id='', port='', module=None):
         ok, message, data = False, f'{type(e).__name__}: {e}', {}
     if ok:
         code = data.get('mode_code')
-        backup['mode'] = {'code': code, 'text': data.get('mode') or MODE_TEXT.get(code, 'unknown')}
+        # `text` 是**驱动原样回读**的值，不许在这里"修正"：
+        #   LG290P（有 RCVRMODE）→ 角色，base/rover
+        #   LC29H(BS)（无 RCVRMODE）→ get_mode() 也用 SVIN Mode 反推角色 → base/rover
+        #   ZED-F9P → 角色，base/rover
+        # 三家口径其实一致，但**字段名叫 mode 却装的是角色**这件事必须显式标出来，
+        # 否则后来人会把 svin['mode']（坐标模式 fixed/survey_in/disabled）和它混用。
+        # 因此额外存一份 `role`（归一化），`text` 保留原值、可追溯。
+        backup['mode'] = {
+            'code': code,
+            'text': data.get('mode') or MODE_TEXT.get(code, 'unknown'),
+            # 角色归一化：只认 base/rover，其余一律 unknown。
+            # 判断走 code 优先（0/1/2 是协议里的数字），code 缺失才退回 text。
+            'role': _role_of(code, data.get('mode')),
+        }
     else:
         backup['ok'] = False
         warn(f'读取工作模式失败，无法还原模式：{message}')
@@ -145,10 +175,11 @@ def capture(driver, task_id='', port='', module=None):
             warn(f'报文 {name} 的速率没读到（还原时该条保持模块当前值）')
 
     # ---- 天线信息（1033）----
-    reader = getattr(driver, 'read_antenna_info', None)
-    if reader is not None and driver.caps('ant_info'):
+    # read_antenna_info 在基类有默认实现（回 unsupported），由 ant_info 能力位
+    # 决定要不要读 —— 不再探测方法是否存在。
+    if driver.caps('ant_info'):
         try:
-            ok, message, data = reader()
+            ok, message, data = driver.read_antenna_info()
             if ok:
                 backup['antenna'] = {'desc': data.get('desc', ''),
                                      'setup_id': data.get('setup_id'),
@@ -213,9 +244,13 @@ def usable(backup):
     """这份备份能不能拿来还原：至少要有一个明确的工作模式。"""
     if not backup:
         return False, '没有可用的备份（还没标定过，或备份文件已损坏）'
-    code = (backup.get('mode') or {}).get('code')
-    if code not in (1, 2):
-        return False, f'备份里的工作模式不可识别（{code}），无法还原'
+    mode = backup.get('mode') or {}
+    # 老备份（BACKUP_VERSION 1 且没写 role）没有 role 字段，按 code 现算一次，
+    # 不能因为"老文件缺字段"就把可还原的备份判成不可用。
+    role = mode.get('role') or _role_of(mode.get('code'), mode.get('text'))
+    if role not in ('base', 'rover'):
+        return False, (f'备份里的工作模式不可识别'
+                       f'（code={mode.get("code")}, text={mode.get("text")}），无法还原')
     return True, '备份可用'
 
 
@@ -224,8 +259,11 @@ def describe(backup):
     """一句话摘要，给 CLI / 页面确认框用。"""
     if not backup:
         return '无备份'
-    mode = (backup.get('mode') or {}).get('text') or '?'
+    mode_raw = backup.get('mode') or {}
+    mode = mode_raw.get('role') or _role_of(mode_raw.get('code'), mode_raw.get('text')) or '?'
     svin = backup.get('svin') or {}
+    # 这里是**坐标模式**（fixed/survey_in/disabled），与上面的工作模式角色是两回事，
+    # 分开取值、分开命名，避免又一次混用。
     svin_mode = svin.get('mode') or '?'
     if svin_mode == 'fixed':
         coord = (f'ECEF {svin.get("ecef_x")}, {svin.get("ecef_y")}, {svin.get("ecef_z")}')

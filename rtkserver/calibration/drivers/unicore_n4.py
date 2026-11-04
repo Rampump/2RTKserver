@@ -164,11 +164,27 @@ UM980_ONLY_CMD = {
 CAPS = {
     'dual_mode': True,        # 可切移动站/基站（§3）
     'set_mode': True,
-    # §3.3 的 `MODE BASE TIME` 是"自主优化 60 秒取均值"，语义上确实等于 Survey-in，
-    # 但**没有** PQTM 那套"最少定位次数 / 3D 精度门限 / 收敛状态语句"。
-    # 标成 True 会让流程层去等一个永远不来的 SVINSTATUS，然后超时失败，
-    # 所以这里保持 False，由 writer 走"自主优化基站"分支而不是"Survey-in"分支。
-    'svin': False,
+    # §3.3 的 `MODE BASE TIME <秒>` 是"自主优化基站"：按时间取均值，
+    # 语义上**就是** Survey-in —— 只差两样东西，都不影响把它当 Survey-in 用：
+    #   ① 没有"最少定位次数 / 3D 精度门限"参数（`count` 在这里当**秒数**用，
+    #      Quectel 的 60 次 @1Hz 恰好也是 60 秒，数值口径是通的）；
+    #   ② 没有 `$PQTMSVINSTATUS` 那样的进度语句（`enable_survey_status()` 明说做不到）。
+    #
+    # 早先这里是 False，理由是"流程层会去等一个永远不来的 SVINSTATUS"。
+    # 那个担心是对的，但**解决方式错了**：流程层 `writer._step_svin_wait()` 用的是
+    # 通用 poll 循环，遇到 `survey_status()` 返回 `error='no_status'` 只会继续等，
+    # 真正该做的是给它一条"按时间等 + 从 GGA/RTCM 取坐标"的专用分支 ——
+    # 那是流程层的事，不该靠"把能力位写成 False 让整条路被 API 闸门拒掉"来回避。
+    # 后者造成的实际后果是：UM960/UM980/UM982 的「自收敛」按钮被 `_reject_without_caps`
+    # 直接拒绝，功能彻底不可用，而驱动的 `config_survey_in`/`survey_status` 却都实现了。
+    #
+    # 现在 `writer._step_svin_wait()` 里按 `_caps('svin_has_status')` 分流：
+    # 有状态语句（Quectel/F9P）走原逻辑，没有（N4）走"等够时长 + 等坐标稳定"。
+    'svin': True,
+    # 该型号有没有"收敛进度语句"。True = 有 `$PQTMSVINSTATUS` 类输出，
+    # 流程层可以按 `Valid==2 && Obs>=CfgDur` 判收敛；
+    # False = 只能按时间 + 坐标稳定性间接判断（N4 属于这档）。
+    'svin_has_status': False,
     'fixed': True,            # 精确坐标（§3.2）
     'ant_info': True,         # CONFIG BASEANTENNAMODEL（§4.26，影响 1005/1006/1007/1033）
     # 天线高（§4.22 ANTENNADELTAHEN，影响 RTCM1006）。四型号都有这条命令，
@@ -265,6 +281,10 @@ class UnicoreN4Base(BaseDriver):
     DOC_TITLE = 'Unicore Reference Commands Manual For N4 High Precision Products V2_CH_R1.1'
 
     MATCH_PREFIX = ''          # 见文件头"一件事刻意没做"
+    # 默认按双模：N4 主力型号（UM960 / UM980 / UM982）都有 `MODE ROVER` 与
+    # `MODE BASE`。**唯一的例外是 UM960L**，它没有流动站命令，所以在自己的
+    # 子类里把 ROLE 改回 'single' —— 覆盖只能发生在子类，不能在这里写死。
+    ROLE = 'dual'
     DUAL_MODE = True
     CAPS = CAPS
     CMD = CMD
@@ -813,9 +833,20 @@ class UnicoreN4Base(BaseDriver):
             if mode == 'base' else 'disabled'
 
         result = {
-            'mode': mode,                 # 'base' / 'rover' / 'heading2' / 'unknown'
-            'variant': variant,           # 'default' / 'time' / 'fixed' / '' 
-            'mode_norm': norm,            # 归一化后的三态，给流程层用
+            # ⚠ `mode` 必须与 Quectel 驱动**同口径**：'disabled' / 'survey_in' / 'fixed'。
+            #
+            # 早先这里填的是 N4 原生口径（'base' / 'rover' / 'heading2'），
+            # 归一化值另放 `mode_norm`。结果是流程层 `writer._svin_config_verified()`
+            # 只认 `readback.get('mode') == 'survey_in'`，而 N4 回的是 'base'
+            # → 每次 Survey-in 配置回读都判"回读模式不是 survey_in"，
+            # 重发一轮仍不符就整单失败。UM960/UM980/UM982 的「自收敛」因此
+            # 一直跑不起来（不是驱动没实现，是键名对不上）。
+            #
+            # 现在 `mode` 直接给三态，`mode_norm` 保留同一个值只为兼容旧调用方。
+            'mode': norm,                 # 'disabled' / 'survey_in' / 'fixed'
+            'variant': variant,           # 'default' / 'time' / 'fixed' / ''
+            'mode_norm': norm,            # 兼容字段，与 mode 同值
+            'mode_raw': mode,             # N4 原生口径：'base' / 'rover' / 'heading2'
             'raw_mode': raw_mode,
             'count': None,                # N4 没有"最少定位次数"，只有秒
             'acc_limit': None,            # N4 没有 3D 精度门限
@@ -1600,8 +1631,20 @@ class UnicoreUM960LDriver(UnicoreN4Base):
     DISPLAY_NAME = 'Unicore UM960L'
     PRODUCT_MODEL = 'UM960L'
     DOC_TITLE = 'Unicore N4 手册 § UM960L'
+    # **单模**：手册 §3.6 的 `MODE ROVER` 适用产品里没有 UM960L，
+    # 它只有 `MODE BASE`。既然是纯基准站，就只支持「自收敛」和「写入已知坐标」——
+    # 列表页不能给它显示"CORS 一键固定"，那条路第一步就要切流动站，必失败。
+    # 这是本文件里唯一一个 ROLE 与基类不同的子类。
+    ROLE = 'single'
+    # `DUAL_MODE` / `CAPS['dual_mode']` 必须跟着 ROLE 一起改。这两个是历史布尔字段，
+    # 但**不是摆设**：`service.start_cors(measure_only=...)` 与
+    # `writer._step_cors_rover_setup` / `_step_ensure_base_for_write` 都直接读它们，
+    # 不从 ROLE 折算。只改 ROLE 不改这两处，UM960L 就会出现
+    # "methods_of 说只能 survey_in+manual，但 caps.dual_mode 仍是 True"的自相矛盾 ——
+    # 「只测坐标」会被放行，然后在切流动站时撞 `MODE ROVER` 不存在。
+    DUAL_MODE = False
     CMD = dict(CMD)              # 无流动站、无 Heading2
-    CAPS = dict(CAPS)
+    CAPS = {**CAPS, 'dual_mode': False}
 
 
 @register

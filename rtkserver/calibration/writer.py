@@ -79,6 +79,12 @@ SVIN_POLL_INTERVAL = 0.5
 SVIN_RESUME_WAIT = 6.0
 # 连续多少次"读到状态但 Valid 一直是 1"才警告"可能已卡住"（不做硬终止，交给超时兜底）
 SVIN_STALL_WARN_AT = 20
+# 未显式给 `svin_timeout` 时，按"档位次数 × 这个系数"推一个兜底上限（秒/次）。
+# `$PQTMSVINSTATUS` 是 1 Hz 输出，500 次名义 500 秒；×3 留给收星差的现场。
+SVIN_TIMEOUT_PER_OBS = 3.0
+# 兜底下限（秒）。高精度档 3600 次 × 3 = 3 小时，但任何档位至少给 10 分钟，
+# 免得"档位配错成 60 次"时 3 分钟就判失败、把一个正常的收敛掐掉。
+SVIN_DEFAULT_TIMEOUT_MIN = 600.0
 # 精度等级标注：Survey-in 是**亚米级**，与 CORS 的厘米级必须区分开（方案 §0.5.8 / §0.5.9）
 ACCURACY_GRADE_SUB_METER = 'sub_meter'
 ACCURACY_GRADE_CENTIMETER = 'centimeter'
@@ -192,6 +198,11 @@ CONVERGE_SIGMA = 0.02
 # 浮动解的"收敛"含义是「σ 稳定下来不再漂」，取 15 cm——与它的真实噪声量级匹配。
 CONVERGE_SIGMA_FLOAT = 0.15
 CONVERGE_HOLD_SECONDS = 60.0
+# 没有收敛进度语句的型号（Unicore N4 `MODE BASE TIME`）判"均值已定"的门槛：
+# 相邻两次 GGA 换算出的 ECEF 三轴差都小于这个值，并持续 CONVERGE_HOLD_SECONDS。
+# 取 5 cm —— 自主优化是**亚米级**，5 cm 的帧间抖动已经明显小于它的精度量级；
+# 卡得太死（如 1 cm）会被正常的单点解噪声拖住，永远等不到"稳定"。
+SURVEY_TIME_DRIFT_TOL = 0.05
 # 3σ 野值剔除（§7.3）：滑动窗口 N=30，σ 下限钳到 5 mm。
 OUTLIER_WINDOW = 30
 OUTLIER_SIGMA_FLOOR = 0.005
@@ -621,11 +632,37 @@ def _check_on_slow(value):
 
 
 def _check_ecef(values):
+    """把「三个数」收成 `(x, y, z)` 元组，并做地球范围校验。
+
+    入参形态有两种，**都必须认**：
+
+    - 序列 `[x, y, z]` / `(x, y, z)` —— 前端 `calibration.js` 手输 ECEF 时发的
+      就是数组，这是主通路；
+    - 字典 `{'x': .., 'y': .., 'z': ..}` —— 页面「复用历史坐标」的 `arp`、
+      以及 API 调用方从 `detect` 读到的 `svin.ecef_x/y/z` 现拼的，都是这个形态。
+
+    以前这里只按下标取，真机实测 `POST /api/calibration/start` 传字典时直接
+    `KeyError: 0` → Flask 500（HTML 错误页），前端只能看到"服务器错误"，
+    完全不知道是坐标格式不对。现在的契约是：**任何非法输入一律 `ValueError`**，
+    由 service 转成可读的 400，绝不把 500 漏给调用方。
+    """
+    if isinstance(values, dict):
+        try:
+            values = (values['x'], values['y'], values['z'])
+        except KeyError:
+            raise ValueError(f'ECEF 字典必须含 x / y / z 三个键，收到 {values!r}')
     try:
         x, y, z = (float(values[0]), float(values[1]), float(values[2]))
-    except (TypeError, ValueError, IndexError):
+    except (TypeError, ValueError, IndexError, KeyError):
         raise ValueError(f'ECEF 必须是三个数字，收到 {values!r}')
     for axis, value in zip('xyz', (x, y, z)):
+        # `float('nan')` / `float('inf')` 能过 float()，但**所有比较都返回 False** ——
+        # nan 会从下面两个范围判断里同时溜过去，最后被当成合法坐标 `MODE BASE nan nan nan`
+        # 发下去，模块要么拒收要么写进一个垃圾值，而 1005 回读校验时"写入值"本身就是 nan，
+        # 比对永远不通过、报的却是"播发坐标与写入不符"。必须先挡这个。
+        if not math.isfinite(value):
+            raise ValueError(f'ECEF 的 {axis} = {value!r} 不是有限数'
+                             f'（NaN / Inf 不能作为坐标）')
         if not (-7.0e6 <= value <= 7.0e6):
             raise ValueError(f'ECEF 的 {axis} = {value} 超出地球范围，'
                              f'疑似把经纬度当 ECEF 传进来了')
@@ -653,12 +690,19 @@ class CoordinateWriter:
     def __init__(self, driver, channel=None, on_stage=None, checkpoint=None,
                  on_record=None, rtcm_timeout=DEFAULT_RTCM_TIMEOUT,
                  rtcm_samples=DEFAULT_RTCM_SAMPLES, task_id='', svin_timeout=None,
-                 fix_wait_timeout=None):
+                 fix_wait_timeout=None, on_beat=None):
         self.driver = driver
         self.channel = channel if channel is not None else getattr(driver, 'channel', None)
         self._on_stage = on_stage or (lambda *a, **k: None)
         self._checkpoint = checkpoint or (lambda: None)
         self._on_record = on_record
+        # 心跳回调（service 传 `lease.beat`）。`on_stage` **只在阶段名变化时**才喂
+        # 心跳（`_set_stage` 的实现），而单个阶段内部完全可能卡超过看门狗的 30 秒 ——
+        # 真机实测：F9P 的 MSG_SETUP 里 `config_rtcm()` 一次 VALSET 等 ACK 等到超时，
+        # 35 秒没有一次阶段变化，看门狗直接把租约收了，
+        # 而写入坐标和切基站其实早就成功了、只差配报文这一步。
+        # 所以凡是"一次驱动调用可能长时间阻塞"的地方，都要显式 `_beat()` 一次。
+        self._on_beat = on_beat or (lambda: None)
         self.rtcm_timeout = float(rtcm_timeout)
         self.rtcm_samples = max(1, int(rtcm_samples))
         self.task_id = str(task_id or '')
@@ -704,6 +748,13 @@ class CoordinateWriter:
         }
 
         try:
+            # 开工先确认"该出的数据出得来"。
+            # 真机踩过：模块被之前的调试配成只剩 RTCM 输出（NAV/NMEA 全关），
+            # 流程于是卡在等 GGA，几十秒后才由 `_nudge_gga_output()` 补一条，
+            # 而且只补 GGA —— NAV-PVT/NAV-SAT 照样关着，前端看到"模块没反应"。
+            # 放在所有分支之前，因为 4 种方式都要读模块自己的输出。
+            self._step_prepare_outputs(plan)
+
             # Survey-in 自收敛（方案 P3）：先切基站模式（$PQTMSVINSTATUS 只在基站模式
             # 输出），再配收敛参数 + 等收敛，最后把收敛均值写成固定坐标；后续校验链路
             # （配报文→保存→重启→校验→落库）完全复用。
@@ -756,10 +807,25 @@ class CoordinateWriter:
                 self.result['readonly'] = True
                 return self.result
             else:
+                # 「只写已知坐标」（方案 P2）与「复用历史坐标」共用这条路。
+                # 按硬件角色分两种做法（用户规范里的第三种方式）：
+                #   双模模块 → 先检测当前模式；不是基准站就先切基准站并保存重启，
+                #              再写坐标。原因：双模模块可能停在流动站（上一次做
+                #              CORS 测量后没切回来），此时写进去的固定坐标不会被
+                #              当成基准站坐标使用，1005 里播的还是模块自己解的位置。
+                #   单模模块 → 默认就是基准站，**不检测也不切**，直接写。
+                #              它连模式命令都没有（set_mode 是空操作），多发一条
+                #              只会换来一个 ERROR 应答和一次无谓的等待。
+                # 未知流动站模块在 API 层就被挡住了（methods_of 里没有 manual），
+                # 这里不必再判一次。
+                self._step_ensure_base_for_write(plan)
                 if plan.svin_mode == 'fixed':
                     self._step_write_coord(plan)
                 else:
                     self._step_config_svin(plan)
+                # 上面已经切到基准站时，这一步是幂等的空跑（驱动会带
+                # already_base_side 或回读确认已是 base）；保留它是因为
+                # 单模模块走的是这里 —— 它需要这条路径把 mode_ack 记成 not_needed。
                 self._step_switch_mode(plan)
             self._step_setup_messages(plan)
             self._step_save(plan)
@@ -1014,26 +1080,25 @@ class CoordinateWriter:
         if not ok or (cfg or {}).get('mode') != 'survey_in':
             return False
 
-        # 状态输出可能在模块重启后关掉了，读之前先确认打开
-        enabler = getattr(self.driver, 'enable_survey_status', None)
-        if enabler is not None:
-            try:
-                enabler(True, 1)
-            except Exception as e:                # noqa: BLE001
-                logging.debug(f'打开 SVINSTATUS 输出失败（继续等）：{e}')
+        # 状态输出可能在模块重启后关掉了，读之前先确认打开。
+        # 基类默认回 unsupported（本型号没有进度语句），忽略即可 —— 下面读不到
+        # 状态自然走"按时间等"的降级路径。
+        try:
+            self.driver.enable_survey_status(True, 1)
+        except Exception as e:                # noqa: BLE001
+            logging.debug(f'打开 SVINSTATUS 输出失败（继续等）：{e}')
 
         status = None
         deadline = time.time() + SVIN_RESUME_WAIT
-        reader = getattr(self.driver, 'survey_status', None)
         while time.time() < deadline:
             self._checkpoint()
             self._drain_svin(0.0)
-            if reader is not None:
-                ok2, _m2, data = reader()
-                if ok2 and data:
-                    status = data
-                    if data.get('state') == 2:
-                        break
+            # 基类默认回 unsupported；拿不到状态就自然走下面的"返回 False 重收敛"
+            ok2, _m2, data = self.driver.survey_status()
+            if ok2 and data:
+                status = data
+                if data.get('state') == 2:
+                    break
             time.sleep(SVIN_POLL_INTERVAL)
         if not status or status.get('state') != 2:
             return False
@@ -1087,8 +1152,7 @@ class CoordinateWriter:
         # `$PQTMSVINSTATUS` 只在基站模式输出（真机实测 rover 下开状态输出直接 ERROR,1）。
         # 所以在配 survey-in 之前，先重启一次让基站模式真正起来。
         # 声明了"不需要重启"的型号（无重启命令、配置即时生效）跳过这一步。
-        if plan.mode_ack in ('ack', 'deferred') and getattr(self.driver,
-                                                            'RESTART_REQUIRED', True):
+        if plan.mode_ack in ('ack', 'deferred') and self.driver.RESTART_REQUIRED:
             self._stage('SVIN_CFG', '重启让基站模式生效（SVINSTATUS 只在基站模式输出）')
             ok, message, data = self.driver.reboot()
             if not ok:
@@ -1108,19 +1172,44 @@ class CoordinateWriter:
 
         # 打开 PQTMSVINSTATUS 1 Hz（收敛状态就靠它喂）。失败是致命的：没有状态输出，
         # SVIN_WAIT 无从判断收敛，只能干等超时。
-        enabler = getattr(self.driver, 'enable_survey_status', None)
-        if enabler is not None:
-            ok, message, data = enabler(True, 1)
-            if not ok:
+        #
+        # 只在型号**声称有进度语句**时才当致命错误：`svin_has_status=False`
+        # 的型号（Unicore N4 全系）本来就没有这条语句，走的是"按 BASE TIME
+        # 时间到了就结束"的另一条路，不该因为"开不了进度输出"直接中止。
+        ok, message, data = self.driver.enable_survey_status(True, 1)
+        if not ok:
+            if self._caps('svin_has_status', True):
                 raise WriteFailed('SVIN_CFG',
                                   f'打开收敛状态输出失败：{message}。'
                                   f'没有状态输出就无法判断收敛，已中止', data)
+            logging.info('本型号无收敛进度语句（%s），按时间等待收敛：%s', message, message)
         self._record_step('SVIN_CFG', True,
                           f'Survey-in 已配置（{count} 次 / {acc:.1f} m），状态输出已打开',
                           readback)
 
     # ---------- 步骤 0b：等收敛（方案 P3 第 2 步，唯一的长时间步骤） ----------
     def _step_svin_wait(self, plan):
+        """等自收敛结束，拿到固件算出的坐标。
+
+        **两条路，按驱动能力位 `svin_has_status` 分流**：
+
+        - `True`（Quectel LG290P / LC29H(BS)、u-blox ZED-F9P）：
+          轮询 `$PQTMSVINSTATUS` 一类进度语句，`Valid==2 && Obs>=CfgDur` 判收敛。
+        - `False`（Unicore N4 全系）：手册里根本没有进度语句，
+          `MODE BASE TIME <秒>` 到了时间会自己结束并转固定解。
+          所以按"**等够时长 + 坐标不再变化**"间接判定，坐标从 GGA 取。
+
+        分流放在这里而不是靠"把 CAPS['svin'] 写成 False"来回避 ——
+        后者会让 API 闸门把整条路拒掉（`_reject_without_caps(module, 'svin')`），
+        功能彻底不可用。而"没有状态语句"只是**判定手段**的差异，
+        不是"不支持自收敛"。
+        """
+        if not self._caps('svin_has_status', True):
+            return self._step_svin_wait_by_time(plan)
+        return self._step_svin_wait_by_status(plan)
+
+    # ---------- 步骤 0b-1：有进度语句的型号（Quectel / u-blox） ----------
+    def _step_svin_wait_by_status(self, plan):
         """轮询 `$PQTMSVINSTATUS` 直到收敛、用户终止、或超时。
 
         判据（§5.2 / P3）：`<Valid> == 2`（已收敛）且 `<Obs> >= <CfgDur>`。
@@ -1134,7 +1223,7 @@ class CoordinateWriter:
         count = (plan.survey_in or {}).get('count') or 0
         self._stage('SVIN_WAIT', f'等待模块自收敛（目标 {count} 次，可随时手动终止）')
 
-        stats = self.driver.survey_status if hasattr(self.driver, 'survey_status') else None
+        stats = self.driver.survey_status
         started = time.time()
         last_obs = 0
         stall_ticks = 0
@@ -1190,9 +1279,16 @@ class CoordinateWriter:
                     if rate > 1e-6:
                         remaining = f'，预计还需 {(count - obs) / rate / 60:.0f} 分钟'
                 pct = int(100 * (progress if progress is not None else 0))
+                # 精度文案：没定位时 F9P 的 meanAcc 是溢出垃圾值（真机见过
+                # 94868.3264 m = 0xE8D4A510×0.1mm），照原样打印会被现场
+                # 误读成"信号极差"。按 cap 加一句解释，不隐藏数值、不改判定。
+                acc_txt = f'{mean_acc} m' if mean_acc is not None else '?'
+                if (mean_acc is not None and obs == 0
+                        and self._caps('svin_acc_meaningless_when_no_fix')):
+                    acc_txt += '（未定位时该值无效，模块还没在解算）'
                 self._stage('SVIN_WAIT',
                             f'收敛中：{obs}/{count} 次（{pct}%）'
-                            f'，当前 3D 精度 {mean_acc if mean_acc is not None else "?"} m'
+                            f'，当前 3D 精度 {acc_txt}'
                             f'{remaining}')
                 if stall_ticks >= SVIN_STALL_WARN_AT:
                     self._warn('观测数已多轮未增长，天线可能被遮挡或收星条件差，仍在等待')
@@ -1205,10 +1301,25 @@ class CoordinateWriter:
                             f'等待状态输出…（已 {time.time() - started:.0f} 秒）')
 
             # 超时兜底：不能让一个信号差的模块把串口占住 60 分钟以上。
-            if self.svin_timeout and (time.time() - started) >= self.svin_timeout:
+            #
+            # `svin_timeout` 为空时**必须**按档位推一个默认上限，不能无限等。
+            # 真机实测：模块没接天线时 `$PQTMSVINSTATUS` 照样 1 Hz 往外吐，
+            # 但 `Obs` 恒为 0（`0/600`）、`Valid` 恒为 1 —— 状态语句有、收敛信号没有。
+            # 而这条路早先只在 `self.svin_timeout` 非空时才判超时，于是任务
+            # **永远不结束**：串口被占用到进程重启为止，页面上看是"一直在收敛"，
+            # 现场看是"点了没反应还敢去拔线"。另一条 `_step_svin_wait_by_time`
+            # 一直有 `max(seconds * 1.5, seconds + 120)` 兜底，两条路此前不对称。
+            #
+            # 上限怎么取：`Obs` 按 1 Hz 增长（SVINSTATUS 的输出节拍），
+            # 所以 `count` 次的名义耗时就是 `count` 秒；再留 3 倍余量给
+            # "收星差、进度慢但确实在前进"的现场（fast 600 次 → 30 分钟）。
+            # 用户显式给了 `svin_timeout` 就仍以用户的为准。
+            limit = self.svin_timeout or max(SVIN_DEFAULT_TIMEOUT_MIN,
+                                             count * SVIN_TIMEOUT_PER_OBS)
+            if (time.time() - started) >= limit:
                 raise WriteFailed(
                     'SVIN_WAIT',
-                    f'Survey-in 在 {self.svin_timeout:.0f} 秒内未收敛'
+                    f'Survey-in 在 {limit:.0f} 秒内未收敛'
                     f'（已 {last_obs}/{count} 次）。信号条件可能不满足精度门限，'
                     f'可提高档位精度门限、更换开阔场地或改用历史坐标', {'obs': last_obs})
 
@@ -1260,6 +1371,165 @@ class CoordinateWriter:
                           f'3D 精度 {last.get("mean_acc")} m',
                           self.result['survey'])
 
+    # ---------- 步骤 0b-2：没有进度语句的型号（Unicore N4） ----------
+    def _step_svin_wait_by_time(self, plan):
+        """没有收敛进度语句时的自收敛等待（Unicore N4 `MODE BASE TIME <秒>`）。
+
+        **和上面那条路的本质区别**：这条路没有任何"已收敛"的信号可读，所以只能：
+
+        1. **等够时长** —— `MODE BASE TIME n` 里的 n 就是总时长，模块到点自己
+           结束取均值并转成固定解。
+        2. **看坐标稳不稳** —— 从 GGA 读经纬高转 ECEF，跟 `CONVERGE_HOLD_SECONDS`
+           窗口前的值比；三轴差 < `SURVEY_TIME_DRIFT_TOL` 就认为均值已定。
+        3. **确认模式已转出 time** —— 模块从 `MODE BASE TIME` 转到普通固定坐标基站，
+           说明它自己的取均值过程结束了。这是**唯一**来自固件的确定性证据。
+
+        时长到了但坐标还在飘（例如卫星数不够、多路径严重）→ 不硬判成功，
+        延到 `svin_timeout` 再失败。宁可在现场多等 30 秒，
+        也不要把一个正在漂的坐标钉进基准站 —— 那会让下游所有终端一起错。
+
+        精度等级同样固定标 sub_meter。
+        """
+        self._checkpoint()
+        seconds = int((plan.survey_in or {}).get('count') or 0)
+        self._stage('SVIN_WAIT',
+                    f'等待模块自主优化收敛（{seconds} 秒，本型号无进度语句，'
+                    f'按时长与坐标稳定性判定，可随时手动终止）')
+
+        started = time.time()
+        last_pos = None          # 上一次有效 ECEF
+        stable_since = None      # 从什么时候开始"看起来稳定"
+        last_drift = None
+        terminated = False
+        samples = 0
+
+        while True:
+            try:
+                self._checkpoint()
+            except Exception as e:        # noqa: BLE001
+                if getattr(e, 'evicted', False):
+                    raise
+                terminated = True
+                break
+
+            # 必须持续消费串口：GGA 是这条路唯一的位置来源，
+            # 不读串口 `channel.cache['gga']` 永远是空的。
+            self._drain_svin(SVIN_POLL_INTERVAL)
+            self._assert_link_alive('SVIN_WAIT')
+
+            elapsed = time.time() - started
+            ecef = self._gga_ecef()
+            if ecef is not None:
+                samples += 1
+                if last_pos is not None:
+                    last_drift = max(abs(ecef[i] - last_pos[i]) for i in range(3))
+                    if last_drift <= SURVEY_TIME_DRIFT_TOL:
+                        if stable_since is None:
+                            stable_since = elapsed
+                    else:
+                        stable_since = None
+                last_pos = ecef
+
+            pct = min(100, int(100 * elapsed / seconds)) if seconds else 0
+            drift_txt = (f'{last_drift * 100:.0f} cm' if last_drift is not None else '?')
+            self._stage('SVIN_WAIT',
+                        f'自主优化中：{elapsed:.0f}/{seconds} 秒（{pct}%），'
+                        f'坐标帧间变化 {drift_txt}，已采样 {samples} 次')
+
+            done_time = elapsed >= seconds
+            done_stable = (stable_since is not None
+                           and elapsed - stable_since >= CONVERGE_HOLD_SECONDS)
+
+            if done_time and done_stable:
+                break
+
+            # 超时兜底：只有用户显式给了 svin_timeout 才用。
+            # 没给的话按"标称时长 + 一半"自然兜底，避免信号差时无限占串口。
+            deadline = self.svin_timeout if self.svin_timeout else max(seconds * 1.5, seconds + 120)
+            if elapsed >= deadline:
+                if last_pos is None:
+                    raise WriteFailed(
+                        'SVIN_WAIT',
+                        f'自主优化已跑 {elapsed:.0f} 秒仍未拿到任何有效定位。'
+                        f'天线可能被遮挡或未收星 —— 自收敛必须有稳定的定位输入，'
+                        f'请检查天线位置后重试，或改用「写入已知坐标」', {'samples': 0})
+                raise WriteFailed(
+                    'SVIN_WAIT',
+                    f'自主优化跑满 {elapsed:.0f} 秒，坐标仍未稳定'
+                    f'（最近帧间变化 {drift_txt}）。'
+                    f'收星条件可能不满足精度要求：请更换开阔场地、'
+                    f'延长收敛时长或提高档位后重试', {'drift': last_drift, 'samples': samples})
+
+        # ---- 取出坐标 ----
+        if last_pos is None:
+            raise WriteFailed('SVIN_WAIT',
+                              '没有拿到任何有效定位（GGA 里没有可信的经纬高），无法写入',
+                              {'samples': 0})
+
+        x, y, z = (float(v) for v in last_pos)
+        try:
+            apc = _check_ecef((x, y, z))
+        except ValueError as e:
+            raise WriteFailed('SVIN_WAIT', f'模块给出的坐标不合法：{e}',
+                              {'mean': [x, y, z]})
+
+        # 与上面那条路保持同一套语义：这里读到的是**固件算出来的均值**，
+        # 我们只负责把它转成固定坐标配置写回，不参与任何解算。
+        plan.apc = apc
+        plan.arp = apc
+        plan.svin_mode = 'fixed'
+        plan.conversion = {
+            'apc': dict(zip(('x', 'y', 'z'), apc)),
+            'arp': dict(zip(('x', 'y', 'z'), apc)),
+            'formula': '自主优化（MODE BASE TIME）后模块播发的位置即写入值（解算全部由模块固件完成）',
+            'solved_by': 'firmware',
+        }
+
+        elapsed_total = time.time() - started
+        self.result['survey'] = {
+            'terminated': terminated,
+            'obs': samples,
+            'count': seconds,
+            'count_unit': 'seconds',
+            'mean_acc': None,                  # N4 不给精度值，如实留空
+            'mean': {'x': round(x, 4), 'y': round(y, 4), 'z': round(z, 4)},
+            'elapsed_seconds': round(elapsed_total, 1),
+            'accuracy_grade': ACCURACY_GRADE_SUB_METER,
+            'has_status_statement': False,
+        }
+        note = '已手动终止，采用当前坐标' if terminated else '已收敛'
+        self._record_step(
+            'SVIN_WAIT', True,
+            f'{note}：自主优化 {elapsed_total:.0f}/{seconds} 秒，'
+            f'坐标稳定 {CONVERGE_HOLD_SECONDS:.0f} 秒以上'
+            f'（本型号无进度语句，按时间与稳定性判定）',
+            self.result['survey'])
+
+    def _gga_ecef(self):
+        """从最新 GGA 取 ECEF；没有可信定位返回 None。
+
+        只认 **单点及以上**（quality >= 1）：quality=0 是"未定位"，
+        经纬度字段可能是空或是上一次的残留，拿来当收敛结果会写进一个错坐标。
+        """
+        channel = self.channel
+        if channel is None:
+            return None
+        gga = (channel.cache or {}).get('gga') or {}
+        quality = gga.get('quality')
+        try:
+            quality = int(quality)
+        except (TypeError, ValueError):
+            return None
+        if quality < 1:
+            return None
+        lat, lon, height = gga.get('lat'), gga.get('lon'), gga.get('height')
+        if lat is None or lon is None or height is None:
+            return None
+        try:
+            return geodetic_to_ecef(float(lat), float(lon), float(height))
+        except (TypeError, ValueError):
+            return None
+
     # ==================== CORS 差分标定采集链路（方案 P1 / §6 / §7） ====================
     # 顺序：ROVER_SETUP → NMEA_SETUP → GGA_WAIT → CORS_CONNECT → FIX_WAIT
     #       → COLLECT → CORS_CLOSE，得到 ECEF 后走统一写链路（写坐标→切基站→…）。
@@ -1296,13 +1566,11 @@ class CoordinateWriter:
         if not mode:
             return
         self._mem_restore_mode = None
-        switcher = getattr(self.driver, 'set_mode_memory_only', None)
-        if switcher is None:
-            self._warn(f'模块内存模式仍是流动站（原为 {mode}），该驱动不支持内存切换，'
-                       f'请手动切回（NVM 未受影响，断电重启即恢复）')
-            return
+        # 基类给了默认实现（回 unsupported），直接调用即可 ——
+        # 不再探测"驱动有没有这个方法"：探测不到就静默 return，
+        # 会把"这型号不支持内存切换"变成一次无声的成功。
         try:
-            ok, message, _data = switcher(mode)
+            ok, message, _data = self.driver.set_mode_memory_only(mode)
         except Exception as e:                   # noqa: BLE001
             ok, message = False, str(e)
         if ok:
@@ -1433,7 +1701,7 @@ class CoordinateWriter:
         # 不放行到"切模式失败"那一步，是因为那时的报错是模块回 ERROR,3，
         # 用户看到的是"命令不支持"，而真正的原因是"你选错了标定方式"。
         # 让错误在一开始就指向正确的操作，比让它晚三十秒指向硬件更有用。
-        if (not readonly and not getattr(self.driver, 'PASSIVE', False)
+        if (not readonly and not self.driver.PASSIVE
                 and self._caps('set_mode') and not self._caps('dual_mode')):
             raise WriteFailed(
                 'ROVER_SETUP',
@@ -1448,7 +1716,7 @@ class CoordinateWriter:
                 # 但只要它吐的是**基准站 RTCM 流**而不是定位流，这条路就走不通 ——
                 # 基准站不输出 GGA，没有 GGA 就没有 VRS，采集会一直空转到超时。
                 # 这种情况必须当场拒绝，不能让用户白等十分钟才看到"拿不到固定解"。
-                if getattr(self.driver, 'PASSIVE', False) and self._looks_like_base_stream():
+                if self.driver.PASSIVE and self._looks_like_base_stream():
                     raise WriteFailed(
                         'ROVER_SETUP',
                         '这块模块没有命令集，当前输出的是基准站 RTCM 数据流（没有定位/GGA），'
@@ -1479,16 +1747,9 @@ class CoordinateWriter:
             # 即使直接拔电，模块重启后也会从 NVM 读到原来的基准站配置。
             # 只有"必须保存到 NVM 才能生效"的型号才做不到这件事，那种情况下直接失败。
             self._stage('ROVER_SETUP', '当前是基准站：临时切到流动站（仅内存，不写 NVM）')
-            switcher = getattr(self.driver, 'set_mode_memory_only', None)
-            if switcher is None:
-                raise WriteFailed(
-                    'ROVER_SETUP',
-                    '这块模块当前是基准站模式，而本模式（只测不写）不改动模块配置。'
-                    '该型号驱动不支持"仅内存切换模式"（必须保存到 NVM 才生效），'
-                    '无法在不改配置的前提下测量。'
-                    '请改选「CORS 差分标定」（会自动切流动站、测完切回基准站并写入坐标），'
-                    '或先手动把模块切到流动站模式再测', data)
-            ok, message, mdata = switcher('rover')
+            # 基类默认实现回 unsupported，用它自己的消息（含"必须保存才生效"的
+            # 解释）直接判失败 —— 不再先探测方法是否存在。
+            ok, message, mdata = self.driver.set_mode_memory_only('rover')
             if not ok:
                 raise WriteFailed(
                     'ROVER_SETUP',
@@ -1539,7 +1800,7 @@ class CoordinateWriter:
         最后得出"信号差、进不了固定解"的错误结论——比直接失败更糟。
         读模式失败只告警不失败：串口偶尔丢一帧不该终止整个标定。
         """
-        if getattr(self.driver, 'PASSIVE', False):
+        if self.driver.PASSIVE:
             return                       # 未知模块没有命令集，模式无从复核
         ok, message, data = self.driver.get_mode()
         if not ok:
@@ -1563,7 +1824,7 @@ class CoordinateWriter:
 
         # 未知模块（只读驱动）没有命令集：一条 NMEA_SETUP 都发不出去。
         # 这时唯一能做的是"读它现在吐什么"——模块本来就在输出 GGA 才有得测。
-        if getattr(self.driver, 'PASSIVE', False):
+        if self.driver.PASSIVE:
             self._warn('未知模块没有命令集：不配置 NMEA，直接读模块现有输出。'
                        '若迟迟拿不到 GGA，请先用上位机把模块的 GGA 输出打开')
             self.result['cors_nmea'] = {'applied': {}, 'before': {}, 'passive': True}
@@ -1645,13 +1906,15 @@ class CoordinateWriter:
         # 但固定解始终进不去——VRS 拿 87 秒一条的 GGA 根本无法持续跟踪测站。
         # 本固件（LG290P03AANR01A03S）在 1 Hz 定位节拍下 GGA 调度会卡死。
         # 所以这里钉在 100 ms（10 Hz 定位），再用 GGA 1/10 抽稀出 1 Hz 输出。
-        setter = getattr(self.driver, 'set_fix_rate', None)
-        if setter is not None:
-            ok, message, _data = setter(FIXRATE_SAFE_MS)
-            if ok:
-                applied['FIXRATE'] = FIXRATE_SAFE_MS
-            else:
-                self._warn(f'定位间隔配置失败（{message}），改用实测频率校验兜底')
+        # 基类默认回 unsupported；不改定位频率的型号（Unicore 以外）照样能靠
+        # 实测频率兜底，所以失败只记警告 —— 但**要区分**"不支持"与"下发失败"。
+        ok, message, _data = self.driver.set_fix_rate(FIXRATE_SAFE_MS)
+        if ok:
+            applied['FIXRATE'] = FIXRATE_SAFE_MS
+        elif (message or '').startswith(self.driver.DISPLAY_NAME):
+            logging.info('本型号不支持设置定位间隔，按实测频率校验：%s', message)
+        else:
+            self._warn(f'定位间隔配置失败（{message}），改用实测频率校验兜底')
         self.result['cors_nmea'] = {'applied': applied, 'before': before}
 
         # ---- 关键闭环：RTK 引擎必须靠 SAVEPAR + 重启才真正初始化 ----
@@ -1691,22 +1954,17 @@ class CoordinateWriter:
         重启会断串口，所以顺序必须是：落盘 → 重启 → 等启动 → 重开串口 → 回读确认。
         """
         self._stage('RTK_REINIT', '保存配置并重启模块，初始化 RTK 解算引擎')
-        saver = getattr(self.driver, 'save', None)
-        rebooter = getattr(self.driver, 'reboot', None)
-        if saver is None or rebooter is None:
-            self._warn('驱动不支持 SAVEPAR/重启，跳过 RTK 引擎重建；'
-                       '若迟迟进不了固定解，请手动重启模块后再试')
-            self.result['rtk_reinit'] = {'skipped': True}
-            return
-
-        ok, message, data = saver()
+        # save()/reboot() 在基类都有默认实现（回 unsupported），不判"有没有方法"：
+        # 判不出来的后果是"跳过引擎重建"这条告警，而它恰好会掩盖"驱动根本没实现"
+        # 这个更该修的事实。失败时下面照样只记警告、不判死，行为不变。
+        ok, message, data = self.driver.save()
         applied['SAVEPAR'] = 'ok' if ok else f'failed:{message}'
         if not ok:
             # 部分固件在 rover 模式下 SAVEPAR 会回 ERROR，但重启依然有效。
             # 不直接判死，如实记录后继续 —— 真正的裁判是后面的质量位实测。
             self._warn(f'配置落盘返回异常（{message}），继续尝试重启')
 
-        ok2, message2, data2 = rebooter()
+        ok2, message2, data2 = self.driver.reboot()
         applied['RESTART'] = 'ok' if ok2 else f'failed:{message2}'
         if not ok2:
             self._warn(f'重启命令返回异常（{message2}），仍等待模块自恢复')
@@ -1742,6 +2000,33 @@ class CoordinateWriter:
         self._record_step('RTK_REINIT', True,
                           '已落盘并重启，串口重连且回读确认仍为流动站',
                           self.result['rtk_reinit'])
+
+    def _gga_zero_hint(self, count, hz):
+        """GGA 不达标时给"下一步查什么"的解释。**按驱动能力位分流，不按型号**。
+
+        同一个现象（GGA 不来）在两类模块上根因完全不同，把原因混在一起讲
+        最坑现场：u-blox 用户会被"定位间隔写成 1000 ms"这条 Quectel 专属陷阱
+        带偏，然后去改一个跟问题毫无关系的参数。
+
+        `nmea_needs_fix=True`（u-blox ZED-F9P 实测）：**一条都没有**就是没定位。
+        没有 fixType≥2 时 GGA 的经纬度/质量位/星数字段无值可填，固件整句不出，
+        但 NAV-PVT 照常 1 Hz 输出——所以"配置全对、字节也在流、就是没有 GGA"。
+        """
+        if self._caps('nmea_needs_fix'):
+            if count == 0:
+                return ('本型号（u-blox）在**未定位时不输出 GGA**：GGA 没有经纬度/'
+                        '质量位/星数可填，固件整句不发；NAV-PVT 此时仍然正常输出，'
+                        '所以看起来"配置都对、串口也有数据，就是没有 GGA"。'
+                        '请先确认这几项：① 天线是否接好、是否在室外（NAV-PVT 的 '
+                        'fixType 到 2 以上 / numSV > 0 才会有 GGA）；'
+                        '② MSGOUT 是否写在**当前链路所在端口**上（F9P 的 MSGOUT 键'
+                        '按端口分，I2C/UART1/UART2/USB/SPI 各有各的，写错端口会'
+                        '安静地 ACK 而毫无效果）；③ 刚上电冷启动搜星需要几分钟。')
+            return ('本型号（u-blox）的 GGA 只有在有定位时才有内容，频率偏低通常'
+                    '说明定位在反复丢失（收到卫星但解不连续）。请检查天线视野与'
+                    '供电，必要时把模块挪到室外再测。')
+        return ('常见原因：① 定位间隔被写成 1000 ms（本固件会让 GGA 调度卡到 87 秒一次）；'
+                '② 注入 CORS 差分后 NMEA 输出被 RTCM 解析挤占（关掉 GSV/GLL/VTG/RMC）。')
 
     def _verify_gga_rate(self, stage='GGA_RATE_CHECK', label='实测 GGA 输出频率',
                          window=None, strict=True):
@@ -1801,8 +2086,7 @@ class CoordinateWriter:
                 f'GGA 实际只输出 {len(seen)} 条 / {window:.0f} 秒 = {hz:.3f} Hz'
                 f'（要求 ≥{GGA_MIN_HZ} Hz）。VRS 无法用这个频率持续跟踪测站，'
                 f'继续跑只会把"配置假成功"误判成"信号差进不了固定解"。'
-                f'常见原因：① 定位间隔被写成 1000 ms（本固件会让 GGA 调度卡到 87 秒一次）；'
-                f'② 注入 CORS 差分后 NMEA 输出被 RTCM 解析挤占（关掉 GSV/GLL/VTG/RMC）。',
+                + self._gga_zero_hint(len(seen), hz),
                 detail)
         self.result.setdefault('cors_gga_rate', detail)
         self._record_step(stage, True,
@@ -1827,6 +2111,10 @@ class CoordinateWriter:
         native_deadline = time.time() + GGA_NATIVE_WAIT    # 只给原生 GGA 的窗口
         gga_count = 0
         last_raw = None
+        # 冗余保险只尝试一次：模块有命令集但 GGA 输出是关的（切流动站前是基准站、
+        # 或者上一次配置把人关掉了），这里主动开一次。没命令集的未知模块直接跳过，
+        # 发给它的任何字节都可能被当成别的东西。
+        nudged = False
         while time.time() < deadline:
             self._checkpoint()
             self._drain_gga(0.2)
@@ -1838,6 +2126,16 @@ class CoordinateWriter:
                     gga_count += 1
                     if gga_count >= 3:
                         break
+            # ---- 冗余：原生 GGA 迟迟不来，先问驱动能不能把它打开 ----
+            # 时机刻意放在 `native_deadline` 的一半处而不是一开始：
+            # 刚切完流动站时模块正在重启/重新搜星，这时发命令有较大概率被丢弃，
+            # 而且"它只是在启动"和"它被关掉了"看起来一模一样 —— 太早动手会
+            # 给每一次正常标定都多发一轮命令。等到一半窗口还没有任何 GGA，
+            # 才值得去动配置。
+            if (not nudged and gga_count == 0 and not self._is_passive_driver()
+                    and time.time() >= native_deadline - GGA_NATIVE_WAIT / 2):
+                nudged = True
+                self._nudge_gga_output()
             # 原生 GGA 窗口过了仍没有，且有 RMC/GLL → 允许软件生成（精度受限）
             if gga_count == 0 and time.time() >= native_deadline:
                 if channel and (channel.cache.get('rmc') or channel.cache.get('gll')):
@@ -1865,6 +2163,38 @@ class CoordinateWriter:
                                   {'gga_count': gga_count})
         self._await_position_fix(gga_manager)
         return gga_manager
+
+    def _is_passive_driver(self):
+        """当前驱动是否有命令集。无命令集（未知模块）时任何"发命令"都要跳过。"""
+        return bool(self.driver.PASSIVE)
+
+    def _nudge_gga_output(self):
+        """GGA 长时间不来时的冗余动作：让驱动把 GGA 输出重新打开。
+
+        **只开 GGA，不改其它任何配置，不写 NVM**（persist=False）。
+        这条保险发生在"已经切到流动站、还没写配置"的中间态，多做一次 NVM 写入
+        毫无意义；而且万一后面失败要回滚，也不希望回滚的是我们自己刚写的值。
+
+        失败一律降级成告警：这条路径本来就是"顺手补救"，补不上不能把整个标定
+        判死 —— 真正等不到位置时，`_await_position_fix` 会给出更准确的结论。
+        """
+        if self._is_passive_driver():
+            return
+        self._stage('GGA_WAIT', 'GGA 未出现，尝试用驱动命令打开 GGA 输出')
+        try:
+            ok, message, data = self.driver.ensure_nmea_output(
+                enabled=True, names=('GGA',), persist=False)
+        except Exception as e:                        # noqa: BLE001 - 补救动作不能抛出
+            ok, message, data = False, f'{type(e).__name__}: {e}', {}
+
+        if ok:
+            self._touched = True
+            self._warn(f'模块此前没有输出 GGA，已用驱动命令打开（{message}）')
+            self._record_step('GGA_WAIT', True, f'已补开 GGA 输出：{message}', data)
+        else:
+            self._warn(f'尝试打开 GGA 输出失败（{message}），继续等待原生输出')
+            self._record_step('GGA_WAIT', False,
+                              f'尝试打开 GGA 输出失败：{message}', data)
 
     def _await_position_fix(self, gga_manager):
         """进 FIX_WAIT 前先确认模块**自身已经定位**（GGA 质量位 > 0）。
@@ -2601,6 +2931,179 @@ class CoordinateWriter:
         self._record_step('WRITE_COORD', True, '已停用坐标配置', data)
 
     # ---------- 步骤 2：切模式（§8.1 第 2 步 / §8.3 降级判定） ----------
+    def _step_prepare_outputs(self, plan):
+        """开工前把**本流程要用的输出**主动打开（只开必需的，只改 RAM）。
+
+        ## 为什么需要这一步（真机教训，ZED-F9P / COM12 / HPG 1.32）
+
+        那块板子上的输出状态是：`RTCM_1005/1074/1084/1094/1124/1230` 全 =1，
+        而 NAV/NMEA/RXM 那 69 个输出键里**只有 `NAVOUT_NAV_SVIN_USB` 非零**，
+        其余全 0 —— 它是一台"只剩 RTCM 的纯净基站"，其他语句在之前调试时被关了。
+
+        这种状态对**基站播发**是完美的，但对**标定流程**是致命的：
+
+            · `survey_in` 要观测值自收敛 → 靠 RTCM/原始观测，这条还能走
+            · `cors` / `external_rover` 要 GGA 上送 CORS → 没有 GGA 就永远等不到 FIX
+            · 任何方式的校验都要读模块自身的定位 → 没有 NAV-PVT 只能靠 NMEA 兜
+
+        以前的做法是等：`_step_cors_gga_wait` 超时后才由 `_nudge_gga_output()`
+        补救。那是"出事以后补"，白等一整个 GGA 超时周期（几十秒），
+        而且**只补 GGA 一条** —— NAV-PVT/NAV-SAT 那些照样是关的，
+        诊断与校验链路上拿不到数据，用户在前端看到的就是"模块没反应"。
+
+        所以改成开工前主动开。**只开本流程真正需要的**，不多开：
+        基站侧不需要 GGA（它最占下行带宽），流动站侧不需要 NAV-ODO。
+
+        ## 三条硬约束
+
+        1. **只读模式（`external_rover`）一律跳过**：那条路 `self._readonly=True`，
+           全程不许发写命令 —— 模块不归我们管，临时开输出也算改了人家的设备。
+        2. **persist=False**：只改 RAM。开输出是为了"让本次流程有数据"，
+           没有理由动 Flash（擦写寿命 + 用户可能特意关掉的）。真想落盘由
+           用户自己拿 u-center 存，或后续单独的"恢复出厂输出"功能做。
+        3. **失败只告警，绝不阻断**：模块本来就在正常播 RTCM，
+           输出开不出来顶多是某几条校验降级，不该让用户连坐标都写不进去。
+        """
+        if getattr(self, '_readonly', False):
+            self._record_step('OUTPUT_PREP', True,
+                              '只测不写模式：不改模块输出配置', {'skipped': 'readonly'})
+            return
+
+        # 直接调**基类声明的抽象接口**，不做 `hasattr` / `getattr` 特征探测：
+        # 探测写法看起来"更兼容"，实际是把"某个驱动有没有这个方法"变成了
+        # 运行期才知道的事 —— 漏实现时静默跳过，用户只看到"流程卡在等 GGA"。
+        # 现在基类 `BaseDriver.enable_outputs()` 给了通用默认实现（逐条
+        # set_message_rate），没有命令集的型号由驱动自己回 unsupported，
+        # 流程层按返回值判，不按"方法在不在"判。
+        capability = self._caps('enable_outputs', None)
+        if capability is None:
+            # 老驱动没有声明这条能力位：按"有 set_message_rate 就能开"处理，
+            # 保持向后兼容（LG290P / LC29H(BS) / N4 都属这一类）。
+            capability = True
+        if not capability:
+            self._record_step('OUTPUT_PREP', True,
+                              '本型号不支持主动开启输出，跳过', {'skipped': 'unsupported'})
+            return
+
+        # 按**这次要做的事**决定开哪些，不是无脑全开。
+        # 这里的名字是**语义名**（和 set_message_rate 同一套写法），
+        # 具体落到哪几个物理口、拼成什么键名，完全由驱动决定。
+        want = []
+        method = plan.method
+        if method in ('cors', 'external_rover'):
+            # 流动站侧：CORS 要 GGA 上送，链路存活判断要 RMC，
+            # NAV-PVT 用来给前端/日志一个结构化的定位快照。
+            want = ['GGA', 'RMC', 'NAV_PVT']
+        elif method == 'survey_in':
+            # 自收敛靠观测值，但要能读到"已收敛/精度"才不至于干等：
+            # NAV-SVIN 是收敛状态报文（保留着），NAV-PVT 给个位置快照。
+            want = ['NAV_PVT']
+        else:
+            # 手动写已知坐标：过程里不需要持续输出，但配完要回读校验，
+            # 开 GGA 让用户/前端能立刻看到模块自己在报什么位置。
+            want = ['GGA', 'NAV_PVT']
+
+        self._stage('OUTPUT_PREP', f'检查并开启标定所需输出：{"、".join(want)}')
+        try:
+            ok, message, data = self.driver.enable_outputs(want, rate=1, persist=False)
+        except Exception as e:                              # noqa: BLE001 - 补救动作不能抛出
+            self._warn(f'开启标定所需输出失败（{type(e).__name__}: {e}），'
+                       f'流程继续，后续等待可能更久')
+            self._record_step('OUTPUT_PREP', False,
+                              f'开启输出异常：{type(e).__name__}', {})
+            return
+
+        if ok:
+            # 只有真的写了才标 `_touched`：全开着的时候一条都没写，
+            # 不是"我们改过模块"，失败收尾时也就不该去回写它。
+            if (data or {}).get('enabled'):
+                self._touched = True
+            self.result['output_prep'] = data
+            self._record_step('OUTPUT_PREP', True, message, data)
+            if (data or {}).get('enabled'):
+                self._warn(f'模块此前未输出 {"、".join(want)}，'
+                           f'已临时打开（{message}）；未写入 NVM')
+        elif (data or {}).get('error') == 'unsupported':
+            # 本型号没有这套命令（被动模块 / 只有 ASCII 单键但没有速率命令）：
+            # 不是错误，如实记"跳过"，别在界面上报一条红字让人以为出事了。
+            self.result['output_prep'] = data
+            self._record_step('OUTPUT_PREP', True, message, data)
+        else:
+            self.result['output_prep'] = data
+            self._warn(f'开启标定所需输出失败（{message}）；'
+                       f'若流程卡在等 GGA，请用厂商工具手动打开 GGA 输出')
+            self._record_step('OUTPUT_PREP', False, message, data)
+
+    def _step_ensure_base_for_write(self, plan):
+        """写固定坐标之前，确保模块**已经在基准站模式**（仅双模模块需要）。
+
+        这一步和 `_step_switch_mode` 看起来重复，但职责不同，不能合并：
+            - 本步是**前置条件**：在写坐标**之前**把模式摆正，因为有些型号
+              在流动站模式下写固定坐标会直接回 ERROR（配置项不允许），
+              或者写进去了但基站不生效（模块仍在按流动站解算）。
+            - `_step_switch_mode` 是**兜底与记账**：单模模块走它记 `not_needed`，
+              双模模块走它是幂等确认。
+
+        为什么要"检测"而不是"无脑切"：切模式要 `SAVEPAR` + 重启，串口会断一次、
+        模块重新搜星。已经站在基准站的板子（最常见的情况 —— 上次标定完就没动过）
+        不该被白白重启一遍。
+
+        单模模块直接返回：它没有模式命令（`set_mode` 是空操作，只会回
+        `already_base_side`），发出去只会多一次往返和一个 ERROR 应答。
+        """
+        # 单模 / 无模式命令 → 默认就是基准站，不检测也不切。
+        if not self._caps('dual_mode') or not self._caps('set_mode'):
+            self._record_step('BASE_SETUP', True,
+                              '本型号固定为基准站模式，无需检测与切换', {})
+            return
+        # 未知模块（无命令集）走不到这条路（API 层已拦 manual），但保底跳过。
+        if self._is_passive_driver():
+            return
+
+        self._stage('BASE_SETUP', '检测当前工作模式（写坐标要求基准站）')
+        ok, message, data = self.driver.get_mode()
+        if not ok:
+            # 读不到模式时的处理与 `_step_switch_mode` 一致：不判死，往下走 ——
+            # 写坐标本身仍会回读校验（`_step_verify_rtcm`），真错了会在那一步暴露。
+            self._warn(f'读不到当前工作模式（{message}），直接写入坐标并在写入后校验')
+            self._record_step('BASE_SETUP', True, f'模式未知（{message}），继续写入', data)
+            return
+
+        mode = (data or {}).get('mode')
+        if mode == 'base':
+            self._record_step('BASE_SETUP', True,
+                              '当前已是基准站模式，无需切换（回读确认）',
+                              {'from': 'base', 'switched': False})
+            return
+
+        if mode != 'rover':
+            raise WriteFailed(
+                'BASE_SETUP',
+                f'当前模式为 {mode}，无法写入基准站坐标（必须在 base 或 rover 之间）',
+                data)
+
+        # 当前是流动站 → 切基准站。这里必须 persist：写坐标之后还要配报文、
+        # 保存、重启，重启时若 NVM 里仍是 rover，基站模式就丢了。
+        self._stage('BASE_SETUP', '当前是流动站，切换为基准站（写坐标的前提）')
+        ok, message, data = self.driver.set_mode('base', persist=True, restart=True,
+                                                 verify=True)
+        if not ok:
+            raise WriteFailed('BASE_SETUP', f'切换基准站失败：{message}', data)
+        self._touched = True
+        self.result['mode_ack'] = 'ack'
+        plan.mode_ack = 'ack'
+
+        # set_mode 内部已回读，这里再独立确认一次：模式不对就不该写坐标。
+        ok2, message2, data2 = self.driver.get_mode()
+        if not ok2 or (data2 or {}).get('mode') != 'base':
+            raise WriteFailed(
+                'BASE_SETUP',
+                f'切换后回读模式是 {(data2 or {}).get("mode")}，不是 base：'
+                f'此时写入的坐标不会被当作基准站坐标播发',
+                data2)
+        self._record_step('BASE_SETUP', True,
+                          '已从流动站切为基准站（回读确认），可以写入坐标', data2)
+
     def _step_switch_mode(self, plan):
         self._checkpoint()
         self._stage('BASE_SETUP', f'切换工作模式为 {plan.mode}')
@@ -2612,6 +3115,18 @@ class CoordinateWriter:
         ok, message, data = self.driver.set_mode(
             plan.mode, persist=persist, restart=False, verify=False)
         if ok:
+            # 单基准站模块（无模式命令，如 LC29H(BS)）：set_mode('base') 是空操作，
+            # 驱动会带 already_base_side 标记。这里如实记成"无需切换"，
+            # 不能让前端看到"已切换为 base（收到应答）"——模块那边一个字节都没发。
+            #
+            # 也**不能**置 `_touched`：它决定"失败时要不要回写"，空操作没改过模块，
+            # 标成已改动会让失败文案谎称"配置已被改动、正在回写"。
+            if (data or {}).get('already_base_side'):
+                plan.mode_ack = 'not_needed'
+                self.result['mode_ack'] = 'not_needed'
+                self._record_step('BASE_SETUP', True,
+                                  f'本型号是单基准站模块，无需切换工作模式（{message}）', data)
+                return
             self._touched = True
             plan.mode_ack = 'ack'
             self.result['mode_ack'] = 'ack'
@@ -2652,7 +3167,9 @@ class CoordinateWriter:
         msm = plan.msm
         if msm and self._caps('rtcm_out', True):
             self._stage('MSG_SETUP', f'配置 RTCM 输出（MSM{msm}）')
+            self._beat()          # 下面这次 VALSET 等的 ACK 可能超时重试好几轮
             ok, message, data = self.driver.config_rtcm(msm_type=msm, persist=False)
+            self._beat()
             if not ok:
                 raise WriteFailed('MSG_SETUP', f'RTCM 配置失败：{message}', data)
             self._touched = True
@@ -2660,6 +3177,7 @@ class CoordinateWriter:
             # 回读确认 MSM 档位真的变了。真机踩过一次：`PQTMCFGRTCM` 的仰角写成 `-90.0`
             # 会被回 ERROR,1（参数不合法），而只在"应答是 OK"这一层是看不出"配置没生效"的。
             ok2, message2, readback = self.driver.read_rtcm_config()
+            self._beat()
             if not ok2:
                 raise WriteFailed('MSG_SETUP', f'RTCM 配置回读失败：{message2}', readback)
             # 回读的档位优先取驱动翻译好的 `msm_type`：
@@ -2687,7 +3205,9 @@ class CoordinateWriter:
             self._stage('MSG_SETUP',
                         f'打开 {coord_name}（基准站坐标播发，'
                         f'{"含天线高度" if plan.coord_msg == "1006" else "标准 1005"}）')
+            self._beat()
             ok, message, data = self.driver.set_message_rate(coord_name, 1)
+            self._beat()
             if not ok:
                 # 1006 在部分固件上不支持：明确告诉用户换 1005，而不是干巴巴一句失败
                 hint = ''
@@ -2716,13 +3236,16 @@ class CoordinateWriter:
         # 所以只能判 None，不能用 `or` —— 早先写成 `... or ('RTCM3-107X',)`，
         # 空表会被兜成默认值，于是对只有一个全局 MSM 开关的型号照样逐条发
         # `RTCM3-107X`，换来一串"不支持"的假警告。
-        constellations = getattr(self.driver, 'MSM_CONSTELLATIONS', None)
+        constellations = self.driver.MSM_CONSTELLATIONS
         if constellations is None:
             constellations = ('RTCM3-107X',)
 
         if msm:
             opened, failed = [], []
             for name in constellations:
+                # 5 个星座 × 每条一次 UBX 往返（ACK 超时 1.5s × 2 次重试），
+                # 最坏可以到 20 秒以上。逐条喂心跳，别让看门狗误判线程已死。
+                self._beat()
                 ok, message, _data = self.driver.set_message_rate(name, 1)
                 if ok:
                     applied[name] = 1
@@ -2752,6 +3275,72 @@ class CoordinateWriter:
         elif plan.antenna:
             self._warn('本型号不支持写天线信息（1033），已跳过')
 
+        # 3.5 静音多余输出（只有声称 `silence` 能力的型号才走这里）。
+        #     为什么要有这一步：Quectel 两家（LG290P / LC29H(BS)）切到 base 后会
+        #     **自动**停掉 NMEA、改播 RTCM，所以配好 RTCM 就完事。u-blox F9P
+        #     **没有这个自动行为** —— 模式一切，NAV-PVT / NAV-SAT / NAV-ODO 照旧
+        #     按 1 Hz 往外吐，外加出厂默认的 GGA/GSA/GSV/RMC/VTG。真机实测 38400 下
+        #     这几路已经吃掉约 5% 带宽；有星时一条 NMEA-GSV 就是几百字节，
+        #     串口预算会被 RTCM 观测值挤爆，下游拿到"坐标有、观测值缺"的基站。
+        #
+        #     **必须放在 RTCM 配置之后**：先保证该播的播出来，再关不该播的。
+        #     顺序反了也没错，但一旦静音步骤失败（比如模块忙），
+        #     RTCM 那边已经配好了，用户至少还有一半可用。
+        #
+        #     失败只记警告，**绝不让它拦住写入**：静音是"体验与带宽优化"，
+        #     不是基准站能不能用的前提。真出了"关不掉"的怪模块，
+        #     也不能让用户连坐标都写不进去。
+        if self._caps('silence'):
+            # 3.5a 静音**之前先刮一份完整快照**。
+            #
+            # 备份表 `backup.RATE_TARGETS` 只有 12 条（GGA/RMC/GSA/GLL + 七条 RTCM），
+            # **一条 NAV-* 都没有**；而下面的 silence_outputs 会把 NAV/NMEA/RXM
+            # 那 69 个键里开着的一律写 0。于是还原分支只回放那 12 条时，
+            # 被关掉的 NAV-PVT / NAV-SAT / NAV-ODO ... 一条都放不回来 ——
+            # 模块从此只剩 RTCM，用户 u-center 里星图全空，
+            # 而界面显示"已按备份回放"、不报任何错。
+            #
+            # 快照放 RAM 层、只读不写，失败也不拦流程（静音本身就只是优化）。
+            # 直接调抽象接口：基类给了默认实现（回 unsupported），
+            # 所以这里不需要判"驱动有没有这个方法" —— 没有快照能力就
+            # 拿到 False，走下面"跳过静音"的分支，行为是一致的。
+            # 心跳：F9P 的 USB 口是 69 个 MSGOUT 键，快照要逐键 VALGET。
+            # 驱动内部已按 VALGET_BATCH=12 分组、每组等 ACK/超时重试，
+            # 但**分组之间不会自己喂心跳** —— 6 组 × 单组最长 2.0s 超时
+            # 累计可达 12s 以上，加上随后的静音（同样逐键 VALSET），
+            # 这一段整体就可能顶穿 30s 看门狗。本函数前段（RTCM 配置）
+            # 有 6 处 _beat()，这里一处都没有，是明确的遗漏。
+            self._beat()
+            ok, message, snap = self.driver.snapshot_outputs()
+            snapshot_ok = ok            # 别被下面静音分支复用 ok 冲掉
+            self._beat()
+            if ok:
+                self.result['output_snapshot'] = {
+                    'rates': snap.get('rates') or {},
+                    'layer': snap.get('layer'),
+                    'ports': snap.get('ports'),
+                }
+                applied['snapshot'] = len(snap.get('rates') or {})
+            else:
+                # 拿不到快照就别静音：宁可带宽多占一点，
+                # 也不能关完没法还原。静音不是基准站能用的前提。
+                self._warn(f'输出配置快照失败，已跳过静音以免无法还原：{message}')
+
+            if snapshot_ok:
+                self._stage('MSG_SETUP', '关闭多余输出（NAV / NMEA / RXM）')
+                # 留 1005 之外什么都不用留：RTCM 不走 MSGOUT 的这三组键，
+                # 关掉 NAV/NMEA/RXM 不影响 RTCM 播发。GGA 也不留 ——
+                # 基站侧不需要 GGA，而它恰是下行带宽里最占地方的一条。
+                ok, message, silenced = self.driver.silence_outputs(
+                    keep=('NAV_SVIN',), persist=False)
+                self._beat()
+                self.result['silence'] = silenced
+                if ok:
+                    self._touched = True
+                    applied['silenced'] = len(silenced.get('turned_off') or [])
+                else:
+                    self._warn(f'关闭多余输出失败（不影响基准站功能）：{message}')
+
         self.result['messages'] = {'applied': applied}
         self._record_step('MSG_SETUP', True, f'已配置 {len(applied)} 条报文', self.result['messages'])
 
@@ -2770,15 +3359,27 @@ class CoordinateWriter:
 
         # ---- 1. RTCM 七字段原样回放（含星历模式/间隔，按档位重配会悄悄改掉它们）----
         fields = plan.rtcm_fields
-        restorer = getattr(self.driver, 'restore_rtcm_config', None)
-        if fields and restorer is not None:
+        # 基类默认回 unsupported（本型号没有"原样回写"这条命令）。这里直接调用、
+        # 不探测方法是否存在：失败时**当场**退化成按档位重配，比"没方法就整段跳过、
+        # 备份字段被静默丢弃"更接近用户预期 —— 后者会让还原看起来成功、实际没恢复。
+        if fields:
             self._stage('MSG_SETUP', f'原样恢复 RTCM 配置：{",".join(fields)}')
-            ok, message, data = restorer(fields)
+            ok, message, data = self.driver.restore_rtcm_config(fields)
             if ok:
                 self._touched = True
                 applied['rtcm'] = ','.join(fields)
             else:
                 self._warn(f'RTCM 配置原样恢复失败（{message}）；该档配置未还原')
+                if plan.msm and self._caps('rtcm_out', True):
+                    self._stage('MSG_SETUP',
+                                f'退回按档位重配 RTCM 输出（MSM{plan.msm}）')
+                    ok2, message2, _d2 = self.driver.config_rtcm(
+                        msm_type=plan.msm, persist=False)
+                    if ok2:
+                        self._touched = True
+                        applied['msm'] = plan.msm
+                    else:
+                        self._warn(f'RTCM 档位恢复也失败（{message2}）')
         elif plan.msm and self._caps('rtcm_out', True):
             # 旧备份或当时读不到 → 只剩 MSM 档位可用，退一步按档位重配
             self._stage('MSG_SETUP', f'恢复 RTCM 输出（MSM{plan.msm}；备份无完整字段）')
@@ -2799,16 +3400,15 @@ class CoordinateWriter:
             if rate is None:
                 continue
             if _is_msm_rate_name(name):
-                setter = getattr(self.driver, 'set_msm_rate', None)
-                if setter is None:
-                    skipped.append(name)
-                    continue
                 if rate <= 0:
                     # MSM 的 Rate 必须 ≥1，没有"关掉"的写法；保持模块当前值并告知
                     skipped.append(f'{name}(备份为 0)')
                     continue
                 offset = _to_int((plan.offsets or {}).get(name)) or 0
-                ok, message, _data = setter(rate, offset)
+                # 直接调抽象接口：基类默认回 unsupported，不再判"有没有这个方法"。
+                # 判"有没有"会让一个漏实现的型号静默走进 skip 分支，日志上看
+                # 和"这型号本来就不支持"完全一样，排查时无从区分。
+                ok, message, _data = self.driver.set_msm_rate(rate, offset, name=name)
             else:
                 ok, message, _data = self.driver.set_message_rate(name, rate)
             if ok:
@@ -2817,6 +3417,34 @@ class CoordinateWriter:
                 # 单条速率失败不判整个还原失败：其余配置照样放回去，
                 # 这一条模块用自己的默认值，界面提示用户手动核对即可。
                 self._warn(f'{name} 速率恢复失败（{message}）；该条保持模块当前值')
+
+        # ---- 2.5 输出配置按静音前的快照放回 ----
+        #
+        # 必须排在速率回放**之后**：`silence_outputs` 关掉的是 NAV/NMEA/RXM 那
+        # 69 个 MSGOUT 键，而上面第 2 步回放的是另一套名字（GGA/RMC/...）。
+        # 两者交集里那 4 条（GGA/RMC/GSA/GLL）会被第 2 步按备份写一遍，
+        # 快照再写一遍 —— 顺序上快照在后，所以**以快照为准**。
+        # 这正是想要的：快照是"静音前那一刻的真实状态"，比备份表更全更准。
+        #
+        # 快照只在 RAM 层回放（`restore_outputs()` 内部就是这么做的）：
+        # Flash 一个字节都不动，即使这里出错，重启后仍是用户原来那份配置。
+        snap = self.result.get('output_snapshot') or {}
+        # 直接调抽象接口，不做特征探测：基类给了默认实现（逐条 set_message_rate），
+        # 所以任何型号走到这里都有得回放 —— 只是覆盖度不同，不该由流程层判"有没有"。
+        if snap.get('rates'):
+            self._stage('MSG_SETUP',
+                        f'按快照恢复 {len(snap["rates"])} 条输出配置')
+            self._beat()        # 同上：69 键逐条回写，分组之间不喂心跳会顶穿看门狗
+            ok, message, data = self.driver.restore_outputs(snap)
+            self._beat()
+            if ok:
+                self._touched = True
+                applied['outputs_restored'] = len(data.get('restored') or [])
+                if data.get('unchanged'):
+                    applied['outputs_unchanged'] = len(data['unchanged'])
+            else:
+                self._warn(f'输出配置按快照恢复失败（{message}）；'
+                           f'请用 u-center 核对 NAV/NMEA 输出是否已开回')
 
         # ---- 3. 天线信息（1033）按备份回放；备份里没有就不碰 ----
         if plan.antenna and self._caps('ant_info'):
@@ -2889,19 +3517,20 @@ class CoordinateWriter:
         而不是回 `{'ok': True}` 假装查过了。报告里这两种状态必须能分开，
         否则看日志的人会以为持久化被验证过。
         """
-        caps = getattr(self.driver, 'CAPS', None) or {}
+        caps = self.driver.CAPS or {}
         if not caps.get('persist_check'):
             return {'checked': False, 'reason': 'unsupported'}
-        checker = getattr(self.driver, 'verify_persisted', None)
-        if not callable(checker):
-            return {'checked': False, 'reason': 'no_method'}
+        # 声明了 persist_check 就必须实现 verify_persisted（基类给了默认实现，
+        # 回 unsupported）。这里不再判 callable：真漏实现时让下面的调用直接暴露，
+        # 而不是被一个 'no_method' 分支悄悄吞掉、日志上看和"这型号不支持"一样。
+        checker = self.driver.verify_persisted
 
         expected = {}
         mode = getattr(plan, 'mode', None)
         if mode in ('rover', 'base'):
             # 流程层用角色名（rover/base），驱动内部翻成 TMODE；这里给的是
             # `verify_persisted` 期望的**物理值**，所以用驱动自己的别名表翻一次。
-            aliases = getattr(self.driver, 'MODE_VALUE', None) or {}
+            aliases = self.driver.MODE_VALUE or {}
             label = 'fixed' if mode == 'base' else 'disabled'
             if label in aliases:
                 expected['TMODE_MODE'] = aliases[label]
@@ -2925,7 +3554,7 @@ class CoordinateWriter:
         # 需要断电重启，那一步本来就不在标定流程里）。这类驱动声明
         # `RESTART_REQUIRED = False`，这里跳过软重启并如实记录 ——
         # 否则每次标定都死在"模块没有重启成功"，而模块其实早就配好了。
-        if not getattr(self.driver, 'RESTART_REQUIRED', True):
+        if not self.driver.RESTART_REQUIRED:
             self.result['restart'] = {'skipped': True, 'reason': 'no_reboot_command'}
             self._warn('本型号没有软重启命令（配置即时生效），已跳过重启；'
                        '如需确认掉电后仍保持，请手动断电重启一次再校验')
@@ -3350,6 +3979,28 @@ class CoordinateWriter:
             self._on_stage(name, message, progress)
         except Exception as e:                   # noqa: BLE001 - 回显失败不该拦住写入
             logging.debug(f'阶段回显失败（忽略）：{e}')
+
+    def _beat(self):
+        """喂一次心跳。**阶段名没变、但这次操作可能很久**时调用。
+
+        为什么需要它：`_stage()` 走的是 service 的 `_set_stage`，而后者只在
+        **阶段名变化**时才 `beat(force=True)`；同一阶段里连调多次只会落到
+        `lease.beat()` 的 2 秒节流分支。所以"某个阶段内部阻塞很久"这件事，
+        从心跳上看是完全隐形的。
+
+        真机翻车实例（COM12 / ZED-F9P / manual 写入）：
+            BASE_SETUP  03:25:54  成功
+            MSG_SETUP   03:25:55  config_rtcm() 等 ACK 超时重试
+            03:26:30  看门狗：30 秒无心跳，强制收租约
+        写入坐标、切基站都已落盘成功，只差配 RTCM 报文这一步就被判"线程已死"。
+
+        只喂内存心跳、不写磁盘：这里可能一秒调好几次，
+        磁盘那条由 `lease.beat()` 自己按 5 秒节流。
+        """
+        try:
+            self._on_beat()
+        except Exception as e:                   # noqa: BLE001 - 心跳失败不该拦住写入
+            logging.debug(f'写入链路喂心跳失败（忽略）：{e}')
 
     def _record_step(self, stage, ok, message, detail):
         self.result.setdefault('steps', []).append({

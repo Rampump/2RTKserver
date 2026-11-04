@@ -181,6 +181,9 @@ class LG290PDriver(BaseDriver):
     MODEL_KEY = 'lg290p'
     DISPLAY_NAME = 'Quectel LG290P'
     MATCH_PREFIX = 'LG290P'
+    # 双模：§4.1 有 `PQTMCFGRCVRMODE` 的 1=移动站 / 2=基站，两边都能跑。
+    # 4 种标定方式全支持。
+    ROLE = 'dual'
     DUAL_MODE = True
     CAPS = CAPS
     CMD = CMD
@@ -849,8 +852,56 @@ class LG290PDriver(BaseDriver):
             'msm_type': msm_type, 'eph_mode': eph_mode, 'eph_interval': eph_interval}
 
     def read_rtcm_config(self):
-        """§6.2 查询 RTCM 配置。"""
-        return self.request('get_rtcm')
+        """§6.2 查询 RTCM 配置，并把七字段翻译成流程层能直接用的名字。
+
+        `$PQTMCFGRTCM,R` 的应答是七个**位置固定**的字段（协议规范 §6.2 表）：
+
+            index 0  <MSMtype>      3~7，即 MSM3~MSM7 档位
+            index 1  <EPHmode>      星历输出模式 0/1
+            index 2  <GeoBias>      通常 -90（仰角阈值，整数，写 -90.0 会回 ERROR,1）
+            index 3  <1xxx>         "07" —— 1005/1006/1007 这一组的开关位图
+            index 4  <MSM>          "06" —— MSM 组的星座位图
+            index 5  <EPH>          星历输出间隔
+            index 6  <Reserved>     保留位
+
+        以前这里只是把 `request()` 的结果原样透传，`msm_type` / `enabled` 永远是
+        `None`：备份要靠调用方自己去解析 `fields[0]`，界面显示成 `enabled=None
+        msm_type=None`，看起来像"模块没配置"。现在驱动自己把话说完整，
+        调用方不必再猜位置 —— 但 `fields` / `raw` 仍然保留（还原功能要原样回放）。
+        """
+        ok, message, data = self.request('get_rtcm')
+        if not ok:
+            return ok, message, data
+
+        fields = [str(item).strip() for item in (data.get('fields') or [])]
+        parsed = dict(data)
+        parsed['msm_type'] = _to_int(fields[0]) if len(fields) > 0 else None
+        parsed['eph_mode'] = _to_int(fields[1]) if len(fields) > 1 else None
+        parsed['eph_interval'] = _to_int(fields[5]) if len(fields) > 5 else None
+
+        # `<1xxx>` 是位图，不是"哪一条开着"的清单。真机读到的 `07` = 0b111
+        # = 1005 + 1006 + 1007 三条全开；这一点必须按位解释，不能当成数字 7。
+        coord_bits = _to_int(fields[3]) if len(fields) > 3 else None
+        enabled = []
+        if coord_bits is not None:
+            for bit, name in ((0, '1005'), (1, '1006'), (2, '1007')):
+                if coord_bits & (1 << bit):
+                    enabled.append(name)
+        parsed['enabled'] = enabled
+        parsed['coord_bits'] = coord_bits
+
+        # MSM 组位图同理：`06` = 0b110，对应卫星系统那几位的组合。
+        msm_bits = _to_int(fields[4]) if len(fields) > 4 else None
+        parsed['msm_bits'] = msm_bits
+
+        if ok:
+            summary = [f'MSM{parsed["msm_type"]}'] if parsed['msm_type'] else ['MSM?']
+            if enabled:
+                summary.append('坐标报文 ' + '/'.join(enabled))
+            else:
+                summary.append('坐标报文全关')
+            message = 'RTCM 配置：' + '，'.join(summary)
+        return ok, message, parsed
 
     def restore_rtcm_config(self, fields):
         """把备份里读到的 7 个字段原样写回（还原专用）。

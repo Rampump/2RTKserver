@@ -27,6 +27,10 @@ class PassiveDriver(BaseDriver):
     MODEL_KEY = 'passive'
     DISPLAY_NAME = '未知模块（仅读 NMEA）'
     MATCH_PREFIX = ''
+    # **未知模块默认按流动站处理**（需求原文）：
+    # 我们不知道它有什么命令，但它只要能吐 NMEA，就能被 CORS 测出坐标。
+    # 所以它唯一支持的方式是「仅测量」—— 前端不会给它显示写坐标/切基站那几条。
+    ROLE = 'rover'
     DUAL_MODE = False
     CAPS = {}                 # 所有能力位为 False，前端据此灰掉所有需要写操作的功能
     CMD = {}                  # 没有命令集：body() 一被调用就抛 DriverBug，这是有意的

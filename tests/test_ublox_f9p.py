@@ -577,14 +577,14 @@ class TestDriverSemantics(unittest.TestCase):
 
         drv, _ch, _s = make_f9p(on_write)
         cases = {
-            'GGA': 'NMEAMOUT_GGA',
-            'NMEA-GGA': 'NMEAMOUT_GGA',
-            'GPGGA': 'NMEAMOUT_GGA',        # 带 talker 前缀
-            'RMC': 'NMEAMOUT_RMC',
-            'RAWX': 'RXMOUT_RXM_RAWX',
-            'RXM-RAWX': 'RXMOUT_RXM_RAWX',
-            'NAVSVIN': 'NAVOUT_NAV_SVIN',
-            'NAV_SVIN': 'NAVOUT_NAV_SVIN',
+            'GGA': 'NMEAMOUT_GGA_UART1',
+            'NMEA-GGA': 'NMEAMOUT_GGA_UART1',
+            'GPGGA': 'NMEAMOUT_GGA_UART1',   # 带 talker 前缀
+            'RMC': 'NMEAMOUT_RMC_UART1',
+            'RAWX': 'RXMOUT_RXM_RAWX_UART1',
+            'RXM-RAWX': 'RXMOUT_RXM_RAWX_UART1',
+            'NAVSVIN': 'NAVOUT_NAV_SVIN_UART1',
+            'NAV_SVIN': 'NAVOUT_NAV_SVIN_UART1',
             'RTCM3-1005': 'RTCM_1005',
             '1005': 'RTCM_1005',
         }
@@ -593,7 +593,10 @@ class TestDriverSemantics(unittest.TestCase):
             self.assertTrue(ok, f'{name}: {msg}')
             self.assertEqual(data['key'], want, name)
             self.assertEqual(K.lookup(want)[2], 1.0, f'{want} 的 scale')
-        self.assertEqual(len(seen), len(cases))
+        # 不能断言"写了几帧"：`_valset()` 带写后回读，回读不符会重发一次，
+        # 帧数取决于假模块怎么答 ACK，和本用例要验的东西（名字解析）无关。
+        self.assertTrue(seen, '一条 VALSET 都没发出去')
+        self.assertEqual(len(cases), 10, '用例表本身少了/多了')
 
     def test_resolve_msg_key_shares_one_parser(self):
         """`set_message_rate` 与 `get_message_rate` 必须用同一个解析器。
@@ -601,6 +604,8 @@ class TestDriverSemantics(unittest.TestCase):
         以前两处各抄一份 if/elif，加一种报文就得改两个地方，
         漏一个的表现是"能设不能读"——这种 bug 很难从现象反推。
         """
+        # `_resolve_msg_key()` 给的是**裸键名**（不带端口），端口后缀由
+        # `_port_key()` 补。这里钉住"裸名"这一层契约，端口维度另有测试覆盖。
         cases = {'1005': 'RTCM_1005', 'GGA': 'NMEAMOUT_GGA',
                  'NAVSVIN': 'NAVOUT_NAV_SVIN', 'RAWX': 'RXMOUT_RXM_RAWX'}
         for name, want in cases.items():
@@ -821,9 +826,161 @@ class TestDriverSemantics(unittest.TestCase):
         for name in ('get_svin_config', 'read_rtcm_config', 'restore_rtcm_config',
                      'config_rtcm', 'get_message_rate', 'set_message_rate',
                      'disable_survey_in', 'read_antenna_info', 'save', 'reboot',
-                     'get_mode', 'get_fixed_ecef', 'survey_status', 'read_uart'):
+                     'get_mode', 'get_fixed_ecef', 'survey_status', 'read_uart',
+                     'enable_survey_status'):
             method = getattr(drv, name)
             self.assertTrue(callable(method), f'{name} 不可调用')
+
+    def test_survey_status_provides_flow_field_names(self):
+        """`survey_status()` 的字段名与单位必须对上流程层的读法。
+
+        `_step_svin_wait()` 读的是 `mean_acc`（**米**）和 `mean_x/y/z`。
+        驱动只给 `mean_acc_mm` + `x/y/z` 时，真机表现依次是：
+          ① `当前 3D 精度 ? m` —— 收敛判据拿不到值，永远判不收敛直到超时；
+          ② 就算 obs 够了，也会抛"没有拿到任何有效收敛均值（观测数为 0）"，
+             而模块里其实是好好的。这是与 `count` / `ecef_x` 同类的名字错配。
+        """
+        # 载荷：version(1)+reserved(3)+iTOW(4)+dur(4)
+        #       +meanX/Y/Z(4×4)+meanHP(1×3)+reserved(1)+meanAcc(4)+obs(4)
+        #       +valid(1)+active(1)
+        body = bytearray(40)
+        body[0] = 1
+        struct.pack_into('<I', body, 8, 600)          # dur = 600s
+        struct.pack_into('<i', body, 12, -2221810)    # meanX cm
+        struct.pack_into('<i', body, 16, 5173277)     # meanY cm
+        struct.pack_into('<i', body, 20, 2986962)     # meanZ cm
+        body[24:27] = bytes([0, 0, 0])                # HP
+        struct.pack_into('<I', body, 28, 25)          # meanAcc = 25 × 0.1mm = 2.5mm
+        struct.pack_into('<I', body, 32, 600)         # obs
+        body[36] = 1                                  # valid
+        body[37] = 0                                  # active
+
+        frame = ubx_frame(0x01, 0x3B, bytes(body))
+
+        drv, ch, ser = make_f9p(lambda _d: _ack_ack())
+        # NAV-SVIN 是**周期输出**，不由我们发命令触发 —— `survey_status()` 只读缓存，
+        # 读不到就如实报 `no_nav_svin`（这正是它在真机上该有的行为，不能为了好测就
+        # 改成"顺手发个 VALGET"）。所以这里得模拟总线上已经有一帧在流：
+        # 直接把它塞进假串口的接收缓冲，效果等同于模块自己推了一帧过来。
+        ser._rx += frame
+        ok, message, st = drv.survey_status()
+        self.assertTrue(ok, message)
+
+        # ① 米/毫米两套都在，值一致
+        self.assertAlmostEqual(st['mean_acc_mm'], 2.5, places=3)
+        self.assertAlmostEqual(st['mean_acc'], 0.0025, places=6,
+                               msg='流程层按“米”读 mean_acc')
+        # ② 收敛均值两套名字都在
+        for alias in ('mean_x', 'mean_y', 'mean_z'):
+            self.assertIn(alias, st, f'流程层要读 {alias}')
+        self.assertAlmostEqual(st['mean_x'], st['x'])
+        self.assertAlmostEqual(st['mean_x'], -22218.10, places=2)
+        # ③ 基本状态
+        self.assertTrue(st['valid'])
+        self.assertEqual(st['obs'], 600)
+        self.assertEqual(st['duration_s'], 600)
+
+
+        """Survey-in 的状态源是 NAV-SVIN，必须真的把它的 MSGOUT 打开。
+
+        流程层用 `getattr(driver, 'enable_survey_status', None)` 探测，缺失时
+        **静默跳过**。真机踩过：方法不存在 → NAV-SVIN 速率恒 0 →
+        `survey_status()` 永远 `no_nav_svin` → SVIN_WAIT 干等 20 秒后报
+        "Survey-in 未收敛（0/600）"，看起来像信号问题，其实状态输出没开。
+
+        另外必须写在**当前链路的口**上：MSGOUT 键按端口分，写错口会安静 ACK。
+        """
+        written = []
+
+        def on_write(data):
+            data = bytes(data)
+            if data[2:4] == bytes(VALSET):
+                payload = data[6:6 + struct.unpack('<H', data[4:6])[0]]
+                for i in range(4, len(payload) - 4, 5):
+                    written.append((struct.unpack('<I', payload[i:i + 4])[0],
+                                    payload[i + 4]))
+            return _ack_ack()
+
+        drv, _ch, _s = make_f9p(on_write)
+        ok, message, data = drv.enable_survey_status(True, 1)
+        self.assertTrue(ok, message)
+        self.assertEqual(data['msg'], 'NAV-SVIN')
+
+        sv_keys = {K.lookup(n)[0]: n for n in
+                   ('NAVOUT_NAV_SVIN_I2C', 'NAVOUT_NAV_SVIN_UART1',
+                    'NAVOUT_NAV_SVIN_UART2', 'NAVOUT_NAV_SVIN_USB',
+                    'NAVOUT_NAV_SVIN_SPI')}
+        hit = [(sv_keys[k], v) for k, v in written if k in sv_keys]
+        self.assertTrue(hit, '没有写任何 NAV-SVIN 的 MSGOUT 键')
+        for name, value in hit:
+            self.assertEqual(value, 1, f'{name} 应写 1')
+        # 只写一个口，不是五个口全写
+        self.assertEqual(len(hit), 1, f'只应写当前链路口，实际写了 {hit}')
+
+        # 关闭走同一路径，值 0
+        written.clear()
+        ok, _message, _data = drv.enable_survey_status(False, 1)
+        self.assertTrue(ok)
+        hit = [(sv_keys[k], v) for k, v in written if k in sv_keys]
+        self.assertEqual([v for _n, v in hit], [0], '关闭应写 0')
+
+    def test_get_svin_config_provides_flow_field_names(self):
+        """`get_svin_config()` 必须同时给出流程层读取的字段名。
+
+        真机踩过两次，都是"写对了却判失败"：
+          ① `x/y/z` 没有 `ecef_x/y/z` → `_compare_fixed()` 全取到 None，
+             报"最大轴差 5028827 m"；`_revert()` 里还抛过
+             `float() argument must be ... not 'NoneType'`。
+          ② `svin_min_dur` 没有 `count` → `_svin_config_verified()` 判
+             `None != 600`，子收敛流程在 SVIN_CFG 就判失败并回滚，
+             而模块里 `TMODE_SVIN_MIN_DUR` 明明是 600。
+
+        这里钉死"两套名字都在、且值一致"，避免第三次。
+        """
+        mode_key = K.lookup('TMODE_MODE')[0]
+        pos_key = K.lookup('TMODE_POS_TYPE')[0]
+        dur_key = K.lookup('TMODE_SVIN_MIN_DUR')[0]
+        acc_key = K.lookup('TMODE_SVIN_ACC_LIMIT')[0]
+        x_key = K.lookup('TMODE_ECEF_X')[0]
+
+        answer = {
+            mode_key: struct.pack('<B', 1),            # survey_in
+            pos_key: struct.pack('<B', 0),
+            dur_key: struct.pack('<I', 600),
+            acc_key: struct.pack('<I', 30000),         # 原始 0.1mm → 3000 mm
+            x_key: struct.pack('<i', -2221810),        # cm
+        }
+
+        def on_write(data):
+            data = bytes(data)
+            if data[2:4] == bytes(VALGET):
+                payload = data[6:6 + struct.unpack('<H', data[4:6])[0]]
+                layer, keys = payload[1], [struct.unpack('<I', payload[i:i + 4])[0]
+                                           for i in range(4, len(payload) - 3, 4)]
+                body = bytearray([0x01, layer, 0x00, 0x00])
+                for key_id in keys:
+                    body += struct.pack('<I', key_id)
+                    body += answer.get(key_id, struct.pack('<I', 0))
+                return ubx_frame(*VALGET, bytes(body)) + _ack_ack()
+            return _ack_ack()
+
+        drv, _ch, _s = make_f9p(on_write)
+        ok, message, cfg = drv.get_svin_config()
+        self.assertTrue(ok, message)
+
+        # ① ECEF 两套名字
+        for alias in ('ecef_x', 'ecef_y', 'ecef_z'):
+            self.assertIn(alias, cfg, f'流程层要读 {alias}')
+        self.assertAlmostEqual(cfg['ecef_x'], -22218.10, places=2)
+        self.assertAlmostEqual(cfg['x'], cfg['ecef_x'])
+
+        # ② Survey-in 两套名字 + 单位
+        self.assertEqual(cfg['mode'], 'survey_in')
+        self.assertEqual(cfg['svin_min_dur'], 600)
+        self.assertEqual(cfg['count'], 600,
+                         '流程层 _svin_config_verified() 读的是 count')
+        self.assertAlmostEqual(cfg['svin_acc_limit_mm'], 3000.0)   # 物理 mm
+        self.assertAlmostEqual(cfg['acc'], 3.0)                    # 流程层口径：米
 
 
 class TestKeyTable(unittest.TestCase):
@@ -925,3 +1082,270 @@ class TestKeyTable(unittest.TestCase):
 if __name__ == '__main__':
     unittest.main(verbosity=2, exit=False)
     sys.exit(0)
+
+
+# ==================== 5. 端口维度（MSGOUT 键按口拆分） ====================
+class TestPortDimension(unittest.TestCase):
+    """**MSGOUT 键是分端口的**，这一节钉死这个事实。
+
+    驱动早期的 bug：一律写 `_UART1` 后缀键。真机链路其实是 USB CDC
+    （COM12 = VID:PID 1546:01A9），模块对写错的端口**照样回 ACK**，
+    但 USB 口上的 NAV-PVT/NAV-SAT 一个字节没少 —— 症状是"关不掉输出"，
+    而日志里全绿，极难从现象反推。
+    """
+
+    def test_port_suffix_table_matches_offsets(self):
+        """端口偏移固定：I2C → UART1 → UART2 → USB → SPI，逐个 +1。"""
+        for name, ids in K.NAV_OUT_PORTS.items():
+            seq = [ids[p] for p in ('I2C', 'UART1', 'UART2', 'USB', 'SPI')]
+            self.assertNotIn(None, seq, name)
+            self.assertEqual(seq, [seq[0] + i for i in range(5)], f'{name} 端口 ID 不连续')
+
+    def test_zda_uart1_is_not_i2c_plus_one_typo(self):
+        """`ZDA` 的 UART1 曾抄成 0x209100D7（那是 `GST` 的 SPI 位）。
+
+        权威序列是 I2C 0xd8 / UART1 0xd9 / UART2 0xda / USB 0xdb / SPI 0xdc。
+        抄错的后果：写下去的速率作用在别的报文上，ZDA 永远关不掉。
+        """
+        self.assertEqual(K.lookup_msgout('NMEA', 'ZDA', 'UART1'), 0x209100D9)
+        self.assertEqual(K.lookup_msgout('NMEA', 'ZDA', 'I2C'), 0x209100D8)
+
+    def test_full_msgout_coverage(self):
+        """三族的条数必须与固件一致：NAV 40 / RXM 18 / NMEA 15。"""
+        self.assertEqual(len(K.NAV_OUT_PORTS), 40)
+        self.assertEqual(len(K.RXM_OUT_PORTS), 18)
+        self.assertEqual(len(K.NMEA_OUT_PORTS), 15)
+
+    def test_missing_port_key_is_none_not_zero(self):
+        """`None` 表示"固件里没这个键"，**绝对不是**"值是 0"。
+
+        RXM-MEAS20/50/MEASC12/MEASD12 只给了 I2C/UART1/SPI 三个口。
+        把 None 当 0 去写，写的是一个不存在的键 —— 要么 NAK 要么静默。
+        """
+        for name in ('MEAS20', 'MEAS50', 'MEASC12', 'MEASD12'):
+            self.assertIsNone(K.lookup_msgout('RXM', name, 'USB'), name)
+            self.assertIsNone(K.lookup_msgout('RXM', name, 'UART2'), name)
+            self.assertIsNotNone(K.lookup_msgout('RXM', name, 'UART1'), name)
+
+    def test_port_key_appends_correct_suffix(self):
+        drv, _ch, _s = make_f9p()
+        self.assertEqual(drv._port_key('NAVOUT_NAV_PVT', 'UART1'), 'NAVOUT_NAV_PVT_UART1')
+        self.assertEqual(drv._port_key('NAVOUT_NAV_PVT', 'USB'), 'NAVOUT_NAV_PVT_USB')
+        self.assertEqual(drv._port_key('NAVOUT_NAV_PVT', 'UART2'), 'NAVOUT_NAV_PVT_UART2')
+        self.assertEqual(drv._port_key('NAVOUT_NAV_PVT', 'I2C'), 'NAVOUT_NAV_PVT_I2C')
+        self.assertEqual(drv._port_key('NAVOUT_NAV_PVT', 'SPI'), 'NAVOUT_NAV_PVT_SPI')
+        # RTCM 键没有端口维度，原样返回
+        self.assertEqual(drv._port_key('RTCM_1005', 'USB'), 'RTCM_1005')
+        with self.assertRaises(F9P.DriverBug):
+            drv._port_key('NAVOUT_NAV_PVT', 'COM9')
+
+    def test_every_port_key_resolves_to_real_id(self):
+        """`_port_key()` 拼出来的名字必须都能在键表里查到真 ID。
+
+        查不到就说明拼错了（比如少了 `NAV_` 前缀），`silence_outputs()`
+        会静默跳过这条 —— 表现又是"关不掉"。
+        """
+        drv, _ch, _s = make_f9p()
+        for prefix, table, np in (('NAVOUT_', K.NAV_OUT_PORTS, 'NAV_'),
+                                  ('RXMOUT_', K.RXM_OUT_PORTS, 'RXM_'),
+                                  ('NMEAMOUT_', K.NMEA_OUT_PORTS, '')):
+            for name, ids in table.items():
+                for port, key_id in ids.items():
+                    if key_id is None:
+                        continue
+                    full = drv._port_key(f'{prefix}{np}{name}', port)
+                    rec = K.lookup(full)
+                    self.assertIsNotNone(rec, f'{full} 查不到')
+                    self.assertEqual(rec[0], key_id, full)
+
+
+class TestDetectPort(unittest.TestCase):
+    """`detect_port()` 用 MON-COMMS 问模块"你在哪个口跟我说话"。"""
+
+    @staticmethod
+    def _comms_payload(port_stats):
+        """造一条 MON-COMMS：port_stats = {portId: [msgs_rx, msgs_tx, ...]}。"""
+        n = 5
+        head = bytes([0x00, 0x00, n, 0x00, 0x00])
+        recs = b''
+        for pid in range(n):
+            rec = bytearray(40)
+            rec[0] = pid
+            counts = port_stats.get(pid, [0, 0, 0, 0])
+            for i, c in enumerate(counts[:4]):
+                rec[24 + i * 2: 26 + i * 2] = int(c).to_bytes(2, 'little')
+            recs += bytes(rec)
+        return head + recs
+
+    def test_picks_port_with_traffic(self):
+        """只有 USB 口有收发，就必须认成 USB。"""
+        payload = self._comms_payload({3: [10, 20, 0, 0]})
+        got = F9P.ZEDF9PDriver._active_port_from_comms(payload)
+        self.assertEqual(got, 3, 'portId 3 = USB')
+
+    def test_prefers_uart1_when_that_has_traffic(self):
+        payload = self._comms_payload({1: [5, 5, 0, 0]})
+        self.assertEqual(F9P.ZEDF9PDriver._active_port_from_comms(payload), 1,
+                         'portId 1 = UART1')
+
+    def test_rejects_garbage(self):
+        """长度不对 / nPorts 离谱的载荷必须拒掉，不能瞎猜。"""
+        self.assertIsNone(F9P.ZEDF9PDriver._active_port_from_comms(b'\x00\x00\x00'))
+        self.assertIsNone(F9P.ZEDF9PDriver._active_port_from_comms(
+            bytes([0x00, 0x00, 0xFF, 0])))
+        self.assertIsNone(F9P.ZEDF9PDriver._active_port_from_comms(b''))
+
+    def test_name_fallback_when_no_comms(self):
+        """问不到 MON-COMMS 时按口名兜底，并如实标 `source='name'`。
+
+        `COM*` 无从知道背后是 USB 还是 UART，但 F9P 模块自带的 USB 接上电脑
+        是最常见的情形，认成 USB 的期望收益最高。来源必须标出来，
+        免得调用方以为这是模块给的确定答案。
+        """
+        drv, _ch, _s = make_f9p()
+        drv.channel.port = 'COM12'
+        port, _msg, data = drv.detect_port()
+        self.assertEqual(port, 'USB')
+        self.assertEqual(data['source'], 'name')
+
+    def test_detect_port_caches(self):
+        drv, _ch, _s = make_f9p()
+        drv._port = 'UART1'
+        _p, _m, data = drv.detect_port()
+        self.assertEqual(data['source'], 'cache')
+        self.assertEqual(drv._port, 'UART1')
+
+
+class TestUsbLinkHasNoBaud(unittest.TestCase):
+    """USB CDC 没有波特率。绝不能因为链路是 USB 就去写 `UART1_BAUDRATE` ——
+    那样 UART1 那个真实物理口会被悄悄改成别的速度，接电台时直接不通。"""
+
+    def test_baud_key_is_none_on_usb(self):
+        drv, _ch, _s = make_f9p()
+        drv._port = 'USB'
+        self.assertIsNone(drv._baud_key())
+
+    def test_baud_key_uart1_and_uart2(self):
+        drv, _ch, _s = make_f9p()
+        drv._port = 'UART1'
+        self.assertEqual(drv._baud_key(), 'UART1_BAUDRATE')
+        drv._port = 'UART2'
+        self.assertEqual(drv._baud_key(), 'UART2_BAUDRATE')
+
+    def test_read_uart_reports_usb_honestly(self):
+        drv, _ch, _s = make_f9p()
+        drv._port = 'USB'
+        ok, _msg, data = drv.read_uart()
+        self.assertTrue(ok)
+        self.assertEqual(data['port'], 'USB')
+        self.assertIsNone(data['baud'], 'USB 口不能编一个波特率出来')
+        self.assertIn('note', data)
+
+    def test_set_baud_refuses_on_usb(self):
+        drv, _ch, _s = make_f9p()
+        drv._port = 'USB'
+        ok, _msg, data = drv.set_baud(115200)
+        self.assertFalse(ok)
+        self.assertEqual(data['error'], 'unsupported')
+
+    def test_get_baud_refuses_on_usb(self):
+        drv, _ch, _s = make_f9p()
+        drv._port = 'USB'
+        ok, _msg, data = drv.get_baud()
+        self.assertFalse(ok)
+        self.assertEqual(data['error'], 'unsupported')
+
+
+class TestSilenceOutputs(unittest.TestCase):
+    """`silence_outputs()` 必须真的往"链路所在的那个口"写 0。
+
+    用能回 VALGET 的假模块：真 F9P 上 VALSET 的 ACK 只代表"消息收下了"，
+    不代表值换了，所以驱动在写 0 之前先 VALGET 一遍现状（只有真开着的才写，
+    省 Flash 擦写），写完再 VALGET 一遍确认。假模块不回 VALGET 的话，
+    这一步直接 timeout 返回 False —— 本用例的价值就在这里。
+    """
+
+    def _open_all(self, *keys):
+        """把指定的键先置成"开着"（=1），这样 silence 才有东西可关。"""
+        return {K.lookup(k)[0]: 1 for k in keys if K.lookup(k)}
+
+    def test_defaults_to_detected_port_not_uart1(self):
+        drv, _ch, _s = make_f9p_with_valget(
+            self._open_all('NMEAMOUT_GGA_USB', 'NMEAMOUT_GSV_USB',
+                           'NAVOUT_NAV_PVT_USB'))
+        drv._port = 'USB'
+        ok, msg, data = drv.silence_outputs(persist=False)
+        self.assertTrue(ok, msg)
+        self.assertEqual(data['ports'], ['USB'])
+        # `_port` 已缓存时 detect_port() 返回 source='cache'，不是 'explicit'：
+        # 'explicit' 只在调用方显式传 ports 时出现。
+        self.assertEqual(data['port_source'], 'cache')
+        self.assertIn('NMEAMOUT_GGA_USB', data['turned_off'])
+        self.assertIn('NAVOUT_NAV_PVT_USB', data['turned_off'])
+        # **绝不能**碰 UART1 的键：那是另一个物理口，可能接着电台
+        self.assertEqual([k for k in data['turned_off'] if k.endswith('_UART1')], [])
+
+    def test_keep_skips_that_message(self):
+        drv, _ch, _s = make_f9p_with_valget(
+            self._open_all('NMEAMOUT_GGA_USB', 'NAVOUT_NAV_PVT_USB',
+                           'NAVOUT_NAV_SVIN_USB'))
+        drv._port = 'USB'
+        ok, msg, data = drv.silence_outputs(keep=('NAV_PVT', 'GGA'), persist=False)
+        self.assertTrue(ok, msg)
+        written = [k for k in data['turned_off'] if 'NAVOUT_NAV_PVT' in k]
+        self.assertEqual(written, [], 'NAV_PVT 在 keep 里，不该被关')
+        self.assertEqual([k for k in data['turned_off'] if 'NMEAMOUT_GGA' in k], [])
+        self.assertIn('NAVOUT_NAV_SVIN_USB', data['turned_off'])
+        self.assertIn('NMEAMOUT_GGA_USB', data['kept'])
+        self.assertIn('NAVOUT_NAV_PVT_USB', data['kept'])
+
+    def test_already_off_not_counted_as_turned_off(self):
+        """本来就是 0 的键不能算"关掉了"，否则用户以为白折腾一场。"""
+        drv, _ch, _s = make_f9p_with_valget(self._open_all('NMEAMOUT_GGA_USB'))
+        drv._port = 'USB'
+        ok, msg, data = drv.silence_outputs(persist=False)
+        self.assertTrue(ok, msg)
+        self.assertIn('NMEAMOUT_GGA_USB', data['turned_off'])
+        self.assertIn('NAVOUT_NAV_PVT_USB', data['already_off'])
+
+    def test_bad_port_raises(self):
+        drv, _ch, _s = make_f9p_with_valget()
+        with self.assertRaises(F9P.DriverBug):
+            drv.silence_outputs(ports=('COM9',), persist=False)
+
+
+# ==================== 6. 假模块：能回 VALGET 的最小实现 ====================
+def make_valget_answer(request_payload, values=None):
+    """按一条 VALGET 请求造对应的应答帧。
+
+    `values` = {key_id: 当前速率}，缺省一律回 0（"本来就是关的"）。
+    U1 类型的键回 1 字节。
+    """
+    layer = request_payload[1]
+    keys = [struct.unpack('<I', request_payload[i:i + 4])[0]
+            for i in range(4, len(request_payload) - 3, 4)]
+    body = bytearray([0x01, layer, 0x00, 0x00])
+    for key_id in keys:
+        body += struct.pack('<I', key_id)
+        body += bytes([(values or {}).get(key_id, 0) & 0xFF])
+    return ubx_frame(*VALGET, bytes(body))
+
+
+def make_f9p_with_valget(initial=None):
+    """假模块：VALSET 回 ACK，VALGET 回一条带当前值的应答。"""
+    state = dict(initial or {})
+
+    def on_write(data):
+        data = bytes(data)
+        if data[2:4] == bytes(VALGET):
+            payload = data[6:6 + struct.unpack('<H', data[4:6])[0]]
+            return make_valget_answer(payload, state) + _ack_ack()
+        if data[2:4] == bytes(VALSET):
+            payload = data[6:6 + struct.unpack('<H', data[4:6])[0]]
+            for i in range(4, len(payload) - 4, 5):
+                key_id = struct.unpack('<I', payload[i:i + 4])[0]
+                state[key_id] = payload[i + 4]
+            return _ack_ack()
+        return _ack_ack()
+
+    return make_f9p(on_write)

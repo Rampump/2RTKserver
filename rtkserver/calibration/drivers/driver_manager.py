@@ -89,23 +89,30 @@ def get_driver_by_id(model_key, channel=None):
 
 
 def list_supported_modules():
-    """返回按双模/单模分组的型号元数据，供前端渲染下拉框与能力灰化。
+    """返回按角色分组的型号元数据，供前端渲染下拉框与能力灰化。
 
     结构：
         {
-          'dual_mode':   [ {...}, ... ],
-          'single_mode': [ {...}, ... ],
-          'all':         [ ... ]
+          'dual_mode':     [ {...}, ... ],   # 双模：4 种方式全支持
+          'single_mode':   [ {...}, ... ],   # 单模（仅基准站）：自收敛 + 写已知坐标
+          'rover_mode':    [ {...}, ... ],   # 流动站：仅测量
+          'all':           [ ... ]
         }
-    每项：id / name / match_prefix / dual_mode / caps / command_count /
-          bauds / set_bauds / default_baud / baud_cmd
+    每项：id / name / match_prefix / role / role_label / methods / dual_mode /
+          caps / command_count / bauds / set_bauds / default_baud / baud_cmd
+
+    **新增的 `role` / `role_label` / `methods` 是前端唯一该看的三个字段。**
+    `dual_mode` 保留只为兼容：它是 `role == 'dual'` 的旧写法，两者在所有
+    内置型号上一致，但含义不如 `methods` 精确 —— 「单模」和「流动站」
+    的 `dual_mode` 都是 False，光看它分不出这两种。
+
     `bauds` 是**自动探测顺序**：`default_baud` 打头、其余降序；
     `set_bauds` 是**合法取值全集**（降序），两者可能不同 ——
     LC29H(BS) 的 3000000 是 UART2 的档，不进探测序列但仍可手动设置。
     前端用 `bauds[0]` 做"优先试哪一档"的提示，用 `set_bauds` 判手填值合不合法。
     """
     load_builtin_drivers()
-    dual, single = [], []
+    dual, single, rover, all_items = [], [], [], []
     for model_key, driver_class in sorted(_REGISTRY.items()):
         # 隐藏型号不进前端下拉（HIDDEN=True，例：双天线定向板不适合做基准站）。
         # 注册表里仍保留，历史记录回填 / 手工指定型号照常能加载。
@@ -113,10 +120,18 @@ def list_supported_modules():
             continue
         # 借一个空实例走 bauds()，保证"默认档打头 + 其余降序 + 去重"这套规则只有一处实现
         probe = driver_class(None)
+        role = probe.role()
         item = {
             'id': model_key,
             'name': getattr(driver_class, 'DISPLAY_NAME', model_key),
             'match_prefix': getattr(driver_class, 'MATCH_PREFIX', ''),
+            # ---------- 前端真正要用的三个字段 ----------
+            'role': role,
+            'role_label': probe.role_label(),
+            # 该型号支持的标定方式（规范键）。前端按它显示/灰化四张卡，
+            # 后端 start_* 用同一张表判定 —— 两边永远一致。
+            'methods': list(probe.methods()),
+            # ---------- 兼容字段 ----------
             'dual_mode': bool(getattr(driver_class, 'DUAL_MODE', False)),
             # 拷一份，防止前端拿到的 dict 被后续改动污染注册表
             'caps': dict(getattr(driver_class, 'CAPS', {}) or {}),
@@ -132,8 +147,36 @@ def list_supported_modules():
             'default_baud': int(getattr(driver_class, 'DEFAULT_BAUD', 115200)),
             'baud_cmd': getattr(driver_class, 'BAUD_CMD_KEY', ''),
         }
-        (dual if item['dual_mode'] else single).append(item)
-    return {'dual_mode': dual, 'single_mode': single, 'all': dual + single}
+        all_items.append(item)
+        if role == 'dual':
+            dual.append(item)
+        elif role == 'single':
+            single.append(item)
+        else:
+            rover.append(item)
+    return {'dual_mode': dual, 'single_mode': single, 'rover_mode': rover,
+            'all': all_items}
+
+
+def role_of(model_key):
+    """型号键 → 角色（'dual'/'single'/'rover'）；未知型号返回 'rover'。
+
+    未知 = 按流动站处理，这是需求里定的默认：不知道它有什么命令，
+    但只要能吐 NMEA 就能被 CORS 测出坐标。**不能返回 'dual'** ——
+    那会让界面显示"一键固定"，点下去必然在切模式那一步失败。
+    """
+    driver = get_driver_by_id(model_key)
+    if driver is None:
+        return 'rover'
+    return driver.role()
+
+
+def methods_of(model_key):
+    """型号键 → 支持的标定方式元组；未知型号 = ('external_rover',)。"""
+    driver = get_driver_by_id(model_key)
+    if driver is None:
+        return ('external_rover',)
+    return driver.methods()
 
 
 def match_driver(channel, only=None, timeout=None):

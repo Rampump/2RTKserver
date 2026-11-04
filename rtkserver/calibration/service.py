@@ -38,9 +38,9 @@ import time
 
 from ..core import state
 from . import backup as backup_mod
-from . import store, workspace
+from . import scanner, store, workspace
 from .drivers import driver_manager
-from .drivers.base import DriverBug, frame
+from .drivers.base import DriverBug, frame, _normalize_method
 from .geo import ecef_to_geodetic, max_axis_delta
 from .lease import SerialLease, leftover_lease
 from .proto.rtcm import decode_frame
@@ -196,6 +196,131 @@ class CalibrationService:
         self._stage_at = ''
         self._last_persist = 0.0
         self._persist_interval = 1.0
+
+        # ---------- 串口扫描的独立状态 ----------
+        # 刻意与标定任务分开存：扫描不是标定，不能占用 `_task` / `_stage`
+        # （那会让页面上的"当前任务"显示一个根本没在跑的标定），
+        # 也不能受租约看门狗管辖（它不发命令、不写 NVM，没有"卡死"这种后果）。
+        self._scan_lock = threading.RLock()
+        self._scan_thread = None
+        self._scan_id = ''
+        self._scan_state = {}
+
+    # ---------- 串口扫描（只做判定，不做决断） ----------
+    def scan_ports(self, ports=None, bauds=None, active=True, task_id=None):
+        """扫描串口并判定"是不是 GNSS 模块家族"。
+
+        **与标定任务完全独立**：它不发配置命令、不取租约、不碰租约看门狗。
+        唯一要小心的是串口独占 —— 所以要扫描的串口如果正被标定任务或
+        数据面占着，`probe_passive` 会打不开，如实报 `family='busy'`，
+        而不是把别人的数据判成"没有模块"。
+
+        扫完不自动选口、不自动切型号 —— 结果原样推给前端。
+
+        返回 `(ok, message, payload)`。真正的扫描在后台线程里跑，
+        `payload` 里带 `scan_id`，前端轮询 `scan_status()` 拿进度与结果。
+        """
+        with self._scan_lock:
+            if self._scan_thread is not None and self._scan_thread.is_alive():
+                return False, '已有串口扫描在进行，请等它结束', self.scan_status()
+            if self._thread is not None and self._thread.is_alive():
+                # 标定正在占串口。允许扫描会让两边都读到半帧、互相判错，
+                # 比"请稍后再扫"糟糕得多。
+                return False, '标定任务正在进行，串口被占用，无法扫描。请先等任务结束或取消', \
+                    self.scan_status()
+
+            self._scan_id = task_id or f'scan_{int(time.time() * 1000)}'
+            self._scan_state = {
+                'scan_id': self._scan_id,
+                'started_at': time.strftime('%H:%M:%S'),
+                'finished_at': '',
+                'running': True,
+                'progress': [],
+                'ports': [],
+                'error': '',
+                'summary': {},
+            }
+            targets = list(ports or [])
+            arg_bauds = list(bauds or [])
+            arg_active = bool(active)
+
+            def worker():
+                try:
+                    listing = scanner.list_ports()
+                    panel = targets or [item['device'] for item in listing]
+                    progress = []
+
+                    def on_progress(event):
+                        # 只留最近 40 条：一次扫 10 个口 × 9 档就是 90 条，
+                        # 全留着推给前端毫无用处，还会把响应撑到几十 KB。
+                        progress.append(event)
+                        del progress[:-40]
+
+                    results = scanner.scan(panel, bauds=arg_bauds or None,
+                                           active=arg_active, on_progress=on_progress)
+                    byte_count = {}
+                    for item in listing:
+                        byte_count[item['device']] = item
+                    merged = []
+                    for item in results:
+                        meta = byte_count.get(item['port']) or {}
+                        merged.append(dict(item, description=meta.get('description', ''),
+                                           vid=meta.get('vid', ''), pid=meta.get('pid', ''),
+                                           serial_number=meta.get('serial_number', ''),
+                                           # `kind` 由 scanner.scan() 已经填好（uart/bridge/usb-cdc），
+                                           # 这里只在老路径上兜底，不要覆盖扫描器的判断。
+                                           kind=item.get('kind') or meta.get('kind', 'uart')))
+                    hits = [item for item in merged if item.get('family') == 'gnss']
+                    with self._scan_lock:
+                        self._scan_state.update({
+                            'running': False,
+                            'finished_at': time.strftime('%H:%M:%S'),
+                            'ports': merged,
+                            'progress': progress,
+                            # 摘要只统计，不表态：`hits` 是"读到了 GNSS 数据"的口，
+                            # 到底用哪个、是不是目标模块，由用户点。
+                            'summary': {
+                                'total': len(merged),
+                                'gnss': len(hits),
+                                'ports': [item['port'] for item in hits],
+                                # 需要用户复核波特率的口：扫出来有多档都能对上，
+                                # 或者扫到的档位没有校验位撑腰（confidence != high）。
+                                # 只是个提示清单，不代表这些口不能用。
+                                'verify': [item['port'] for item in hits
+                                           if (item.get('confidence') or 'low') != 'high'],
+                                # 没有波特率概念的口（USB 直连 CDC）。
+                                'rate_free': [item['port'] for item in merged
+                                              if item.get('baud_fixed') is False],
+                            },
+                        })
+                except Exception as e:                # noqa: BLE001 - 扫描失败不能拖垮服务
+                    logging.exception('串口扫描失败')
+                    with self._scan_lock:
+                        self._scan_state.update({
+                            'running': False,
+                            'finished_at': time.strftime('%H:%M:%S'),
+                            'error': f'{type(e).__name__}: {e}',
+                        })
+
+            thread = threading.Thread(target=worker, name='calibration-scan', daemon=True)
+            self._scan_thread = thread
+            thread.start()
+        return True, f'开始扫描 {len(ports) if ports else "全部"} 个串口', self.scan_status()
+
+    def scan_status(self):
+        """扫描进度与结果快照。永远不抛异常。"""
+        with self._scan_lock:
+            state = dict(self._scan_state or {})
+            state['running'] = bool(self._scan_thread is not None
+                                    and self._scan_thread.is_alive())
+            # 顺便把当前系统的串口清单带上：页面初次加载时要用它填下拉框，
+            # 不必等一次完整扫描。
+            try:
+                state['available'] = scanner.list_ports()
+            except Exception as e:                    # noqa: BLE001
+                logging.debug(f'列举串口失败（忽略）：{e}')
+                state['available'] = []
+            return state
 
     # ---------- 对外快照 ----------
     def status(self):
@@ -489,7 +614,7 @@ class CalibrationService:
             # 未指定型号时放行：未知模块完全可能就是一台现成的流动站，
             # 那正是这条路径存在的主要理由。
             info = _module_caps(module)
-            if info and info['command_count'] > 0 and not info['caps'].get('dual_mode'):
+            if info and _has_command_set(info) and not info['caps'].get('dual_mode'):
                 return False, (
                     f'{info["name"]} 是单基准站模块，没有流动站模式，'
                     f'无法接收 CORS 差分数据测量天线坐标。请改用「Survey-in 自收敛」'
@@ -638,7 +763,28 @@ class CalibrationService:
         if driver is not None:
             return driver, message, attempts, ''
 
-        # ① 型号不符：换其余候选再问一次（跳过刚失败的那个，省一轮超时）
+        # 注意顺序：**先换档、再验型号**。反过来会白烧几十秒，原因是物理层的：
+        # 波特率不对时，模块对我们的每一条命令都不应答 —— 其它型号的驱动
+        # 放在这个档位上问也一样是"没应答"，一个都认不出来。
+        # 真机实测（COM3 / LG290P 实际 115200 / 用户选了 lg290p）：
+        #   先验型号 → 6 个驱动 × 约 7.5s = 45s，全军覆没，才开始换档；
+        #   而第一档 115200 一上去 0.2s 就认出来了。
+        # 也就是说那 45 秒完全是白等，还顺带把 30 秒看门狗踩了。
+        #
+        # ① 波特率不对：换档重开串口再识别（现场最常见的失败原因，优先做）
+        if allow_baud_scan:
+            found = self._scan_bauds(lease, only)
+            if found is not None:
+                found_driver, found_baud = found
+                # 换对档位后，型号已由 `_scan_bauds` 里的 `only` 直接确认，
+                # 不需要再拿别的驱动试一遍。
+                return found_driver, f'{found_driver.DISPLAY_NAME}（{found_baud} 波特率识别）', \
+                    attempts, f'已自动把波特率改为 {found_baud}'
+
+        # ② 型号不符：在**当前档位**上换其余候选再问一次（跳过刚失败的那个）。
+        # 走到这里说明波特率没救（要么用户手填了显式值不允许扫，要么全档位都没应答），
+        # 此时"认错型号"才是剩下的可能原因，问一遍是值得的 —— 能直接告诉用户
+        # "你选错了，实际是 X"，比笼统报"识别失败"有用得多。
         others = [key for key in driver_manager.supported_driver_ids()
                   if not only or key not in only]
         if only and others:
@@ -650,14 +796,6 @@ class CalibrationService:
                     f'模块型号与所选不符：你选的是「{only[0]}」，实际检测到「{alt.DISPLAY_NAME}」'
                     f'（{_alt_message}）。请把「模块型号」改成 {alt.DISPLAY_NAME} 后重试，'
                     f'或直接选「自动探测」')
-
-        # ② 波特率不对：换档重开串口再识别
-        if allow_baud_scan:
-            found = self._scan_bauds(lease, only)
-            if found is not None:
-                found_driver, found_baud = found
-                return found_driver, f'{found_driver.DISPLAY_NAME}（{found_baud} 波特率识别）', \
-                    attempts, f'已自动把波特率改为 {found_baud}'
 
         # ③ 都不成立：返回 None 由调用方决定（只测不写可以退化到 PassiveDriver，
         #    其它任务必须失败）。文案在这里拼好，避免上层再猜一遍病因。
@@ -693,6 +831,9 @@ class CalibrationService:
         for baud in self._baud_candidates(only, current=original, remembered=remembered):
             if int(baud) == int(original):
                 continue
+            # 每档都喂心跳：单档识别最坏 2.0s×4 + 间隔 ≈ 9s，四档就 36s，
+            # 超过看门狗的 30s 阈值。缺这一行 = 换档慢一点就被误判线程已死。
+            self._keepalive()
             self._set_stage('DETECT', f'识别失败，改用 {baud} 波特率重试')
             try:
                 channel.close()
@@ -704,11 +845,15 @@ class CalibrationService:
                 logging.debug(f'以 {baud} 重开串口失败：{e}')
                 continue
             driver, message, _attempts = driver_manager.match_driver(channel, only=only)
+            self._keepalive()        # 上一步最坏 9 秒，回来先喂一次再决定
             if driver is not None:
                 lease.baud = int(baud)
                 self._result['baud_switched'] = {'from': original, 'to': int(baud)}
                 logging.warning(f'识别时自动切换波特率 {original} → {baud}：{message}')
-                self._warn(f'已自动把波特率从 {original} 改为 {baud}（模块在这个档位才有应答）')
+                # 只记结果，不在这里起线程/发事件：`_scan_bauds` 在识别阶段，
+                # `self._result` 是唯一公共出口（与 `_set_stage` 同一条写入路径）。
+                self._result.setdefault('warnings', []).append(
+                    f'已自动把波特率从 {original} 改为 {baud}（模块在这个档位才有应答）')
                 return driver, int(baud)
             logging.debug(f'{baud} 波特率下仍未识别到模块')
 
@@ -749,22 +894,25 @@ class CalibrationService:
                     out.append(n)
             return out
 
+        # 优先级：手填值（current）> 上次回读值（remembered）> 官方档位表。
+        #
+        # `current` 是**用户这一轮亲口说的**，无论它是不是官方档位都要第一位：
+        # 现场模块可能被刷过固件 / 改过 CONFIG COM1 / 工程上约定用非标值，
+        # 把它排到后面等于先花四五轮超时再回到用户早说过的话。
+        #
+        # `remembered` 是**这台设备上次模块自己报的**，排在 `current` 之后、
+        # 官方档位之前。它是实测过的答案，比按文档押注准；但用户刚刚改过手填值
+        # 就说明"上次那个已经不是现在这个"，不能压过用户的当场输入。
+        # （真机吃过亏：remembered=115200 排在 460800 后，每次先白试一轮最高档。
+        #   这个坑靠"排在官方档位前面"就够了，不需要压过 current。）
         head = []
-        try:
-            if current and int(current) > 0:
-                head = [int(current)]
-        except (TypeError, ValueError):
-            head = []
-
-        # 这台设备上次**回读**到的波特率，紧跟在用户手填值后面。
-        # 现场事实 > 文档推断：模块被刷过固件、改过 CONFIG COM1 之后，
-        # 它跑的那一档未必还是厂商示例里那个值。这里记的是"模块亲口说的"，
-        # 优先级自然高于后面那张厂商档位表。
-        try:
-            if remembered and int(remembered) > 0 and int(remembered) not in head:
-                head.append(int(remembered))
-        except (TypeError, ValueError):
-            pass
+        for value in (current, remembered):
+            try:
+                n = int(value)
+            except (TypeError, ValueError):
+                continue
+            if n > 0 and n not in head:
+                head.append(n)
 
         if only:
             merged = []
@@ -914,6 +1062,11 @@ class CalibrationService:
     def _run_diagnose(self, driver, lease, task):
         self._set_stage('OBSERVE', f'只读读取 {driver.DISPLAY_NAME} 的配置')
         report = self._diagnose(driver, lease, task['seconds'])
+        # 识别阶段的警告（典型：自动切了波特率）在 `self._result` 里，而
+        # `_diagnose` 一开始就地重建了 `report['warnings']`，不接过来就会丢。
+        for item in self._carry_warnings():
+            if item not in report['warnings']:
+                report['warnings'].append(item)
 
         self._set_stage('PLAN', '汇总判定')
         report['summary'] = _summarize(report)
@@ -921,7 +1074,42 @@ class CalibrationService:
         self._record_events('DONE', report)
         return report
 
+    def _keepalive(self):
+        """在"阶段不变、但耗时可能超过看门狗阈值"的循环里喂一次心跳。
+
+        看门狗按 `state.calibration_beat` 判活，30 秒不动就强制放开串口。
+        而 `_set_stage` 只在**阶段变化**时 `beat(force=True)`；同阶段内重复调用
+        只会走节流分支（`lease.beat()`，2 秒内不重复写）—— 也就是说
+        "同一阶段的第 N 次循环"根本没有心跳。
+
+        真机上就是这样翻车的：LG290P 上次回读是 460800，这次实际在 115200，
+        逐档扫描 460800→921600→230400→115200 每档约 9 秒（识别档 2s×4 次重试），
+        第 30 秒看门狗把租约收了，而此时第 115200 档刚刚识别成功。
+        用户看到的是"识别失败"，日志里却明明白白写着"识别到 LG290P"。
+
+        所以扫描循环每轮都要显式喂一次。故意**不**开独立心跳线程：
+        工作线程真卡死时这里也不会被执行，看门狗照样生效（lease.py 顶部契约）。
+        """
+        lease = self._lease
+        if lease is not None and lease.is_held:
+            lease.beat()
+        else:
+            logging.warning(f'[DIAG] _keepalive 跳过：lease={lease is not None} '
+                            f'held={getattr(lease, "held", None)}')
+
     # ---------- 任务二/三：P1 写入 / 还原 ----------
+    def _carry_warnings(self):
+        """取走识别阶段（`_scan_bauds` 等）记在 `self._result` 里的警告。
+
+        用「取走」而不是「读」：`_run_diagnose` 会整体重建 `self._result`，
+        `_run_write` 最后也会用 writer 的结果覆盖它 —— 不摘掉就会在收尾时
+        被丢一次，或者同一句话在页面上出现两遍。
+        """
+        items = list((self._result or {}).get('warnings') or [])
+        if self._result:
+            self._result['warnings'] = []
+        return items
+
     def _run_write(self, driver, lease, task):
         """写入链路的外壳：备份 → 交给 writer 跑 8 步 → 落库。
 
@@ -931,6 +1119,13 @@ class CalibrationService:
         """
         plan = task['plan']
         is_restore = task.get('action') == 'restore'
+        # 识别阶段产生的警告（典型：自动切了波特率）要跟着 plan 走一段，
+        # 否则 `plan.summary()` / 落库摘要里都不会出现「已自动改为 X」——
+        # 用户只看到"当前波特率 460800"，不知道是自己填的还是程序挑的。
+        for item in self._carry_warnings():
+            if item not in plan.warnings:
+                plan.warnings.append(item)
+
         # 只测不写：模块可能是别人的流动站、也可能是没有命令集的未知模块，
         # 备份要发 12 条查询命令，对未知模块全是 2 秒超时，纯浪费时间；
         # 而且"没有写入"就不需要备份。
@@ -951,7 +1146,9 @@ class CalibrationService:
             }
             lease.set_module(model=info.get('display_name'), firmware=info.get('firmware'),
                              sn=info.get('sn'))
-            self._save_profile(driver, info, uart)
+            self._save_profile(driver, info, uart, port=lease.port or '',
+                               baud=getattr(plan, 'baud', 0) or 0,
+                               method=getattr(plan, 'method', '') or '')
         else:
             # 读不到身份仍然允许写（现场常见：用户就是要覆盖一块读不出 SN 的模块），
             # 只是记录里会缺 SN/固件 —— 必须告诉用户，否则以后按 SN 查历史会查不到。
@@ -1008,6 +1205,10 @@ class CalibrationService:
             on_stage=self._writer_stage,
             checkpoint=self._checkpoint,
             on_record=self._save_record,
+            # 写链路内部有些驱动调用一卡就是几十秒（F9P 的 VALSET 等 ACK 超时重试），
+            # 而 `on_stage` 只在阶段名变化时才喂心跳。把 `_keepalive` 直接递进去，
+            # 让它在那些"同一阶段内可能阻塞很久"的地方自己喂。
+            on_beat=self._keepalive,
             rtcm_timeout=task.get('rtcm_timeout') or DEFAULT_RTCM_TIMEOUT,
             rtcm_samples=DEFAULT_RTCM_SAMPLES,
             task_id=self._task_id,
@@ -1176,7 +1377,8 @@ class CalibrationService:
                 report['module']['uart'] = uart
             lease.set_module(model=info.get('display_name'),
                              firmware=info.get('firmware'), sn=info.get('sn'))
-            self._save_profile(driver, info, uart)
+            self._save_profile(driver, info, uart, port=lease.port or '',
+                               baud=(uart or {}).get('baud') or 0)
         else:
             warn(f'读取模块信息失败：{message}')
             report['module'] = {'display_name': driver.DISPLAY_NAME,
@@ -1302,25 +1504,29 @@ class CalibrationService:
         而且只要一条查询。把它记进 module_profiles 之后，下次连同一台设备
         就能把这一档排到候选表最前面，不必从 115200 一档档往上试。
         """
-        reader = getattr(driver, 'read_uart', None)
-        if reader is None:
-            return None
+        # read_uart 在基类有默认实现（回 unsupported），直接调用。
+        # 不再探测"驱动有没有这个方法"：探测不到就 return None，与"回读失败"
+        # 在执行日志里是同一条静默结果，无法区分漏实现和真的读不到。
         try:
-            ok, message, data = reader()
+            ok, message, data = driver.read_uart()
         except Exception as e:                       # noqa: BLE001 - 回读失败不能拖垮任务
             logging.debug(f'串口参数回读异常（忽略）：{e}')
             return None
         if not ok:
-            logging.debug(f'{getattr(driver, "DISPLAY_NAME", "模块")} 串口参数回读失败（忽略）：{message}')
+            logging.debug(f'{driver.DISPLAY_NAME} 串口参数回读失败（忽略）：{message}')
             return None
         return dict(data or {})
 
     @staticmethod
-    def _save_profile(driver, info, uart=None):
+    def _save_profile(driver, info, uart=None, port='', baud=0, method=''):
         """把驱动里的能力矩阵同步进 module_profiles（页面没连硬件时也能列型号）。
 
         `uart` 有值就顺手把"模块自报的串口参数"记住（store 侧只在 baud>0 时覆盖，
         所以"这次没读到"不会把上次的记录抹掉）。
+
+        同时更新 **SN 级台账** `module_info`：两处写的是不同粒度的事实，
+        `module_profiles` 记"这个型号支持什么"，`module_info` 记"这块板子上次什么样"。
+        台账写入失败不影响主流程（`store.touch_module` 内部吞异常只记日志）。
         """
         try:
             store.save_profile(driver.MODEL_KEY,
@@ -1332,6 +1538,19 @@ class CalibrationService:
             logging.debug(f'型号能力落库失败（忽略）：{e}')
         except Exception as e:                       # noqa: BLE001
             logging.debug(f'型号能力落库异常（忽略）：{e}')
+
+        try:
+            store.touch_module(
+                model_key=driver.MODEL_KEY,
+                display_name=(info.get('display_name') or driver.DISPLAY_NAME),
+                info=info,
+                port=port,
+                baud=baud or ((uart or {}).get('baud') or 0),
+                method=method,
+                role=driver.role(),
+            )
+        except Exception as e:                       # noqa: BLE001
+            logging.debug(f'模块台账落库异常（忽略）：{e}')
 
 
 # ==================== 结果组装 ====================
@@ -1659,6 +1878,26 @@ def _module_caps(module):
 _NO_COMMAND_ADVICE = '只能做「只观测」或「外接流动站测坐标」，无法写入坐标'
 
 
+def _has_command_set(info):
+    """这个型号有没有"能下发命令"的手段。
+
+    **不能用 `command_count > 0` 当唯一判据**：那是 PQTM/PAIR 这类**文本命令**
+    的条数，只有 Quectel 系驱动才有值。u-blox ZED-F9P 全走 UBX 二进制
+    （`_valset/_valget`），`CMD = {}` 于是恒为 0 —— 拿条数当闸会把 F9P 判成
+    "没有可下发命令"，四张卡全灰、接口直接 400，而它其实是四种方式全通的模块。
+
+    判据改为：**命令表非空 → 可写；否则看能力位是否被驱动真正声明过**。
+    能力位有明确布尔值的驱动（不论值是真还是假）说明它实现了自己的能力探测，
+    走的是 UBX 之类的二进制路径，同样能写。
+    能力位全是 undefined 的空壳驱动（如 passive）才算"没法写"。
+    """
+    if (info or {}).get('command_count', 0) > 0:
+        return True
+    caps = (info or {}).get('caps') or {}
+    return any(isinstance(caps.get(key), bool)
+               for key in ('fixed', 'svin', 'set_mode', 'dual_mode'))
+
+
 def _reject_write_without_fixed(module):
     """「写坐标」要能下发命令，还要有写固定坐标的能力。
 
@@ -1671,7 +1910,7 @@ def _reject_write_without_fixed(module):
     info = _module_caps(module)
     if info is None:
         return None
-    if info['command_count'] == 0:
+    if not _has_command_set(info):
         return f'{info["name"]} 没有可下发命令，{_NO_COMMAND_ADVICE}'
     if not info['caps'].get('fixed'):
         return f'{info["name"]} 不支持写入固定坐标，请改用「Survey-in 自收敛」或「CORS 差分」'
@@ -1696,7 +1935,7 @@ def _reject_without_caps(module, *needed):
     if info is None:
         return None
     caps = info['caps']
-    if info['command_count'] == 0:
+    if not _has_command_set(info):
         return f'{info["name"]} 没有可下发命令，{_NO_COMMAND_ADVICE}'
     missing = [_CAP_TEXT.get(key, key) for key in needed if not caps.get(key)]
     if not missing:
@@ -1819,6 +2058,22 @@ def backup_info():
 
 def status():
     return get_service().status()
+
+
+def scan_ports(ports=None, bauds=None, active=True):
+    """扫描串口并判定是不是 GNSS（**只判定，不做决断**）。
+
+    与标定任务**完全隔离**：独立线程、独立锁，不取串口租约，
+    因此不受 30 秒标定看门狗管辖，也不会把正在跑的标定判成失败。
+    唯一互斥是"标定任务正在跑时就别扫" —— 那时串口正被占用，
+    硬扫只会拿到一堆 `busy`。
+    """
+    return get_service().scan_ports(ports=ports, bauds=bauds, active=active)
+
+
+def scan_status():
+    """扫描进度与结果快照；附带系统串口清单（页面首屏用）。"""
+    return get_service().scan_status()
 
 
 def abort():

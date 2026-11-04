@@ -15,14 +15,22 @@ import logging
 import re
 
 from flask import jsonify, render_template, request
-
 from ..calibration import service as calib
 from ..calibration import store
 from ..calibration.drivers import driver_manager
+from ..calibration.drivers.base import _normalize_method
 from ..calibration.writer import SURVEY_PROFILES as _SURVEY_PROFILES
 from ..core import state
 from ..core.config import get_config, save_config
 from ..security import login_required
+
+# 规范方式键 → 界面文案。错误信息与日志用它，四个键只在这里写一次。
+_METHOD_LABEL = {
+    'cors': 'CORS 一键固定',
+    'survey_in': '自收敛（Survey-in）',
+    'manual': '写入已知坐标',
+    'external_rover': '仅测量坐标',
+}
 
 # 需要打码的键名（与 core.config.mask_config 同款规则，这里独立一份是为了
 # 也能处理"自由文本里的 password=xxx"）
@@ -245,6 +253,58 @@ def api_calibration_options():
 
 
 @login_required
+def api_calibration_scan():
+    """扫描串口并判定是不是 GNSS 模块（**只判定，不决定**）。
+
+    POST body：
+        ports   [str]   要扫的口；留空 = 扫全部
+        bauds   [int]   要试的波特率；留空 = 从高到低扫全集
+        active  bool    被动读不到时要不要主动发查询（默认 true）
+        wait    bool    同步等待模式（CLI/脚本用），默认 false
+
+    结果**不过滤**：每个口都返回，带 `family`（gnss / unknown / noise / busy）、
+    `features`（nmea / rtcm / ubx / ...）与 `note`。前端据此显示，
+    用户自己决定点哪个口、要不要当成模块 —— 这里不做任何自动选择。
+    """
+    body = request.get_json(silent=True) or {}
+    ports = body.get('ports')
+    if isinstance(ports, str):
+        ports = [item.strip() for item in ports.split(',') if item.strip()]
+    if ports is not None and not isinstance(ports, list):
+        return jsonify({'ok': False, 'error': 'ports 必须是字符串数组'}), 400
+
+    bauds = body.get('bauds')
+    if isinstance(bauds, (str, int)):
+        bauds = [bauds]
+    clean_bauds = []
+    for item in (bauds or []):
+        try:
+            value = int(item)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            clean_bauds.append(value)
+
+    ok, message, payload = calib.scan_ports(
+        ports=ports or None, bauds=clean_bauds or None,
+        active=bool(body.get('active', True)))
+    if not ok:
+        busy = '在进行' in str(message)
+        return jsonify({'ok': False, 'error': _mask(message),
+                        'scan': _mask_obj(payload)}), (409 if busy else 400)
+    return jsonify({'ok': True, 'message': _mask(message),
+                    'scan': _mask_obj(payload)}), 202
+
+
+@login_required
+def api_calibration_scan_status():
+    """扫描进度与结果（1 秒轮询）。附带当前系统串口清单，页面首屏用它填下拉。"""
+    resp = jsonify({'ok': True, 'scan': _mask_obj(calib.scan_status())})
+    resp.headers['Cache-Control'] = 'no-store, max-age=0'
+    return resp
+
+
+@login_required
 def api_calibration_status():
     """1 秒轮询：阶段 / 进度 / 实时指标 / 日志尾。
 
@@ -273,18 +333,57 @@ def api_calibration_detect():
 
 @login_required
 def api_calibration_start():
-    """下发 plan 启动任务。202=已接受，409=已有任务在跑。"""
+    """下发 plan 启动任务。202=已接受，409=已有任务在跑。
+
+    **方式的合法性只有一处判据**：`driver.methods()`（由驱动声明的 ROLE 派生）。
+    以前这里写的是 `if method in ('cors', ...)` 一张字符串白名单，而驱动那边
+    另有一套 CAPS 判断 —— 两边一旦不一致，页面能点、后端 400，或者反过来
+    后端放行、执行到一半才在切模式那步失败。现在先按型号收紧，再分流。
+    """
     body = request.get_json(silent=True) or {}
-    method = str(body.get('method') or 'cors').strip().lower()
+    # 别名收口：'measure' / 'svin' / 'known' 都是老写法，统一成规范键。
+    # 漏传 method 时**不再默认成 cors** —— 老代码 `body.get('method') or 'cors'`
+    # 让"忘了传"变成"用 CORS 跑"，而 CORS 是最重的一条路（要连网、要账号、
+    # 要切流动站）。现在直接 400 报清楚。
+    raw_method = body.get('method')
+    if not raw_method:
+        return jsonify({'ok': False, 'error': '缺少 method（cors / survey_in / manual / external_rover）'}), 400
+    method = _normalize_method(raw_method)
     port = body.get('port')
     baud = _baud_param(body.get('baud'))
     module = body.get('module')
 
-    if method in ('cors', 'external_rover', 'measure'):
+    # 先挡"键本身不认识"：归一化后仍是原样（且不等于任何规范键）说明前端
+    # 传了一个我们没定义的方法名。这时候报"型号不支持"会误导用户去换模块，
+    # 真正的问题是调用方拼错了键。
+    if method not in _METHOD_LABEL:
+        return jsonify({
+            'ok': False,
+            'error': (f'未知的标定方式：{raw_method}'
+                      f'（可用：{" / ".join(_METHOD_LABEL)}）'),
+            'methods': list(_METHOD_LABEL),
+        }), 400
+
+    # 型号能力闸门。未知型号（module 为空 / 认不出来）按流动站处理，
+    # 只允许「仅测量」—— 这是需求里定的默认，也是最保守的假设。
+    allowed = driver_manager.methods_of(module)
+    if method not in allowed:
+        driver = driver_manager.get_driver_by_id(module)
+        name = driver.DISPLAY_NAME if driver else '未知模块'
+        role = driver.role_label() if driver else '流动站（仅测量）'
+        return jsonify({
+            'ok': False,
+            'error': (f'{name} 是「{role}」，不支持「{_METHOD_LABEL.get(method, method)}」。'
+                      f'可用的方式：{" / ".join(_METHOD_LABEL.get(m, m) for m in allowed)}'),
+            'role': driver_manager.role_of(module),
+            'methods': list(allowed),
+        }), 400
+
+    if method in ('cors', 'external_rover'):
         cors = body.get('cors') or {}
         # `reuse_arp` 走标定流程 A1 的复用分支：库内已有该天线坐标且未移动 →
         # 跳过整段 CORS 测量，不连网、不占账号，直接设基准站。
-        # 只对 method='cors' 生效（'measure' 是只测不写，两者互斥）。
+        # 只对 method='cors' 生效（'external_rover' 是只测不写，两者互斥）。
         reuse_arp = body.get('reuse_arp') if method == 'cors' else None
         ok, message, payload = calib.start_cors(
             port=port, baud=baud,
@@ -300,7 +399,7 @@ def api_calibration_start():
             measure_only=(method != 'cors'),
             on_slow=body.get('on_slow') or 'adopt',
             reuse_arp=reuse_arp)
-    elif method in ('survey_in', 'svin'):
+    elif method == 'survey_in':
         ok, message, payload = calib.start_survey_in(
             port=port, baud=baud,
             profile=body.get('svin_profile') or 'standard',
@@ -310,7 +409,7 @@ def api_calibration_start():
             svin_timeout=body.get('svin_timeout'),
             module=module, coord_msg=body.get('coord_msg') or '1005',
             resume=body.get('svin_resume', True))
-    elif method in ('manual', 'known'):
+    elif method == 'manual':
         # `arp` = 复用历史坐标：库里存的就是当年写进模块的值，直通写入。
         ok, message, payload = calib.start_write(
             port=port, baud=baud,
@@ -324,8 +423,12 @@ def api_calibration_start():
             antenna=body.get('antenna'),
             remark=body.get('remark') or '',
             module=module, coord_msg=body.get('coord_msg') or '1005')
+        # 已知坐标写入**不测量**，所以"没信号"这件事不该拦它。
+        # 历史坐标 / 手填 ECEF 都是现场测量过的值，直接写就行。
     else:
-        return jsonify({'ok': False, 'error': f'未知的标定方式：{method}'}), 400
+        # 归一化后还有第四种以外的值，说明前端传了个我们不认识的键。
+        # 这里不猜、不打补丁，直接报清楚 —— 猜错一次就是"点 A 跑了 B"。
+        return jsonify({'ok': False, 'error': f'未知的标定方式：{raw_method}'}), 400
 
     if not ok:
         busy = '已有标定任务' in str(message)
@@ -388,6 +491,65 @@ def api_calibration_history():
                     'items': [_mask_obj(item) for item in items]})
 
 
+def api_calibration_modules():
+    """模块台账（按 SN）：这块板子上次插在哪个口、固件是哪一版、标定用的什么方式。
+
+    和 `history` 的分工：history 是"每次标定一行"的流水，只有标定成功才有行；
+    modules 是"每块板子一行"的状态快照，**读一次信息就更新一次**，
+    所以没标定过的模块也在这里，且带着上次的端口与固件 —— 这正是
+    "把这块板子插回来，上次是怎么配的" 这类问题的答案。
+    """
+    try:
+        limit = max(1, min(int(request.args.get('limit') or 50), 200))
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'error': 'limit 必须是整数'}), 400
+    items = store.list_module_info(limit=limit)
+    return jsonify({'ok': True, 'limit': limit, 'count': len(items), 'items': items})
+
+
+def _install_json_error_page(app):
+    """让标定接口的未捕获异常返回 **JSON**，而不是 Flask 的 HTML 错误页。
+
+    真机实测：`POST /api/calibration/start` 里 `_check_ecef` 抛 `KeyError`，
+    Flask 兜底渲染了 `<!doctype html>...500 Internal Server Error...`。
+    而前端 `calibration.js` 有十几处都是 `res.json()` 直取 —— 拿到 HTML 就
+    `SyntaxError: Unexpected token '<'`，页面只能显示"网络错误"，
+    **真实原因（坐标格式不对）一个字都传不到用户眼前**，用户会以为是服务没起来
+    而反复重试，每次重试都重新占一遍串口。
+
+    所以这里挂一层**只作用于标定 API 前缀**的兜底：
+      * `/api/calibration/*` 出错 → 500 + `{'ok': false, 'error': ...}`；
+      * 页面 `/calibrate` 保持 HTML 行为；
+      * 其它路由（数据面、登录）完全不受影响。
+
+    为什么不用 `@app.errorhandler(500)`：那是**全局**的，会把主程序数据面接口的
+    错误页也换成 JSON，属于干扰别的模块。这里用 `after_request` 只改写
+    **已经发生的 5xx 且仍是 HTML** 的响应，命中面严格限定在前缀内。
+    """
+    from flask import jsonify as _jsonify
+
+    @app.after_request
+    def _jsonify_calib_errors(response):
+        """把标定 API 的 HTML 5xx 换成 JSON。"""
+        if not request.path.startswith('/api/calibration/'):
+            return response
+        if response.status_code < 500 or response.is_json:
+            return response
+        # Flask 的 HTML 错误页里带着异常类名，尽量抠出来给前端一个线索
+        detail = ''
+        try:
+            body = response.get_data(as_text=True)
+            match = re.search(r'<p>(.*?)</p>', body, re.S)
+            if match:
+                detail = re.sub(r'<[^>]+>', '', match.group(1)).strip()
+        except Exception:                              # noqa: BLE001 - 抠不出就算了
+            detail = ''
+        text = f'标定服务内部错误：{detail}' if detail else '标定服务内部错误（详见服务端日志）'
+        payload = _jsonify({'ok': False, 'error': _mask(text), 'detail': _mask(detail)})
+        payload.status_code = response.status_code
+        return payload
+
+
 def register(app):
     """挂到 app 上。endpoint 名统一 `api_calibration_*`，页面用 `calibration_page`。
 
@@ -397,6 +559,7 @@ def register(app):
     在 Web 线程起来之前、`run_once()` 之前，是"进程刚起来"这个语义点。
     钩子内部自带幂等与异常兜底，失败只记日志，不影响任何其它功能。
     """
+    _install_json_error_page(app)
     app.add_url_rule('/calibrate', 'calibration_page', calibration_page, methods=['GET'])
     app.add_url_rule('/api/calibration/options', 'api_calibration_options',
                      api_calibration_options, methods=['GET'])
@@ -404,6 +567,13 @@ def register(app):
                      api_calibration_status, methods=['GET'])
     app.add_url_rule('/api/calibration/detect', 'api_calibration_detect',
                      api_calibration_detect, methods=['POST'])
+    # 串口扫描：只判定、不决定。和 detect 是两件事 ——
+    # detect 是"我已经选定了这个口和型号，读一下它的信息"（要走租约、占串口）；
+    # scan 是"电脑上都有哪些口、哪些在吐 GNSS 数据"（独立跑，不占租约）。
+    app.add_url_rule('/api/calibration/scan', 'api_calibration_scan',
+                     api_calibration_scan, methods=['POST'])
+    app.add_url_rule('/api/calibration/scan/status', 'api_calibration_scan_status',
+                     api_calibration_scan_status, methods=['GET'])
     app.add_url_rule('/api/calibration/start', 'api_calibration_start',
                      api_calibration_start, methods=['POST'])
     app.add_url_rule('/api/calibration/abort', 'api_calibration_abort',
@@ -412,6 +582,8 @@ def register(app):
                      api_calibration_apply_as_source, methods=['POST'])
     app.add_url_rule('/api/calibration/history', 'api_calibration_history',
                      api_calibration_history, methods=['GET'])
+    app.add_url_rule('/api/calibration/modules', 'api_calibration_modules',
+                     api_calibration_modules, methods=['GET'])
 
     try:
         calib.on_startup()

@@ -70,6 +70,8 @@
     reuseHistory: null,
     // 最近一次扫描到的串口候选（供 chip 重绘，避免每次重扫才刷新选中态）
     ports: [],
+    // 协议嗅探状态（与标定任务完全独立，见 sniffPorts）
+    scan: null,
     history: null
   };
 
@@ -292,6 +294,13 @@
       });
   }
 
+  // 型号下拉按**硬件角色**分三组：双模 / 单模 / 流动站。
+  // 分组不是为了好看，是为了让用户一眼看出"这块模块能干什么"：
+  // 单模型号下面不会出现 CORS 一键固定，流动站型号下面不会出现任何"固定"。
+  //
+  // `role` 与 `methods` 由后端驱动类声明（BaseDriver.ROLE + METHODS_BY_ROLE），
+  // 前端**只读不猜**：后端说支持哪些方式，就放开哪些卡。这样"页面能点"
+  // 与"后端会接受"永远同源，不会再出现"按钮能点但点了 400"。
   function fillModules(modules) {
     var select = $('cal-module');
     if (!select) return;
@@ -304,7 +313,8 @@
 
     var groups = [
       { label: t('cal.module.dual'), items: (modules && modules.dual_mode) || [] },
-      { label: t('cal.module.single'), items: (modules && modules.single_mode) || [] }
+      { label: t('cal.module.single'), items: (modules && modules.single_mode) || [] },
+      { label: t('cal.module.rover'), items: (modules && modules.rover_mode) || [] }
     ];
     groups.forEach(function (group) {
       if (!group.items.length) return;
@@ -315,6 +325,9 @@
         opt.value = item.id;
         opt.textContent = item.name;
         opt.dataset.dual = item.dual_mode ? '1' : '0';
+        opt.dataset.role = item.role || 'rover';
+        // 方式表整份留在 DOM 上：型号切换后 computeLocks() 只按它判。
+        opt.dataset.methods = (item.methods || []).join(',');
         // 能力表整份留在 DOM 上：applyCapabilities() 要按它决定"哪些块根本不该出现"。
         try { opt.dataset.caps = JSON.stringify(item.caps || {}); }
         catch (e) { opt.dataset.caps = '{}'; }
@@ -342,9 +355,23 @@
 
   // 自动识别时 mod 为 null，这里用"先放开"的策略：识别不出模块不该等于
   // "什么都不能做"，真要跑起来后端会按实际识别到的型号再拦一次。
+  //
+  // 判据不能用 `command_count`：那是"PQTM/PAIR 文本命令条数"，只有 Quectel 系
+  // 驱动才有值。u-blox ZED-F9P 全走 UBX 二进制（`_valset/_valget`），`CMD = {}`，
+  // 于是 command_count 恒为 0 —— 一旦拿它当总闸，F9P 在页面上四张卡全部置灰，
+  // 用户根本点不下去（真机上只能靠绕过页面的脚本跑）。
+  //
+  // 改为**看能力位**：只要能算出"这条路需要的能力有没有"，就跟协议是文本还是
+  // 二进制无关。下面四个判据与后端 `_reject_without_caps` / `_reject_write_*`
+  // 逐条对齐（见 computeLocks）。command_count 只在"能力位全是 undefined 的
+  // 空壳驱动"上还留着一层兜底价值，这里用 hasAnyCap 表达同一件事。
   function canWrite() {
     var mod = selectedModule();
     if (!mod) return true;
+    var caps = mod.caps || {};
+    // 能力表有明确置位（true/false 都算）→ 说明驱动真的声明了能力，可写。
+    if (caps.fixed === true || caps.svin === true || caps.set_mode === true) return true;
+    // 能力表是空壳（三者都 undefined）：退回命令集判据，避免把 unknown 驱动放开。
     return Number(mod.command_count) > 0;
   }
 
@@ -360,57 +387,90 @@
     }
   }
 
+  // 选中型号支持的方式集合。返回 null 表示"自动识别"（还不知道是什么模块）。
+  //
+  // 这是页面灰化的**唯一真相源**，与后端 `driver_manager.methods_of()` 同源：
+  // 后端 `api_calibration_start()` 用同一张表拦请求，所以这里放开的一定能跑，
+  // 这里锁掉的连点都点不下去。
+  //
+  // 三个角色对应的方式表（BaseDriver.METHODS_BY_ROLE）：
+  //   dual   → cors / survey_in / manual / external_rover
+  //   single → survey_in / manual
+  //   rover  → external_rover
+  // 未知模块（后端 role_of → 'rover'）**不是** dual —— 否则页面会亮出
+  // "一键固定"，点下去必然卡在"切基准站"那一步。
+  function selectedMethods() {
+    var mod = selectedModule();
+    if (!mod) return null;
+    // 后端老版本可能没带 methods，退回按角色推一遍，避免整页四张卡全灰。
+    if (Array.isArray(mod.methods)) return mod.methods.slice();
+    var role = mod.role || (mod.dual_mode ? 'dual' : 'single');
+    if (role === 'dual') return ['cors', 'survey_in', 'manual', 'external_rover'];
+    if (role === 'single') return ['survey_in', 'manual'];
+    return ['external_rover'];
+  }
+
   // ---------------- 能力锁 ----------------
   // 每个方式卡片按"后端到底会拦什么"来决定锁不锁。锁定比后端严 → 用户被白白挡住；
   // 锁定比后端松 → 点下去才 400。这里逐条对着 api_calibration.start_* 写。
+  //
+  // **第一层判据是角色方式表**（selectedMethods），不是能力位：
+  //   - 角色表说这块模块不支持 cors，就直接锁，理由写清楚"它是单模/流动站"；
+  //   - 角色表说支持，再往下查能力位兜底（同一颗芯片的不同固件版本能力可能不同）。
+  // 这个顺序很重要：先讲"你是单模模块"，比先讲"你缺 set_mode 位"对用户有用得多。
   function computeLocks() {
     var mod = selectedModule();
     var caps = selectedCaps() || {};
     var writable = canWrite();
     var locks = { cors: '', survey_in: '', manual: '', external_rover: '' };
-    if (!mod) return locks;   // 自动识别：全部放开
+    if (!mod) return locks;   // 自动识别：全部放开，后端按实际识别到的型号再拦
 
     var name = mod.name || mod.id;
-    // 三条写路径后端各有一处判据，**不是一套统一规则**，这里逐条对齐：
+    var allowed = selectedMethods() || [];
+    var role = mod.role || (mod.dual_mode ? 'dual' : 'single');
+    var roleLabel = mod.role_label || '';
+
+    // 0) 角色闸门：型号能力表里没有这个方式 → 直接锁，理由用角色说。
+    //    这与后端 start_* 开头的 `if method not in methods_of(module)` 一一对应。
+    if (allowed.indexOf('cors') < 0) {
+      locks.cors = role === 'single'
+        ? t('cal.lock.cors_single', { name: name })
+        : t('cal.lock.cors_role', { name: name, role: roleLabel || t('cal.role.rover') });
+    }
+    if (allowed.indexOf('survey_in') < 0) {
+      locks.survey_in = t('cal.lock.svin_role', { name: name, role: roleLabel || t('cal.role.rover') });
+    }
+    if (allowed.indexOf('manual') < 0) {
+      locks.manual = t('cal.lock.manual_role', { name: name, role: roleLabel || t('cal.role.rover') });
+    }
+    if (allowed.indexOf('external_rover') < 0) {
+      locks.external_rover = t('cal.lock.measure_role', { name: name, role: roleLabel || t('cal.role.single') });
+    }
+
+    // 1) 命令集闸门：没命令集就什么都发不出去（只测不写除外，它不写 NVM）。
+    //    能力位全是 undefined 的空壳驱动（如 passive）会被当成支持 —— 正是
+    //    "按钮能点但点了报错"的来源，这层不能省。
+    if (!writable) {
+      locks.cors = locks.cors || t('cal.lock.manual', { name: name });
+      locks.survey_in = locks.survey_in || t('cal.lock.manual', { name: name });
+      locks.manual = locks.manual || t('cal.lock.manual', { name: name });
+    }
+
+    // 2) 能力位闸门：逐条对齐后端。
     //   start_write     → 先命令集，再 fixed（`_reject_write_without_fixed`）
     //   start_survey_in → 先命令集，再**只**看 svin（不查 fixed）
     //   start_cors      → 复用分支 fixed+set_mode；正常分支再加 dual_mode
-    //                     （`_reject_without_caps`：先命令集，再看能力位）
-    // 顺序不能省「先看命令集」这层：能力位全是 undefined 的空壳驱动（如 passive）
-    // 会被当成支持，页面放开、后端 400 —— 正是"按钮能点但点了报错"的来源。
-    // 复用分支不切流动站，所以不查 dual_mode；但同样要切回基准站并写 NVM，
-    // 所以 fixed / set_mode 照查。
-    if (!writable) {
-      locks.cors = t('cal.lock.manual', { name: name });
-    } else if (caps.fixed === false) {
-      locks.cors = t('cal.lock.cors_fixed', { name: name });
-    } else if (caps.set_mode !== true) {
-      locks.cors = t('cal.lock.cors_set_mode', { name: name });
-    } else if (!mod.dual_mode) {
-      locks.cors = t('cal.lock.cors_dual', { name: name });
+    if (!locks.cors) {
+      if (caps.fixed === false) locks.cors = t('cal.lock.cors_fixed', { name: name });
+      else if (caps.set_mode !== true) locks.cors = t('cal.lock.cors_set_mode', { name: name });
     }
-    // 后端 start_survey_in 只查 caps.svin；这里**不能**顺手把 fixed 也加上，
-    // 否则某些只能自收敛、不能立即写固定坐标的型号会被前端误锁。
-    // 但「没有命令集」这条要先拦：SVIN 是靠下发命令跑的。
-    if (!writable) {
-      locks.survey_in = t('cal.lock.manual', { name: name });
-    } else if (caps.svin !== true) {
+    // 自收敛不能顺手把 fixed 也加上，否则"只能自收敛、不能立即写固定坐标"的
+    // 型号会被前端误锁（后端 start_survey_in 只查 svin）。
+    if (!locks.survey_in && caps.svin !== true) {
       locks.survey_in = t('cal.lock.svin', { name: name });
     }
-    if (!writable) {
-      locks.manual = t('cal.lock.manual', { name: name });
-    } else if (caps.fixed === false) {
+    if (!locks.manual && caps.fixed === false) {
       locks.manual = t('cal.lock.manual_caps', { name: name });
-    }
-    // 只测不写**不写 NVM、不需要命令集**，所以对"未知模块"永远开放 ——
-    // 无命令集的第三方流动站正是它的主要用途。
-    // 但它要能**收改正数**：靠 CORS 差分算出本机天线位置，前提是这块模块
-    // 能当流动站。单基准站型号（LC29H(BS)：dual_mode=false，连模式命令都没有）
-    // 接上 CORS 也只能给单点解，跑满 3 分钟得到一个米级坐标 —— 那是最坏的
-    // 一种"成功"：用户会把这个米级坐标写进基准站。
-    // 所以：选了具体型号、且该型号没有流动站能力 → 锁掉；未选型号（未知模块）→ 放开。
-    if (writable && mod && !mod.dual_mode) {
-      locks.external_rover = t('cal.lock.measure_dual', { name: name });
     }
     return locks;
   }
@@ -454,6 +514,14 @@
     if (method === 'survey_in') return 'svin';
     if (method === 'external_rover') return 'measure';
     return method;
+  }
+
+  // 方式值 → i18n 键。同一个映射，因为字典里用的是短名（cal.method.svin）。
+  // 散落在两处容易漏改，所以统一走这个函数。
+  function methodLabelKey(method) {
+    if (method === 'survey_in') return 'cal.method.svin';
+    if (method === 'external_rover') return 'cal.method.measure';
+    return 'cal.method.' + method;
   }
 
   // ---------------- 方式切换 ----------------
@@ -763,11 +831,23 @@
     box.classList.remove('is-hidden');
   }
 
+  // ---------------- 串口扫描与协议嗅探 ----------------
+  // 两件事分开：
+  //   1) 先列系统串口（/api/serial_ports）—— 快，立刻能填满输入框；
+  //   2) 再起协议嗅探（/api/calibration/scan）—— 慢，逐口 x 逐波特率试读，
+  //      判出这块板子到底是不是 GNSS、以及它在哪个波特率上说话。
+  //
+  // 嗅探是**异步任务**：POST 返回 202 后靠轮询 /scan/status 推进。
+  // 与标定任务完全隔离（独立线程、独立锁、不占串口租约、不受 30 秒看门狗管辖），
+  // 所以扫描期间标定状态机不会动，扫描也不会被标定心跳超时误杀。
   function scanPorts() {
-    var btn = $('cal-scan');
-    if (btn) btn.disabled = true;
-    setPortHint(t('cal.port.scanning'), 'is-info');
-    fetch('/api/serial_ports', { credentials: 'same-origin' })
+    listSerialPorts().then(function (ok) {
+      if (ok) sniffPorts();
+    });
+  }
+
+  function listSerialPorts() {
+    return fetch('/api/serial_ports', { credentials: 'same-origin' })
       .then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.json();
@@ -785,28 +865,290 @@
           });
         }
         renderPortChips(ports);
-
         var input = $('cal-port');
         if (!ports.length) {
           setPortHint(t('cal.err.no_ports'), 'is-error');
-          showError(t('cal.err.no_ports'));
-          return;
+          return false;
         }
-        // 只有一个口就直接填上：现场换完 USB 口最想看到的就是"它认到了"，
-        // 而不是"扫出来了，请你自己再点一次"。
+        // 只有一个口就直接填上：现场换完 USB 口最想看到的就是"它认到了"。
         if (input && ports.length === 1 && !input.value.trim()) pickPort(ports[0].device);
-        renderPortChips(ports);
-        setPortHint(t('cal.port.found', { n: ports.length }), 'is-ok');
-        showError('');
-        if (window.Picker) Picker.open(input);
+        return true;
       })
       .catch(function (err) {
-        // 失败原因写在输入框下面，而不是只丢到页面底部的全局错误框
-        var message = t('cal.err.ports') + ': ' + err.message;
-        setPortHint(message, 'is-error');
-        showError(message);
+        setPortHint(t('cal.err.ports') + ': ' + err.message, 'is-error');
+        return false;
+      });
+  }
+
+  // 已扫到的结果按端口名索引，重扫时整体替换而不是追加。
+  function sniffPorts() {
+    var btn = $('cal-scan');
+    if (btn) btn.disabled = true;
+    STATE.scan = { running: true, ports: [], progress: [], summary: null, error: '' };
+    renderScanPanel();
+    setPortHint(t('cal.scan.started'), 'is-info');
+
+    var body = {
+      // 端口留空 = 让后端把系统里所有串口都试一遍。
+      // 波特率留空 = 统一按高到低扫全集（后端 SCAN_BAUDS）。
+      // 用户手填了波特率就只试那一档 —— 现场明确知道速率时能省掉大半时间。
+      ports: [],
+      active: true
+    };
+    var typed = ($('cal-baud') && $('cal-baud').value.trim()) || '';
+    if (typed && /^\d+$/.test(typed)) body.bauds = [parseInt(typed, 10)];
+
+    return fetch('/api/calibration/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(body)
+    })
+      .then(function (res) {
+        if (res.status === 401) { window.location.href = '/login'; throw new Error('unauth'); }
+        return res.json().then(function (data) { return { status: res.status, data: data }; });
+      })
+      .then(function (r) {
+        if (!r.data || !r.data.ok) {
+          var msg = (r.data && r.data.error) || ('HTTP ' + r.status);
+          throw new Error(msg);
+        }
+        // 202 里已经带了第一帧状态，先画出来再开始轮询 —— 否则用户会盯着
+        // 一个空面板等 1 秒，看起来像"点了没反应"。
+        if (r.data.scan) {
+          maskScanPayload(r.data.scan);
+          renderScanPanel();
+        }
+        pollScan();
+      })
+      .catch(function (err) {
+        if (err && err.message === 'unauth') return;
+        STATE.scan.running = false;
+        STATE.scan.error = err.message;
+        renderScanPanel();
+        setPortHint(t('cal.scan.failed') + ': ' + err.message, 'is-error');
       })
       .then(function () { if (btn) btn.disabled = false; });
+  }
+
+  function pollScan() {
+    if (!STATE.scan || !STATE.scan.running) return;
+    fetch('/api/calibration/scan/status', { credentials: 'same-origin' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function (res) {
+        if (!res || !res.ok) return;
+        // 后端把扫描状态包在 `scan` 里（与 /scan 的 202 响应同构），
+        // 顶层留给 ok / error 这类通用字段。
+        var data = res.scan || {};
+        maskScanPayload(data);
+        renderScanPanel();
+        if (data.running) {
+          // 1 秒一轮：一轮扫描最长也就 (口数 x 档数 x 1.5s)，逐轮刷新足够，
+          // 再密就是无意义地刷 DOM。
+          window.setTimeout(pollScan, 1000);
+          return;
+        }
+        STATE.scan.running = false;
+        onScanDone(data);
+      })
+      .catch(function (err) {
+        STATE.scan.running = false;
+        STATE.scan.error = err.message;
+        renderScanPanel();
+      });
+  }
+
+  function maskScanPayload(data) {
+    if (!STATE.scan) return;
+    STATE.scan.running = !!data.running;
+    STATE.scan.ports = data.ports || [];
+    STATE.scan.progress = data.progress || [];
+    STATE.scan.summary = data.summary || null;
+    // `available` 是系统串口清单，首屏也能用（不用等扫描）。
+    if (data.available && data.available.length) renderPortChips(data.available);
+  }
+
+  // 扫描结束：把结果摊开，同时把"最像 GNSS 的那个口"预填进去。
+  // 预填规则刻意保守 —— 只在**当前输入框是空**的时候填，绝不覆盖用户手填的值。
+  // 波特率同理，而且多加一条：**端口没有波特率概念时不预填**（USB 直连 CDC），
+  // 填进去只会让人以为"这就是它的波特率"。
+  function onScanDone(data) {
+    renderScanPanel();
+    var ports = data.ports || [];
+    var gnss = ports.filter(function (p) { return p.family === 'gnss'; });
+    var target = gnss[0];
+    var input = $('cal-port');
+    if (input && !input.value.trim() && target) {
+      pickPort(target.device);
+      if (target.baud && target.baud_fixed !== false
+          && $('cal-baud') && !$('cal-baud').value.trim()) {
+        $('cal-baud').value = String(target.baud);
+        $('cal-baud').dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    }
+    if (!ports.length) {
+      setPortHint(t('cal.scan.empty'), 'is-info');
+      return;
+    }
+    var n = gnss.length;
+    var verify = (data.summary && data.summary.verify) || [];
+    var rateFree = (data.summary && data.summary.rate_free) || [];
+    var hint = t('cal.scan.done', { total: ports.length, gnss: n });
+    if (verify.length) hint += ' ' + t('cal.scan.done.verify', { ports: verify.join('、') });
+    if (rateFree.length) hint += ' ' + t('cal.scan.done.ratefree', { ports: rateFree.join('、') });
+    setPortHint(hint, n ? 'is-ok' : 'is-info');
+  }
+
+  function renderScanPanel() {
+    var panel = $('cal-scan-panel');
+    if (!panel || !STATE.scan) return;
+    var scan = STATE.scan;
+
+    var title = $('cal-scan-title');
+    if (title) {
+      title.textContent = scan.running
+        ? t('cal.scan.running')
+        : t('cal.scan.result', { n: (scan.ports || []).length });
+    }
+
+    var prog = $('cal-scan-progress');
+    if (prog) {
+      var last = (scan.progress || []).slice(-1)[0];
+      var text = formatScanEvent(last);
+      if (scan.running && text) {
+        prog.textContent = text;
+        prog.classList.remove('is-hidden');
+      } else if (scan.error) {
+        prog.textContent = scan.error;
+        prog.classList.remove('is-hidden');
+      } else {
+        prog.textContent = '';
+        prog.classList.add('is-hidden');
+      }
+    }
+
+    var wrap = $('cal-scan-table');
+    if (wrap) wrap.innerHTML = scanTableHtml(scan.ports || []);
+    panel.classList.remove('is-hidden');
+  }
+
+  // 家族 → 显示名。后端只给 `family` 键，文案在前端；
+  // 后端新加家族时这里兜底显示原始键，不至于渲染成空白行。
+  function familyLabel(family) {
+    var key = 'cal.scan.fam.' + family;
+    var text = t(key);
+    return (text === key) ? (family || '—') : text;
+  }
+
+  // 端口类型 → 显示名。`usb-cdc` 是"这口没有波特率"的那一类，
+  // 必须让人看见 —— 否则用户会照着它给的占位数字去填，然后一辈子对不上。
+  function kindLabel(kind) {
+    var key = 'cal.scan.kind.' + kind;
+    var text = t(key);
+    return (text === key) ? '' : text;
+  }
+
+  // 波特率那一格的文案。三种情况分开：
+  //   没有波特率概念（USB CDC） → 显示"直连"，不显示数字
+  //   扫到了                     → 数字 + 置信度标记（? 表示建议复核）
+  //   没扫到                     → 破折号
+  function baudCellHtml(port) {
+    if (port.baud_fixed === false) {
+      return '<span class="scan-ratefree">' + escapeHtml(t('cal.scan.baud.ratefree')) + '</span>';
+    }
+    if (!port.baud) return '—';
+    var html = escapeHtml(String(port.baud));
+    if ((port.confidence || 'low') !== 'high') {
+      html += ' <span class="scan-warn" title="'
+        + escapeHtml(t('cal.scan.confirm.tip')) + '">?</span>';
+    }
+    return html;
+  }
+
+  // 进度事件 → 一行人话。后端事件形如
+  //   {port:'COM3', baud:115200, phase:'passive'|'active'|'start'|'fallback'}
+  // phase 的语义：
+  //   start    → 开始处理这个口
+  //   passive  → 正在被动试读某一档（不发任何字节）
+  //   fallback → 被动没读到，改走主动询问
+  //   active   → 正在主动询问某一档
+  function formatScanEvent(ev) {
+    if (!ev) return '';
+    if (typeof ev === 'string') return ev;
+    var port = ev.port || '';
+    var baud = ev.baud ? String(ev.baud) : '';
+    if (ev.phase === 'start') return t('cal.scan.ev.start', { port: port });
+    if (ev.phase === 'fallback') return t('cal.scan.ev.fallback', { port: port });
+    if (ev.phase === 'active') return t('cal.scan.ev.active', { port: port, baud: baud });
+    return t('cal.scan.ev.passive', { port: port, baud: baud });
+  }
+
+  function scanTableHtml(ports) {
+    if (!ports.length) {
+      return '<p class="scan-note">' + escapeHtml(t('cal.scan.empty_row')) + '</p>';
+    }
+    var current = ($('cal-port') && $('cal-port').value.trim()) || '';
+    var rows = ports.map(function (p, idx) {
+      var feats = (p.features || []).map(function (f, i) {
+        var key = 'cal.scan.feature.' + f;
+        var label = t(key);
+        if (label === key) label = f;
+        return '<span class="scan-feat' + (i === 0 ? ' is-primary' : '') + '">'
+          + escapeHtml(label) + '</span>';
+      }).join('');
+      var detail = (p.description || '');
+      if (p.vid && p.pid) detail += (detail ? ' · ' : '') + p.vid + ':' + p.pid;
+      var kind = kindLabel(p.kind);
+      if (kind) detail += (detail ? ' · ' : '') + kind;
+      var rowClass = 'scan-row scan-fam-' + escapeHtml(p.family || 'unknown');
+      if ((p.confidence || 'low') !== 'high' && p.family === 'gnss') rowClass += ' is-unverified';
+      return ''
+        + '<tr class="' + rowClass + '" data-idx="' + idx + '">'
+        + '<td><span class="scan-dev"><span class="scan-dot"></span>'
+        + escapeHtml(p.device || '') + '</span></td>'
+        + '<td class="scan-baud">' + baudCellHtml(p) + '</td>'
+        + '<td>' + escapeHtml(familyLabel(p.family)) + '</td>'
+        + '<td><div class="scan-feats">' + (feats || '<span class="scan-note">—</span>') + '</div></td>'
+        + '<td class="scan-note">' + escapeHtml(p.note || '') + '</td>'
+        + '<td class="scan-desc">' + escapeHtml(detail) + '</td>'
+        + '</tr>';
+    }).join('');
+
+    var html = '<table class="scan-table"><thead><tr>'
+      + '<th>' + escapeHtml(t('cal.scan.col.port')) + '</th>'
+      + '<th>' + escapeHtml(t('cal.scan.col.baud')) + '</th>'
+      + '<th>' + escapeHtml(t('cal.scan.col.family')) + '</th>'
+      + '<th>' + escapeHtml(t('cal.scan.col.features')) + '</th>'
+      + '<th>' + escapeHtml(t('cal.scan.col.note')) + '</th>'
+      + '<th>' + escapeHtml(t('cal.scan.col.desc')) + '</th>'
+      + '</tr></thead><tbody>' + rows + '</tbody></table>';
+    return html;
+  }
+
+  // 表格是 innerHTML 拼的，点击用事件委托绑在容器上（重渲染后不用重绑）。
+  function bindScanTable() {
+    var wrap = $('cal-scan-table');
+    if (!wrap) return;
+    on(wrap, 'click', function (ev) {
+      var tr = ev.target.closest ? ev.target.closest('.scan-row') : null;
+      if (!tr) return;
+      var idx = parseInt(tr.dataset.idx, 10);
+      var p = (STATE.scan && STATE.scan.ports || [])[idx];
+      if (!p) return;
+      // 点行 = 用这个口。波特率只在扫出来的时候才带过去：
+      // family=noise 的行 baud 是 null，硬填会把手填值冲掉。
+      pickPort(p.device);
+      if (p.baud && $('cal-baud')) {
+        $('cal-baud').value = String(p.baud);
+        $('cal-baud').dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      Array.prototype.forEach.call(wrap.querySelectorAll('.scan-row'), function (el) {
+        el.classList.toggle('is-current', el === tr);
+      });
+    });
   }
 
   // ---------------- 读取模块信息（只读诊断，不写任何配置） ----------------
@@ -1395,13 +1737,18 @@
     }
     // 能力互斥：后端第一步也会拦，但让用户点按钮之前就知道，
     // 比跑起来再报错省一次等待（而且省掉一次串口占用）。
-    // 判据顺序与后端 `_reject_without_caps()` 保持一致：先命令集，再能力位。
+    // 判据顺序与后端保持一致：**先角色方式表**（methods_of 闸门），再命令集，再能力位。
     var mod = selectedModule() || {};
     if (mod.id) {
       var caps = mod.caps || {};
-      // 复用分支不切流动站，所以不查 dual_mode
-      if (method === 'cors' && !payload.reuse_arp) {
-        if (mod.dual_mode === false) return t('cal.err.base_only');
+      var allowed = selectedMethods() || [];
+      if (allowed.indexOf(method) < 0) {
+        var roleLabel = mod.role_label || '';
+        return t('cal.err.role_unsupported', {
+          name: mod.name || mod.id,
+          role: roleLabel,
+          method: t(methodLabelKey(method))
+        });
       }
       var writable = writesModule(method);
       if (writable && !canWrite()) return t('cal.lock.manual', { name: mod.name || mod.id });
@@ -1556,6 +1903,11 @@
   // ---------------- 启动 ----------------
   function boot() {
     on($('cal-scan'), 'click', scanPorts);
+    on($('cal-scan-close'), 'click', function () {
+      var panel = $('cal-scan-panel');
+      if (panel) panel.classList.add('is-hidden');
+    });
+    bindScanTable();
     on($('cal-rescan'), 'click', function () { loadOptions(); });
     on($('cal-load-mounts'), 'click', loadMountpoints);
     on($('cal-module'), 'change', function () {

@@ -29,7 +29,7 @@ from ..paths import BASE_DIR
 # 与 2RTKserver.db 同级。放模块级而不是常量写死，是为了自测能整体改成临时文件。
 CALIBRATION_DB = os.path.join(BASE_DIR, 'calibration.db')
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # 每 SN 保留条数 / 全库上限（方案 §12.4）
 KEEP_PER_SN = 50
@@ -196,12 +196,54 @@ _DDL_V5 = (
     "ALTER TABLE module_profiles ADD COLUMN uart_info TEXT NOT NULL DEFAULT ''",
 )
 
+# v6（2026-11）：按**模块序列号**建一张独立台账。
+#
+# 为什么已有 `module_profiles` 还要再来一张：
+#   `module_profiles` 的主键是 `model_key`（型号），一行代表"这个型号的默认参数"，
+#   同类模块共用一行。但现场真正需要回答的是"**这一块板子**上次是什么状态" ——
+#   固件刷到哪一版了、上次插在哪个口、上次真正回读到的串口参数是什么、
+#   上次标定是哪天。这些都是 SN 级事实，塞进型号表会被别的模块覆盖掉。
+#
+# 为什么不在 `calibration_records` 里查：
+#   标定记录是"每次标定一行"的流水，只有标定成功才会有行。但一个模块可能
+#   接上来只读了信息、没标定；也可能固件升级后没标定就拔了。这些状态变化
+#   在当前库里完全留不下痕迹。台账按 SN 唯一，**读一次信息就更新一次**。
+#
+# `module_sn` 建 UNIQUE 索引：同一块板子只留一行。没有 SN 的模块（部分固件
+# 不报 SN）退化成用 `uid`（驱动报的唯一 ID）或 `model_key:port` 兜底，见 `sn_key()`。
+_DDL_V6 = (
+    '''
+    CREATE TABLE IF NOT EXISTS module_info (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        sn_key        TEXT    NOT NULL UNIQUE,
+        module_sn     TEXT    NOT NULL DEFAULT '',
+        module_model  TEXT    NOT NULL DEFAULT '',
+        display_name  TEXT    NOT NULL DEFAULT '',
+        firmware      TEXT    NOT NULL DEFAULT '',
+        build_date    TEXT    NOT NULL DEFAULT '',
+        hw_version    TEXT    NOT NULL DEFAULT '',
+        unique_id     TEXT    NOT NULL DEFAULT '',
+        role          TEXT    NOT NULL DEFAULT '',
+        last_port     TEXT    NOT NULL DEFAULT '',
+        last_baud     INTEGER NOT NULL DEFAULT 0,
+        last_method   TEXT    NOT NULL DEFAULT '',
+        first_seen_at TEXT    NOT NULL,
+        last_seen_at  TEXT    NOT NULL,
+        seen_count    INTEGER NOT NULL DEFAULT 0,
+        remark        TEXT    NOT NULL DEFAULT ''
+    )
+    ''',
+    'CREATE INDEX IF NOT EXISTS idx_module_info_sn ON module_info(module_sn)',
+    'CREATE INDEX IF NOT EXISTS idx_module_info_seen ON module_info(last_seen_at DESC)',
+)
+
 _MIGRATIONS = {
     1: _DDL_V1,
     2: _DDL_V2,
     3: _DDL_V3,
     4: _DDL_V4,
     5: _DDL_V5,
+    6: _DDL_V6,
 }
 
 # 初始型号表。**能力矩阵的权威来源是驱动（drivers/*.py 的 CAPS）**，
@@ -834,6 +876,132 @@ def remembered_baud(model_key=None):
         return int(row['uart_baud'] or 0)
     except (TypeError, ValueError):
         return 0
+
+
+# ==================== 模块台账（按 SN，schema v6） ====================
+#
+# 与 `module_profiles` 的分工（别混用）：
+#   module_profiles  一行 = **一个型号**。存"这个型号的命令集能力 / 默认波特率记忆"。
+#   module_info      一行 = **一块板子**。存"这块板子现在是什么状态"。
+#
+# 写入时机只有一处：`service` 识别出型号、读到 `info()` 之后立刻 `touch_module()`。
+# 不做成"标定成功才写" —— 那样没标定过的模块在台账里永远不存在，
+# 而"这块板子上次插在哪个口"恰恰是标定之前就要回答的问题。
+
+def sn_key(module_sn='', unique_id='', model_key='', port=''):
+    """算台账主键。优先 SN，其次唯一 ID，最后退回"型号:端口"。
+
+    为什么要这条降级链：部分固件（例如 LC29HBS 的早期版本）`$PQTMVERNO` 里
+    SN 字段是空的；再退一步连唯一 ID 都没有时，只能用"型号+端口"凑一个 ——
+    这个键不稳（换口就是新行），但**比不记好**，至少能看出"这个口上用过什么"。
+    最坏情况是同一块板子产生多行，事后可以靠 `module_sn` 索引人工归并。
+    """
+    sn = str(module_sn or '').strip()
+    if sn:
+        return f'sn:{sn}'
+    uid = str(unique_id or '').strip()
+    if uid:
+        return f'uid:{uid}'
+    model = str(model_key or '').strip().lower()
+    pname = str(port or '').strip().upper()
+    if model or pname:
+        return f'loc:{model}:{pname}'
+    return ''
+
+
+def touch_module(model_key='', display_name='', info=None, port='', baud=0,
+                 method='', role=''):
+    """记一次"看见这块模块"。已存在就更新状态，不存在就插入。
+
+    `info` 是驱动 `info()` 的返回字典，键名各驱动不完全一致，所以这里逐项容错取值，
+    取不到就保留库里旧值 —— **不能用空串覆盖掉上次读到的好数据**：
+    有些固件第二次回读 `$PQTMVERNO` 少了 SN 字段，一路覆盖下去台账就空了。
+
+    失败不抛异常：台账是状态快照，不能因为它写不进去就中断正在跑的标定。
+    """
+    info = info or {}
+    sn = str(info.get('sn') or info.get('serial') or info.get('module_sn') or '').strip()
+    uid = str(info.get('unique_id') or info.get('uid') or '').strip()
+    key = sn_key(sn, uid, model_key, port)
+    if not key:
+        logging.debug('模块没有任何可作主键的标识，跳过台账记录')
+        return None
+
+    model = str(info.get('model') or info.get('model_name') or model_key or '').strip()
+    firmware = str(info.get('firmware') or info.get('version') or
+                   info.get('ver_str') or '').strip()
+    build_date = str(info.get('build_date') or info.get('build') or '').strip()
+    hw_version = str(info.get('hw_version') or info.get('hw') or '').strip()
+    now = _now()
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                'SELECT id, module_sn, module_model, display_name, firmware, build_date, '
+                'hw_version, unique_id, role, last_port, last_baud, last_method, seen_count '
+                'FROM module_info WHERE sn_key = ?', (key,)).fetchone()
+            if row is None:
+                conn.execute(
+                    'INSERT INTO module_info (sn_key, module_sn, module_model, display_name, '
+                    'firmware, build_date, hw_version, unique_id, role, last_port, last_baud, '
+                    'last_method, first_seen_at, last_seen_at, seen_count) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)',
+                    (key, sn, model, str(display_name or ''), firmware, build_date,
+                     hw_version, uid, str(role or ''), str(port or ''), int(baud or 0),
+                     str(method or ''), now, now))
+            else:
+                # 逐字段"有值才覆盖"：老值保留，空值不参与
+                def pick(new, old):
+                    return new if str(new or '').strip() else (old or '')
+
+                conn.execute(
+                    'UPDATE module_info SET module_sn=?, module_model=?, display_name=?, '
+                    'firmware=?, build_date=?, hw_version=?, unique_id=?, role=?, '
+                    'last_port=?, last_baud=?, last_method=?, last_seen_at=?, seen_count=? '
+                    'WHERE sn_key = ?',
+                    (pick(sn, row['module_sn']),
+                     pick(model, row['module_model']),
+                     pick(display_name, row['display_name']),
+                     pick(firmware, row['firmware']),
+                     pick(build_date, row['build_date']),
+                     pick(hw_version, row['hw_version']),
+                     pick(uid, row['unique_id']),
+                     pick(role, row['role']),
+                     pick(port, row['last_port']),
+                     int(baud) if baud else int(row['last_baud'] or 0),
+                     pick(method, row['last_method']),
+                     now, int(row['seen_count'] or 0) + 1, key))
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.warning(f'模块台账写入失败（已忽略）：{e}')
+        return None
+    return key
+
+
+def get_module_info(sn='', unique_id='', model_key='', port=''):
+    """按标识读一条台账。参数为空时返回 None（不做"读全部"的退化）。"""
+    key = sn_key(sn, unique_id, model_key, port)
+    if not key:
+        return None
+    try:
+        with _connect() as conn:
+            row = conn.execute('SELECT * FROM module_info WHERE sn_key = ?', (key,)).fetchone()
+    except sqlite3.Error as e:
+        logging.warning(f'读取模块台账失败（已忽略）：{e}')
+        return None
+    return _row_to_dict(row)
+
+
+def list_module_info(limit=200):
+    """按"最近见过"倒序列出台账，给页面列已知模块用。"""
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                'SELECT * FROM module_info ORDER BY last_seen_at DESC LIMIT ?',
+                (int(limit),)).fetchall()
+    except sqlite3.Error as e:
+        logging.warning(f'列出模块台账失败（已忽略）：{e}')
+        return []
+    return [_row_to_dict(row) for row in rows]
 
 
 # ==================== 阶段事件（P2 统计用，先落表不展示） ====================

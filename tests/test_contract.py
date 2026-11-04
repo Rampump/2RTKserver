@@ -12,6 +12,7 @@ import io
 import os
 import random
 import sys
+import time as time_module
 import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -124,11 +125,18 @@ class TestRoutes(unittest.TestCase):
         ('/calibrate', 'GET'),
         ('/api/calibration/options', 'GET'),
         ('/api/calibration/status', 'GET'),
+        # 串口扫描是**独立**的异步接口：不取串口租约、不受标定看门狗管辖，
+        # 所以不和 /start 共用一条通道，也不会因为正在标定就 409。
+        ('/api/calibration/scan', 'POST'),
+        ('/api/calibration/scan/status', 'GET'),
         ('/api/calibration/detect', 'POST'),
         ('/api/calibration/start', 'POST'),
         ('/api/calibration/abort', 'POST'),
         ('/api/calibration/apply-as-source', 'POST'),
         ('/api/calibration/history', 'GET'),
+        # SN 级台账：只读，与 history（每次标定一行的流水）是两种粒度 ——
+        # 台账一块板子一行，读一次信息就更新，没标定过的模块也在里面。
+        ('/api/calibration/modules', 'GET'),
     }
 
     @classmethod
@@ -994,6 +1002,60 @@ class TestCalibrationIsolation(unittest.TestCase):
             store.CALIBRATION_DB = original
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    def test_module_info_table(self):
+        """SN 级台账：表在、键唯一、"空值不覆盖旧值"。"""
+        import shutil
+        import sqlite3
+        import tempfile
+        from rtkserver.calibration import store
+
+        original = store.CALIBRATION_DB
+        tmpdir = tempfile.mkdtemp(prefix='2rtk-contract-')
+        store.CALIBRATION_DB = os.path.join(tmpdir, 'calibration.db')
+        try:
+            store.init_db()
+            with store._connect() as conn:
+                tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                self.assertIn('module_info', tables, 'module_info 表必须存在（schema v6）')
+                columns = {row[1] for row in conn.execute('PRAGMA table_info(module_info)')}
+                for field in ('sn_key', 'module_sn', 'module_model', 'firmware',
+                              'unique_id', 'role', 'last_port', 'last_baud',
+                              'last_method', 'first_seen_at', 'last_seen_at', 'seen_count'):
+                    self.assertIn(field, columns, f'module_info 缺字段 {field}')
+                indexes = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='module_info'")}
+                self.assertIn('idx_module_info_sn', indexes)
+
+            # 第一次：完整信息
+            key = store.touch_module(
+                model_key='lg290p', display_name='Quectel LG290P',
+                info={'sn': 'QT2024ABC123', 'firmware': 'V1.03',
+                      'build_date': '2024/05/22', 'model': 'LG290P'},
+                port='COM3', baud=115200, method='cors', role='dual')
+            self.assertEqual(key, 'sn:QT2024ABC123')
+
+            # 第二次：固件/日期读到空 —— 绝不能用空串把上次的值覆盖掉，
+            # 否则"有些固件第二次回读缺字段"会把台账一路清空
+            store.touch_module(
+                model_key='lg290p', display_name='Quectel LG290P',
+                info={'sn': 'QT2024ABC123', 'firmware': '', 'build_date': ''},
+                port='COM7', baud=0, method='manual', role='dual')
+            row = store.get_module_info(sn='QT2024ABC123')
+            self.assertEqual(row['seen_count'], 2, '两次观测必须累加')
+            self.assertEqual(row['firmware'], 'V1.03', '空固件不能覆盖旧值')
+            self.assertEqual(row['last_port'], 'COM7', '端口应该更新为最近一次')
+            self.assertEqual(row['last_method'], 'manual')
+            self.assertEqual(row['last_baud'], 115200, 'baud=0 时保留旧值')
+
+            # 无 SN 的降级链：uid → 型号:端口 → 空
+            self.assertEqual(store.sn_key('', 'UID-1', 'um980', 'COM5'), 'uid:UID-1')
+            self.assertEqual(store.sn_key('', '', 'um980', 'com5'), 'loc:um980:COM5')
+            self.assertEqual(store.sn_key('', '', '', ''), '')
+        finally:
+            store.CALIBRATION_DB = original
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     def test_calibration_db_is_git_ignored(self):
         """标定记录是资产也是隐私，绝不能进版本库。"""
         with open(os.path.join(REPO_ROOT, '.gitignore'), 'r', encoding='utf-8') as handle:
@@ -1008,6 +1070,8 @@ class TestCalibrationWeb(unittest.TestCase):
         ('/calibrate', 'GET'),
         ('/api/calibration/options', 'GET'),
         ('/api/calibration/status', 'GET'),
+        ('/api/calibration/scan', 'POST'),
+        ('/api/calibration/scan/status', 'GET'),
         ('/api/calibration/detect', 'POST'),
         ('/api/calibration/start', 'POST'),
         ('/api/calibration/abort', 'POST'),
@@ -1044,7 +1108,12 @@ class TestCalibrationWeb(unittest.TestCase):
         self.assertIn('no-store', (resp.headers.get('Cache-Control') or ''))
 
     def test_busy_task_returns_409(self):
-        """并发任务必须 409，不能排队去抢同一个串口。"""
+        """并发任务必须 409，不能排队去抢同一个串口。
+
+        必须带 `module='lg290p'`：不带型号的端口被当作「未知模块 → 流动站」，
+        在角色闸门那一步就 400 了（见 test_unknown_module_falls_back_to_rover），
+        根本走不到 `start_cors`。这条测的是"两个任务抢同一个串口"，不是角色判定。
+        """
         from rtkserver.web import api_calibration as web
         original = web.calib.start_cors
         web.calib.start_cors = lambda **kwargs: (False, '已有标定任务在进行，请等它结束或先取消', None)
@@ -1052,6 +1121,7 @@ class TestCalibrationWeb(unittest.TestCase):
             client = self._client()
             resp = client.post('/api/calibration/start',
                                json={'method': 'cors', 'port': 'COM9',
+                                     'module': 'lg290p',
                                      'cors': {'host': 'h', 'port': 2101,
                                               'mountpoint': 'MP'}})
             self.assertEqual(resp.status_code, 409)
@@ -2069,6 +2139,29 @@ class TestCalibrationWriteChain(unittest.TestCase):
         for name in ('GGA', 'RTCM3-1005', 'RTCM3-1033'):
             self.assertEqual(snapshot['rates'][name], 1)
         self.assertTrue(backup.usable(snapshot)[0])
+
+    def test_backup_mode_carries_normalized_role(self):
+        """备份里的 `mode` 装的是**角色**，必须额外存归一化的 `role`。
+
+        三家驱动 `get_mode()` 的 `text` 取值来源不同（LG290P 读 RCVRMODE、
+        LC29H(BS) 用 SVIN Mode 反推），而 `svin['mode']` 装的是坐标模式
+        （fixed/survey_in/disabled）。两个 `mode` 字段同名不同义，
+        还原/展示一律走 role，避免混用。
+        """
+        from rtkserver.calibration import backup
+
+        self.assertEqual(backup._role_of(1, 'rover'), 'rover')
+        self.assertEqual(backup._role_of(2, 'base'), 'base')
+        # code 优先：text 给错也不能盖过协议里的数字
+        self.assertEqual(backup._role_of(2, 'rover'), 'base')
+        # 坐标模式值不是工作模式，必须判 unknown 而不是被当成 base
+        self.assertEqual(backup._role_of(None, 'fixed'), 'unknown')
+        self.assertEqual(backup._role_of(None, 'survey_in'), 'unknown')
+        # 老备份没有 role 字段时按 code 现算，不能因此判成不可还原
+        legacy = {'mode': {'code': 1, 'text': 'rover'}, 'svin': {}}
+        self.assertTrue(backup.usable(legacy)[0])
+        legacy_bad = {'mode': {'code': 0, 'text': 'unknown'}, 'svin': {}}
+        self.assertFalse(backup.usable(legacy_bad)[0])
 
     def test_reboot_tolerates_missing_boot_frame(self):
         """§8.5 降级：等不到开机首帧但串口在出数据，也算重启完成。
@@ -4374,14 +4467,18 @@ class TestLc29hbsRealDevice(unittest.TestCase):
         self.assertEqual(channel.sent, ['PQTMCFGSVIN,R'], '只许查询，不许下发')
         self.assertTrue(data['noop'])
 
-        # 还没有坐标时：verify=True 必须说"还不是基站"，不能假装成功
+        # 还没有坐标时（SVIN Mode=0/1）：单基准站模块**不需要**"先切过去再写"，
+        # 这里必须返回成功并标出 already_base_side，而不是报 base_needs_coords。
+        # 理由：自收敛链上 SWITCH_MODE 在 SVIN_CFG 之前，此刻 Mode 必然是 disabled，
+        # 按 verify 判失败会让全新模块走自收敛第一步就卡住；而这一步对 LC29H
+        # 本来就没有可下发的命令，判失败毫无信息量。真正的动作在 set_fixed_ecef。
         driver, _channel = self._driver([
             ('ok', '$PQTMCFGSVIN,OK,0,0,0,0,0,0*00')])
         ok, message, data = driver.set_mode('base', persist=True, restart=False,
                                             verify=True)
-        self.assertFalse(ok)
-        self.assertEqual(data['error'], 'base_needs_coords')
-        self.assertIn('写入固定坐标', message)
+        self.assertTrue(ok, message)
+        self.assertTrue(data['already_base_side'])
+        self.assertNotIn('error', data)
 
     def test_survey_in_accepts_distance_and_reports_it_ignored(self):
         """7 字段没有 `<Distance>`：接受但不下发，并如实标成 ignored。"""
@@ -4526,8 +4623,15 @@ class TestCrossModelIsolation(unittest.TestCase):
         self.assertNotIn('skipped', writer.result.get('restart') or {})
         self.assertEqual(writer.result['steps'][-1]['stage'], 'RESTART')
 
-    def test_lg290p_rtcm_readback_keeps_seven_fields(self):
-        """LG290P 回读仍是七字段、没有 `msm_type`，流程层继续用 `fields[0]`。"""
+    def test_lg290p_rtcm_readback_translates_seven_fields(self):
+        """LG290P 把七字段翻译成语义化名字，同时原样保留 `fields` 供还原回放。
+
+        这条测试防的是跨型号串味：某个型号改字段形状时把另一个型号带歪。
+        所以它固定的是三件事 ——
+        1. `fields` 仍是 7 项、`fields[0]` 仍是 `'4'`（还原走 `len(fields)==7`）；
+        2. 翻译出来的 `msm_type` 与 `fields[0]` 一致（不能各说各的）；
+        3. 只查询不下发。
+        """
         from rtkserver.calibration.drivers.quectel_lg290p import LG290PDriver
 
         class _Chan:
@@ -4542,10 +4646,16 @@ class TestCrossModelIsolation(unittest.TestCase):
         driver = LG290PDriver(channel)
         ok, _message, data = driver.read_rtcm_config()
         self.assertTrue(ok)
-        self.assertEqual(data['fields'][0], '4')
-        self.assertNotIn('msm_type', data,
-                         'LG290P 不翻译 msm_type，流程层必须继续吃 fields[0]')
-        self.assertEqual(channel.sent, ['PQTMCFGRTCM,R'])
+
+        self.assertEqual(data['fields'], ['4', '0', '-90', '07', '06', '1', '0'],
+                         '原始七字段必须完整保留，还原要原样回放')
+        self.assertEqual(data['msm_type'], 4,
+                         '翻译值必须与 fields[0] 一致')
+        self.assertEqual(data['coord_bits'], 7)
+        self.assertEqual(data['msm_bits'], 6)
+        self.assertEqual(data['enabled'], ['1005', '1006', '1007'],
+                         '07 是位图，0b111 表示 1005/1006/1007 三条全开')
+        self.assertEqual(channel.sent, ['PQTMCFGRTCM,R'], '只查询，不下发')
 
     def test_lg290p_still_fans_out_constellations(self):
         """空星座表是 LC29H(BS) 的声明，不许变成 LG290P 的默认。"""
@@ -4652,12 +4762,22 @@ class TestWriterUsesNormalizedContracts(unittest.TestCase):
                          '只看 fields[0] 会让"没有七字段"的型号永远校验不过')
 
     def test_empty_constellation_list_means_global_switch(self):
-        """`MSM_CONSTELLATIONS = ()` 是"本型号只有一个全局开关"，不能用 `or` 兜掉。"""
+        """`MSM_CONSTELLATIONS = ()` 是"本型号只有一个全局开关"，不能用 `or` 兜掉。
+
+        2026-11 改造后这里不再走 `getattr` 探测（基类已声明该常量），
+        所以断言改看**取值方式**：必须显式判 `is None`，绝不能用
+        `x or ('RTCM3-107X',)` —— 后者会把空元组（有意义的"全局开关"）
+        和一个真没声明的驱动混为一谈。这里的 ``None` 只兜 `driver.X = None`
+        这种手写覆盖，不属于探测。
+        """
         src = self._writer_source()
-        start = src.index("constellations = getattr(self.driver, 'MSM_CONSTELLATIONS'")
+        start = src.index('constellations = self.driver.MSM_CONSTELLATIONS')
         block = src[start:start + 260]
         self.assertIn('is None', block)
         self.assertNotIn("or ('RTCM3-107X',)", block)
+        self.assertNotIn('getattr(self.driver', block,
+                         '直接读类常量即可：基类已声明 MSM_CONSTELLATIONS，'
+                         'getattr 探测会掩盖"驱动没声明"这个事实')
 
 
 class TestMeasureOnlyRequiresRover(unittest.TestCase):
@@ -4688,21 +4808,29 @@ class TestMeasureOnlyRequiresRover(unittest.TestCase):
         block = src[src.index('# 「只测坐标」靠 CORS/NTRIP'):]
         block = block[:block.index('plan = WritePlan.build_cors')]
         self.assertIn('_module_caps(module)', block)
-        self.assertIn("info and info['command_count'] > 0", block,
-                      '必须在"已知型号且有命令集"时才判 dual_mode')
+        # 判据不能是裸的 command_count：UBX 驱动（ZED-F9P）CMD 为空但完全可写。
+        self.assertIn('_has_command_set(info)', block,
+                      '必须在"已知型号且能下发命令"时才判 dual_mode')
         self.assertIn("not info['caps'].get('dual_mode')", block)
 
     def test_frontend_locks_measure_for_base_only(self):
+        """单模 / 流动站模块必须锁掉「仅测量」，理由按角色说。
+
+        判定依据换成了 `methods_of()` 的允许表（`selectedMethods()`），而不是
+        老代码里那个 `!mod.dual_mode` 布尔 —— 三档角色（dual/single/rover）
+        塞不进一个布尔里，而且前后端共用一张表才能保证"能点就一定不会 400"。
+        """
         js = self._read('static', 'calibration.js')
-        self.assertIn('cal.lock.measure_dual', js)
         block = js[js.index('function computeLocks()'):]
         block = block[:block.index('function applyCapabilities()')]
         self.assertIn('locks.external_rover', block,
                       '只测坐标必须在 computeLocks 里被锁')
-        self.assertIn('!mod.dual_mode', block,
-                      '锁的条件是"不是双模模块"')
+        self.assertIn("allowed.indexOf('external_rover') < 0", block,
+                      '锁的条件是"角色的允许方式表里没有仅测量"')
+        self.assertIn('cal.lock.measure_role', block,
+                      '锁文案要带上角色名，用户才知道该换什么模块')
         text = self._read('static', 'i18n.js')
-        self.assertEqual(text.count("'cal.lock.measure_dual'"), 2,
+        self.assertEqual(text.count("'cal.lock.measure_role'"), 2,
                          '中英文各一条')
 
 
@@ -5039,6 +5167,12 @@ class TestManualHeightRequired(unittest.TestCase):
         self.assertIsNotNone(plan.arp)
 
     def test_api_rejects_lat_lon_without_height(self):
+        """经纬度给了、高程没给 → 400，且错误文案点明是高程。
+
+        `module='lg290p'` 不能省：不带型号的口按「未知模块 → 流动站」处理，
+        流动站不支持 `manual`，角色闸门会先返回"不支持写入已知坐标"，
+        就测不到高程校验这一层了。
+        """
         from rtkserver.web.app import create_app
         app = create_app()
         client = app.test_client()
@@ -5046,11 +5180,11 @@ class TestManualHeightRequired(unittest.TestCase):
             sess['user'] = 'admin'
             sess['logged_in'] = True
         for body in ({'method': 'manual', 'port': '/dev/null',
-                      'lat': 30.5, 'lon': 114.3},
+                      'module': 'lg290p', 'lat': 30.5, 'lon': 114.3},
                      {'method': 'manual', 'port': '/dev/null',
-                      'lat': 30.5, 'lon': 114.3, 'height': None},
+                      'module': 'lg290p', 'lat': 30.5, 'lon': 114.3, 'height': None},
                      {'method': 'manual', 'port': '/dev/null',
-                      'lat': 30.5, 'lon': 114.3, 'height': ''}):
+                      'module': 'lg290p', 'lat': 30.5, 'lon': 114.3, 'height': ''}):
             r = client.post('/api/calibration/start', json=body)
             self.assertEqual(r.status_code, 400, body)
             self.assertIn('高程', r.get_json().get('error') or '', body)
@@ -5152,6 +5286,1098 @@ class TestManualHeightRequired(unittest.TestCase):
                              '复用必须跳过没有 ECEF 的记录')
         finally:
             store.CALIBRATION_DB = orig
+
+
+#: 各型号的**期望**角色/能力，作为"模块标记"的唯一期望值表。
+#:
+#: 这张表存在的原因是 `ROLE` / `DUAL_MODE` / `CAPS['dual_mode']` 是三个
+#: 独立字段，改了前两个不会自动改第三个，而运行时三处逻辑（service 的
+#: "只测坐标"闸门、writer 的纯基准站拦截、writer 的兜底切模）**直接读
+#: 后两个**、不从 `ROLE` 折算。UM960L 就是这么漏的：子类只覆盖了
+#: `ROLE='single'`，继承来的 `DUAL_MODE=True` 留在原地，于是"页面上
+#: 只给自收敛+写坐标，后端却放行只测坐标"，点下去必然撞 `MODE ROVER`
+#: 不存在。所以凡是动角色，必须四个字段一起对，这张表就是那道校验。
+_EXPECTED_ROLE_TABLE = {
+    # id:       (role,     dual_mode, svin,  svin_has_status)
+    'lg290p':   ('dual',   True,      True,  True),
+    'lc29hbs':  ('single', False,     True,  True),
+    'zed_f9p':  ('dual',   True,      True,  True),
+    'um960':    ('dual',   True,      True,  False),
+    'um960l':   ('single', False,     True,  False),
+    'um980':    ('dual',   True,      True,  False),
+    'um982':    ('dual',   True,      True,  False),
+}
+
+
+class TestModuleRoleMarking(unittest.TestCase):
+    """模块标记核查（用户指令：LG290P 双模 / LC29HBS 单模 / ZEDF9P 双模 / UM 系列双模）。
+
+    这里锁的是**四个字段的一致性**，不是某个具体值 —— 具体值放
+    `_EXPECTED_ROLE_TABLE`，改型号能力时只改那一张表。
+    """
+
+    def _registry(self):
+        from rtkserver.calibration.drivers import driver_manager
+        driver_manager.load_builtin_drivers()
+        return driver_manager._REGISTRY
+
+    def test_role_and_dual_mode_agree(self):
+        """`ROLE` 与 `DUAL_MODE` / `CAPS['dual_mode']` 必须同值。
+
+        这是三个字段唯一的硬约束：`role == 'dual'` ⟺ `dual_mode is True`。
+        （反向不成立 —— single 和 rover 的 `dual_mode` 都是 False，
+        光看布尔分不出这两种，所以判定"是哪种"仍然只能看 `ROLE`。）
+        """
+        for key, cls in sorted(self._registry().items()):
+            caps = getattr(cls, 'CAPS', {}) or {}
+            role = getattr(cls, 'ROLE', None)
+            dual_attr = getattr(cls, 'DUAL_MODE', None)
+            dual_cap = caps.get('dual_mode')
+            with self.subTest(module=key):
+                self.assertIn(role, ('dual', 'single', 'rover'),
+                              f'{key} 的 ROLE 必须是三档之一')
+                self.assertEqual(
+                    dual_attr, role == 'dual',
+                    f'{key}: ROLE={role!r} 但 DUAL_MODE={dual_attr!r}。'
+                    ' 运行时 service/writer 直接读 DUAL_MODE，不从 ROLE 折算。')
+                self.assertEqual(
+                    dual_cap, role == 'dual',
+                    f"{key}: ROLE={role!r} 但 CAPS['dual_mode']={dual_cap!r}。"
+                    ' 三处运行时逻辑读的是 CAPS 这一份。')
+
+    def test_expected_roles(self):
+        """逐型号核用户给定的期望值。"""
+        reg = self._registry()
+        for key, (role, dual, svin, has_status) in sorted(_EXPECTED_ROLE_TABLE.items()):
+            with self.subTest(module=key):
+                self.assertIn(key, reg, f'{key} 没在注册表里')
+                cls = reg[key]
+                caps = getattr(cls, 'CAPS', {}) or {}
+                self.assertEqual(getattr(cls, 'ROLE', None), role, f'{key} 角色不对')
+                self.assertEqual(getattr(cls, 'DUAL_MODE', None), dual, f'{key} DUAL_MODE 不对')
+                self.assertEqual(caps.get('dual_mode'), dual, f'{key} CAPS dual_mode 不对')
+                self.assertEqual(caps.get('svin'), svin, f'{key} svin 能力位不对')
+                # 缺键按 True 处理（BaseDriver 语义），只有 N4 系列显式声明 False
+                self.assertEqual(caps.get('svin_has_status', True), has_status,
+                                 f'{key} svin_has_status 不对')
+
+    def test_svin_cap_matches_methods(self):
+        """`CAPS['svin']` 与「方式表里有 survey_in」必须一致。
+
+        这是"按钮能亮、点了必 400"的根因：`service.start_survey_in()`
+        第一句就是 `_reject_without_caps(module, 'svin')`，而前端放不放开
+        看的是 `methods_of()`。两边不一致时，用户看到按钮是亮的，
+        点下去收到 400 —— UM960/UM980/UM982 之前就卡在这里。
+        """
+        from rtkserver.calibration.drivers import driver_manager
+        for key, cls in sorted(self._registry().items()):
+            caps = getattr(cls, 'CAPS', {}) or {}
+            methods = driver_manager.methods_of(key)
+            with self.subTest(module=key):
+                if 'survey_in' in methods:
+                    self.assertIs(caps.get('svin'), True,
+                                  f'{key}: 方式表里有 survey_in，但 CAPS["svin"] 不是 True。'
+                                  ' 前端会放开"自收敛"按钮，后端 start_survey_in 会拒。')
+
+    def test_no_status_models_route_to_time_branch(self):
+        """没有收敛进度语句的型号必须在 writer 里走"按时间等"分支。
+
+        `svin_has_status=False` 只是**声明**，真正生效要靠 `_step_svin_wait`
+        的分流。这里把调度器和两个分支都锁住，防止有人后来把分流删了
+        只留下能力位 —— 那种情况能力位变成纯装饰，N4 会回落去轮询一个
+        永远不来的 `$PQTMSVINSTATUS`，一路跑到超时。
+        """
+        with io.open(os.path.join(REPO_ROOT, 'rtkserver', 'calibration', 'writer.py'),
+                     encoding='utf-8') as handle:
+            src = handle.read()
+        self.assertIn('def _step_svin_wait_by_status(', src)
+        self.assertIn('def _step_svin_wait_by_time(', src)
+        self.assertIn('def _gga_ecef(', src, '按时间等的那条支路需要从 GGA 反算 ECEF')
+        # 调度器必须真的按能力位分流，而不是无条件走某一条
+        block = src[src.index('def _step_svin_wait('):]
+        block = block[:block.index('def _step_svin_wait_by_status(')]
+        self.assertIn('svin_has_status', block, '调度器要读能力位')
+        self.assertIn('_step_svin_wait_by_time', block)
+        self.assertIn('_step_svin_wait_by_status', block)
+
+
+class TestSvinModeContract(unittest.TestCase):
+    """`get_svin_config()['mode']` 必须与 Quectel 同口径（三态）。"""
+
+    _THREE_STATES = ('disabled', 'survey_in', 'fixed')
+
+    def _driver_source(self, filename):
+        with io.open(os.path.join(REPO_ROOT, 'rtkserver', 'calibration',
+                                  'drivers', filename), encoding='utf-8') as handle:
+            return handle.read()
+
+    def test_all_drivers_report_three_state_mode(self):
+        """回读键名不统一会让 `writer._svin_config_verified()` 永远判失败。
+
+        它只认 `readback.get('mode') == 'survey_in'`。UM 驱动早先回的是
+        N4 原生口径 `'base'`，于是每次 Survey-in 配置回读都判"模式不是
+        survey_in"，重发一轮仍不符就整单失败 —— UM960/UM980/UM982 的
+        「自收敛」不是没实现，是键名对不上。
+
+        这里做**静态**校验：两个驱动源码里，`mode` 键的取值都必须落在三态内。
+        （跑不出真值是因为 `get_svin_config()` 要发命令回读，无通道时
+        会直接 AttributeError —— 那是通道的问题，不是口径的问题。）
+        """
+        for filename, native_hint in (('quectel_lg290p.py', 'survey_in'),
+                                      ('quectel_lc29hbs.py', 'survey_in'),
+                                      ('unicore_n4.py', 'norm')):
+            src = self._driver_source(filename)
+            with self.subTest(driver=filename):
+                body = src[src.index('def get_svin_config('):]
+                # 截到下一个方法定义为止
+                nxt = body.find('\n    def ', 1)
+                if nxt > 0:
+                    body = body[:nxt]
+                self.assertRegex(body, r"'mode':",
+                                 f'{filename} 的 get_svin_config 没给 mode 键')
+                # 三态的字符串必须都出现过（映射表或归一化表达式）
+                for state in self._THREE_STATES:
+                    self.assertIn(state, body,
+                                  f'{filename} 的 get_svin_config 缺 {state} 这一态')
+
+    def test_quectel_mode_uses_verbatim_three_state(self):
+        """Quectel 侧 `mode` 直接取三态码，不接受原生方言串。"""
+        src = self._driver_source('quectel_lg290p.py')
+        body = src[src.index('def get_svin_config('):]
+        nxt = body.find('\n    def ', 1)
+        if nxt > 0:
+            body = body[:nxt]
+        self.assertIn("{0: 'disabled', 1: 'survey_in', 2: 'fixed'}", body,
+                      'PQTMCFGSVIN 的 Mode 码必须是 0/1/2 直译，别再加中转')
+
+    def test_n4_normalises_and_keeps_native(self):
+        """N4 侧 `mode` 必须是归一化后的三态，原生口径另存 `mode_raw`。
+
+        不能反过来（`mode` 给 'base'、归一化值另放一个键）：流程层只读
+        `mode`，它在 writer / backup 里被当成三态用了至少三处。
+        """
+        src = self._driver_source('unicore_n4.py')
+        body = src[src.index('def get_svin_config('):]
+        nxt = body.find('\n    def ', 1)
+        if nxt > 0:
+            body = body[:nxt]
+        self.assertIn("'mode': norm", body,
+                      "N4 的 mode 必须给归一化三态（norm），不能给原生 'base'")
+        self.assertIn("'mode_raw'", body,
+                      'N4 原生口径必须另存 mode_raw，写日志/排障要看')
+        # 归一化的两个关键映射：time → survey_in
+        self.assertIn("'time': 'survey_in'", body,
+                      "variant='time'（MODE BASE TIME）必须归一化成 survey_in")
+
+
+class TestEcefInputContract(unittest.TestCase):
+    """`_check_ecef()` 的入参形态契约（真机实测 500 的回归防线）。
+
+    背景：`POST /api/calibration/start` 传 `{'x':..,'y':..,'z':..}` 时，
+    早先的 `_check_ecef` 按 `values[0]` 取值 → `KeyError: 0` → Flask 渲染
+    HTML 500。前端 `calibration.js` 十几处都是 `res.json()` 直取，拿到 HTML
+    只能显示"网络错误"，真实原因传不到用户眼前。
+
+    契约三句话：
+      1. 序列和字典**都要认**（两条都是真实通路）；
+      2. 任何非法输入**只能是 `ValueError`**，不能漏 `KeyError`/`TypeError`；
+      3. NaN / Inf 必须挡（它们能过 `float()`，却让所有范围比较失效）。
+    """
+
+    def _fn(self):
+        from rtkserver.calibration.writer import _check_ecef
+        return _check_ecef
+
+    def test_accepts_sequence_and_dict(self):
+        f = self._fn()
+        want = (-2001277.2129, 5416697.0103, 2699549.4332)
+        self.assertEqual(f(list(want)), want)
+        self.assertEqual(f(tuple(want)), want)
+        self.assertEqual(f({'x': want[0], 'y': want[1], 'z': want[2]}), want)
+
+    def test_dict_missing_key_is_value_error(self):
+        f = self._fn()
+        for bad in ({'x': 1, 'y': 2}, {'x': 1, 'z': 3}, {}):
+            with self.assertRaises(ValueError, msg=f'{bad} 应报 ValueError'):
+                f(bad)
+
+    def test_never_leaks_keyerror(self):
+        """漏 KeyError 就是 500；这里钉死它只能 ValueError。"""
+        f = self._fn()
+        for bad in (None, 'abc', [1, 2], {'y': 1, 'z': 2}, 5):
+            try:
+                f(bad)
+            except ValueError:
+                pass
+            except Exception as e:                   # noqa: BLE001
+                self.fail(f'{bad!r} 漏出了 {type(e).__name__}: {e}（应为 ValueError）')
+            else:
+                self.fail(f'{bad!r} 没被拦住')
+
+    def test_rejects_nan_and_inf(self):
+        """NaN 能过 float()，但所有范围比较都是 False —— 必须单独挡。"""
+        f = self._fn()
+        for value in (float('nan'), float('inf'), float('-inf')):
+            with self.assertRaises(ValueError, msg=f'{value!r} 必须被拒'):
+                f([value, 5416697.0, 2699549.0])
+
+    def test_rejects_latlon_as_ecef(self):
+        f = self._fn()
+        with self.assertRaises(ValueError):
+            f([110.27, 25.20, 164.5])
+
+
+class TestSvinTimeoutFallback(unittest.TestCase):
+    """自收敛必须有兜底上限，不能无限等（真机实测暴露）。
+
+    背景：模块没天线时 `$PQTMSVINSTATUS` 照样 1 Hz 输出，但 `Obs` 恒为 0。
+    早先 `_step_svin_wait_by_status` 只在 `svin_timeout` 非空时才判超时，
+    于是任务**永不结束**、串口被占到进程重启；而同文件的
+    `_step_svin_wait_by_time` 一直有兜底 —— 两条路不对称。
+    """
+
+    def test_constants_exist_and_are_sane(self):
+        from rtkserver.calibration import writer
+        self.assertGreater(writer.SVIN_TIMEOUT_PER_OBS, 1.0,
+                           '系数至少 >1，否则"收星慢但确实在前进"会被误掐')
+        self.assertGreaterEqual(writer.SVIN_DEFAULT_TIMEOUT_MIN, 300.0,
+                                '下限不能太小，否则档位配错时正常收敛被掐掉')
+
+    def test_status_branch_has_fallback(self):
+        """源码里必须有兜底表达式，而不是只有 `if self.svin_timeout and ...`。"""
+        import inspect
+        from rtkserver.calibration.writer import CoordinateWriter
+        body = inspect.getsource(CoordinateWriter._step_svin_wait_by_status)
+        self.assertIn('SVIN_TIMEOUT_PER_OBS', body,
+                      'by_status 分支必须用档位推算兜底上限')
+        self.assertIn('SVIN_DEFAULT_TIMEOUT_MIN', body,
+                      'by_status 分支必须用兜底下限')
+
+    def test_all_profiles_get_bounded_limit(self):
+        from rtkserver.calibration.writer import (
+            SVIN_DEFAULT_TIMEOUT_MIN, SVIN_TIMEOUT_PER_OBS, SURVEY_PROFILES)
+        for key, preset in SURVEY_PROFILES.items():
+            limit = max(SVIN_DEFAULT_TIMEOUT_MIN,
+                        preset['count'] * SVIN_TIMEOUT_PER_OBS)
+            self.assertTrue(600 <= limit <= 4 * 3600,
+                            f'{key} 档的兜底上限 {limit}s 不合理')
+
+
+class TestCalibrationApiErrorShape(unittest.TestCase):
+    """标定 API 的 5xx 必须是 JSON，不能是 HTML 错误页。
+
+    前端有十几处 `res.json()` 直取；拿到 `<!doctype html>` 就是
+    `SyntaxError`，用户只能看到"网络错误"，真实原因完全丢失。
+    """
+
+    def test_5xx_is_json_for_calibration_api(self):
+        import rtkserver.web.api_calibration as mod
+        app = mod.app if hasattr(mod, 'app') else None
+        if app is None:
+            # 本模块不持 app，直接读实现了兜底的那个函数
+            src = open(mod.__file__, encoding='utf-8').read()
+            self.assertIn('_install_json_error_page', src)
+            self.assertIn('after_request', src,
+                          '必须用 after_request 改写 5xx，且限定在标定前缀内')
+            self.assertIn("/api/calibration/", src,
+                          '兜底必须限定前缀，不能污染数据面接口')
+            return
+        client = app.test_client()
+        # 故意触发一个 5xx：不存在的路径走不到这里，改为直接断言钩子存在
+        self.assertTrue(any(getattr(f, '__name__', '') == '_jsonify_calib_errors'
+                            for f in app.after_request_funcs.get(None, [])))
+
+
+class TestUbxQueryVsConfigSemantics(unittest.TestCase):
+    """UBX 的**查询类**与**配置类**报文必须走不同的等待方式。
+
+    ## 这条契约是怎么来的（真机测试暴露的设计缺陷）
+
+    `detect()` 原来调的是 `_send_ubx(*K.MSG_MON_VER, b'', retries=3)`。
+    `_send_ubx` 等的是 `UBX-ACK-ACK`(05 01)，而 **MON-VER 是查询类报文，
+    模块永远不回 05 01，只回一条带载荷的 0A 04**。于是每轮白等 1.5 秒、
+    重试 3 次共约 5 秒，然后判 `timeout` —— 模块明明答了，驱动说没收到。
+
+    这个错误最坏的地方不是慢，而是**它把排查方向带偏**：失败文案写
+    "未收到 UBX-MON-VER 应答，不是 u-blox Gen9 模块"，现场会去查
+    流控、TX/RX 接线、固件升级模式，而真正的原因只是"等错了报文类型"。
+    同一次真机测试里扫描器（裸读字节）明明读到了 MON-VER，
+    两个组件结论相反，就是这个 bug 的指纹。
+
+    ## 三条断言锁住什么
+
+    1. `detect()` 的源码里不能出现 `_send_ubx`（回到老路就红）；
+    2. 只回内容、不回 ACK 的模块，`info()` 必须**认出来**且够快；
+    3. 把配置类报文误传给 `_poll_ubx()` 必须**立刻抛 DriverBug**，
+       而不是静默超时 1.5 秒再报一个指向硬件的错。
+    """
+
+    def test_detect_uses_poll_not_send(self):
+        """只查**真实调用**，不看注释 —— 注释里解释"为什么不用 _send_ubx"是正当的。
+
+        用 AST 取 `self.xxx(...)` 形式的调用名，字符串匹配会被大段解释性
+        注释误伤（本项目的驱动注释写得很长，正是为了让后来人不再踩同一个坑）。
+        """
+        import inspect
+        from rtkserver.calibration.drivers.ublox_zed_f9p import ZEDF9PDriver
+
+        tree = ast.parse(inspect.getsource(ZEDF9PDriver.detect).replace(
+            '    def detect', 'def detect', 1))
+        called = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                value = func.value
+                if isinstance(value, ast.Name) and value.id == 'self':
+                    called.add(func.attr)
+
+        self.assertIn('_poll_ubx', called, 'detect 必须用 _poll_ubx 等查询应答')
+        self.assertNotIn('_send_ubx', called,
+                         'detect 不能走等 ACK 的配置路径（MON-VER 不回 ACK）')
+
+    def test_query_reply_without_ack_is_accepted(self):
+        """模块只回 MON-VER 内容、一个 ACK 都不回 —— 这是真实 u-blox 行为。"""
+        from rtkserver.calibration.drivers.base import Channel, ubx_frame
+        from rtkserver.calibration.drivers.ublox_zed_f9p import ZEDF9PDriver
+
+        class FakePort:
+            """最小串口替身：只对查询类报文回内容，配置类一律不回。"""
+
+            def __init__(self):
+                self.port = 'FAKE'
+                self.baudrate = 38400
+                self.is_open = True
+                self.rx = b''
+
+            def write(self, data):
+                if len(data) >= 4 and data[2] == 0x0A and data[3] == 0x04:
+                    sw = b'EXT CORE 1.00 (61b2dd)'.ljust(30, b'\x00')
+                    hw = b'00190000'.ljust(10, b'\x00')
+                    ext = b'ROM BASE 0x118B2060'.ljust(30, b'\x00')
+                    ext += b'FWVER=HPG 1.32'.ljust(30, b'\x00')
+                    ext += b'MOD=ZED-F9P'.ljust(30, b'\x00')
+                    self.rx += ubx_frame(0x0A, 0x04, sw + hw + ext)
+                elif len(data) >= 4 and data[2] == 0x0A and data[3] == 0x09:
+                    self.rx += ubx_frame(0x0A, 0x09, bytes(60))
+                # 注意：**故意不回任何 05 01 / 05 00**
+                return len(data)
+
+            def flush(self):
+                pass
+
+            def read(self, n=256):
+                out, self.rx = self.rx[:n], self.rx[n:]
+                return out
+
+            def reset_input_buffer(self):
+                self.rx = b''
+
+            def close(self):
+                self.is_open = False
+
+        channel = Channel(port='FAKE', serial_instance=FakePort())
+        driver = ZEDF9PDriver(channel)
+        started = time_module.time()
+        ok, message, data = driver.info()
+        elapsed = time_module.time() - started
+
+        self.assertTrue(ok, f'只回内容的模块应该被认出来，实际：{message}')
+        self.assertIn('ZED-F9P', message)
+        self.assertEqual(data.get('model_key'), 'zed_f9p')
+        # 旧实现要白等 4.5s+（3 次 × 1.5s）。现在两条查询各 1.5s 封顶，
+        # 正常路径 1 秒内返回。给到 3 秒容忍 CI 抖动。
+        self.assertLess(elapsed, 3.0, f'查询应答不该慢等 ACK，实际耗时 {elapsed:.2f}s')
+
+    def test_config_message_rejected_by_poll(self):
+        """配置类报文误传进 `_poll_ubx()` 必须立刻报错，不能静默超时。"""
+        from rtkserver.calibration.drivers.base import Channel, DriverBug
+        from rtkserver.calibration.drivers.ublox_zed_f9p import (
+            ZEDF9PDriver, _CONFIG_CLASS_MESSAGES)
+
+        self.assertIn((0x06, 0x8A), _CONFIG_CLASS_MESSAGES)   # CFG-VALSET
+        self.assertNotIn((0x0A, 0x04), _CONFIG_CLASS_MESSAGES)  # MON-VER 是查询
+
+        class Quiet:
+            """什么都不回的串口：用来证明"报错是拦出来的，不是超时出来的"。"""
+
+            port, baudrate, is_open = 'FAKE', 38400, True
+
+            def write(self, data):
+                return len(data)
+
+            def flush(self):
+                pass
+
+            def read(self, n=256):
+                return b''
+
+            def reset_input_buffer(self):
+                pass
+
+            def close(self):
+                pass
+
+        driver = ZEDF9PDriver(Channel(port='FAKE', serial_instance=Quiet()))
+        started = time_module.time()
+        with self.assertRaises(DriverBug):
+            driver._poll_ubx((0x06, 0x8A))
+
+
+class TestOutputSnapshotRestore(unittest.TestCase):
+    """`silence_outputs()` 必须是**可逆**的，否则它就是一台单向破坏机。
+
+    ## 这条契约是怎么来的（Com12 真机，ZED-F9P / HPG 1.32）
+
+    那块板子的输出状态：`RTCM_1005/1074/1084/1094/1124/1230` 全 =1，
+    NAV/NMEA/RXM 那 69 个键里**只有 `NAVOUT_NAV_SVIN_USB` 非零**。
+    也就是说它是一台"只剩 RTCM 的纯净基站"—— 用户之前调试时把别的语句关了。
+
+    原先的链路是这样把它彻底弄坏的：
+
+        1. `backup.capture()` 只记 `RATE_TARGETS` 那 12 条
+           （GGA/RMC/GSA/GLL + 七条 RTCM），**一条 NAV-* 都没有**；
+        2. `silence_outputs(keep=('NAV_SVIN',))` 把开着的 NAV/NMEA/RXM 全写 0；
+        3. 还原时 `_restore_messages()` 只回放那 12 条，NAV 一条都放不回。
+
+    结果：模块从此只吐 RTCM + NAV-SVIN，用户 u-center 里星图全空，
+    而界面显示"已按备份回放"、**不报任何错**。这种"看着成功、
+    实际更糟"的损坏比直接报错恶劣得多。
+
+    ## 四条断言锁住什么
+
+    1. 驱动必须**同时**具备快照 / 开启 / 还原三件套（少一个就是单向的）；
+    2. `silence_outputs()` 关掉的键，`snapshot_outputs()` 必须都覆盖到——
+       两者枚举**同一个集合**，不许各写一份；
+    3. 快照要记**全量**（含 0 的）：还原时"本来是关的"也要写回去，
+       否则会把用户原本关着的输出打开，等于反向破坏；
+    4. 流程层必须先快照再静音，**快照失败就不许静音**。
+    """
+
+    def _driver(self):
+        """用真驱动的枚举/键表，只把串口换成记录型替身。"""
+        from rtkserver.calibration.drivers.base import Channel
+        from rtkserver.calibration.drivers.ublox_zed_f9p import ZEDF9PDriver
+
+        class Recorder:
+            """记录每一次写入的键值，能让 VALGET 回读出"刚写进去的值"。"""
+            port, baudrate, is_open = 'FAKE', 38400, True
+
+            def __init__(self):
+                self.rx = b''
+                self.written = []
+
+            def write(self, data):
+                return len(data)
+
+            def flush(self):
+                pass
+
+            def read(self, n=256):
+                out, self.rx = self.rx[:n], self.rx[n:]
+                return out
+
+            def reset_input_buffer(self):
+                self.rx = b''
+
+            def close(self):
+                pass
+
+        port = Recorder()
+        return ZEDF9PDriver(Channel(port='FAKE', serial_instance=port)), port
+
+    def test_driver_exposes_all_three(self):
+        """快照 / 开启 / 还原三件套必须都在，且 CAPS 如实声明。"""
+        from rtkserver.calibration.drivers.ublox_zed_f9p import ZEDF9PDriver
+
+        for name in ('snapshot_outputs', 'restore_outputs', 'enable_outputs',
+                     'silence_outputs', '_output_keys'):
+            self.assertTrue(callable(getattr(ZEDF9PDriver, name, None)),
+                            f'ZEDF9PDriver 缺少 {name}')
+        self.assertTrue(ZEDF9PDriver.CAPS.get('output_snapshot'),
+                        'CAPS 要声明 output_snapshot，流程层才敢走"先快照再静音"')
+        self.assertTrue(ZEDF9PDriver.CAPS.get('silence'),
+                        'silence 不能让位给 output_snapshot，两条能力是互补的')
+
+    def test_silence_and_snapshot_share_one_key_set(self):
+        """静音枚举的键 ⊆ 快照枚举的键：关得掉的都必须能放回。"""
+        from rtkserver.calibration.drivers import ubx_keys as K
+
+        driver, _port = self._driver()
+        ports = ('USB', 'UART1')
+
+        snapshot_keys = set(driver._output_keys(ports))
+        # `silence_outputs` 的 targets 就是 `_output_keys()` 减去 keep，
+        # 所以"关得掉的"必然是 `_output_keys()` 的子集 —— 这里正着验一遍：
+        # 两个方法都真的用同一个枚举（AST 取真实调用，注释里提到不算）。
+        import inspect
+        for func in (driver.silence_outputs, driver.snapshot_outputs):
+            tree = ast.parse(inspect.getsource(func).replace(
+                '    def ', 'def ', 1))
+            called = {n.func.attr for n in ast.walk(tree)
+                      if isinstance(n, ast.Call)
+                      and isinstance(n.func, ast.Attribute)
+                      and isinstance(n.func.value, ast.Name)
+                      and n.func.value.id == 'self'}
+            self.assertIn('_output_keys', called,
+                          f'{func.__name__} 必须复用 _output_keys()，'
+                          f'否则"关掉的那批"和"能恢复的那批"会随时间漂移')
+
+        # RTCM 不在这组枚举里 —— 它由 read_rtcm_config / restore_rtcm_config 管。
+        # 这条断言防的是"哪天有人把 RTCM 也塞进 _output_keys"，
+        # 那样 silence 会把 RTCM 一起关掉，基站直接哑掉。
+        self.assertFalse([k for k in snapshot_keys if k.upper().startswith('RTCM')],
+                         'RTCM 播发键不该进这组枚举：静音不能关基站的主播发')
+        self.assertTrue(all(k in K.ALL_KEYS for k in snapshot_keys))
+
+    def test_snapshot_records_zero_rates_too(self):
+        """快照必须**全量**记录（含 0），否则还原会把用户关着的输出打开。"""
+        driver, _port = self._driver()
+
+        # 伪造一次 VALGET：一半开、一半关
+        keys = driver._output_keys(('USB',))
+        self.assertGreater(len(keys), 10, 'USB 口应该枚举出十几条以上的输出键')
+        fake = {k: (1 if i % 2 == 0 else 0) for i, k in enumerate(keys)}
+
+        original = driver._valget_batched
+        driver._valget_batched = lambda ks, layer=0: (
+            {k: fake[k] for k in ks if k in fake}, 0, [])
+        try:
+            ok, message, data = driver.snapshot_outputs(ports=('USB',))
+        finally:
+            driver._valget_batched = original
+
+        self.assertTrue(ok, message)
+        rates = data.get('rates') or {}
+        self.assertEqual(set(rates), set(fake),
+                         '快照要覆盖全部键，不能只记开着的')
+        self.assertIn(0, rates.values(),
+                      '必须把速率为 0 的也记下来：还原时"本来是关的"同样要写回')
+        self.assertEqual(len(data.get('on') or {}), sum(1 for v in fake.values() if v),
+                         'on 里只放开着的，但 rates 必须是全量')
+
+    def _called_order(self, func):
+        """按源码出现顺序返回**真实调用**的驱动方法名。
+
+        必须走 AST 而不是字符串 find：本项目的注释极长，`_step_setup_messages`
+        里解释"为什么静音前要快照"的那段话本身就提到了 `silence_outputs`，
+        字符串匹配会把它当成调用，顺序就假红了 —— 这个坑刚踩过一次。
+
+        三类都要收：
+            · `self.xxx(...)`                        —— 流程内部方法
+            · `self.driver.xxx(...)`                 —— 驱动方法直接调用
+            · `getattr(self.driver, 'xxx', None)`    —— 驱动能力探测
+        第三类是"能力可选"的统一写法（驱动不一定有这个方法），
+        漏了它会把所有可选能力调用当不存在。
+        """
+        import inspect
+        tree = ast.parse(inspect.getsource(func).replace('    def ', 'def ', 1))
+        calls = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == 'self'):
+                calls.append((node.lineno, node.func.attr))
+                continue
+            # self.driver.silence_outputs(...)
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Attribute)
+                    and isinstance(node.func.value.value, ast.Name)
+                    and node.func.value.value.id == 'self'
+                    and node.func.value.attr == 'driver'):
+                calls.append((node.lineno, node.func.attr))
+                continue
+            # getattr(self.driver, 'snapshot_outputs', None)
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == 'getattr'
+                    and len(node.args) >= 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)):
+                calls.append((node.lineno, node.args[1].value))
+        calls.sort()
+        return [name for _l, name in calls]
+
+    def test_writer_snapshots_before_silence(self):
+        """流程层：先快照 → 再静音；**快照失败就跳过静音**。"""
+        import inspect
+        from rtkserver.calibration import writer as writer_mod
+
+        order = self._called_order(
+            writer_mod.CoordinateWriter._step_setup_messages)
+        self.assertIn('snapshot_outputs', order,
+                      '_step_setup_messages 必须先做输出快照')
+        self.assertIn('silence_outputs', order)
+        self.assertLess(order.index('snapshot_outputs'),
+                        order.index('silence_outputs'),
+                        '快照必须在静音之前 —— 静音后再快照，'
+                        '记下的已经是关掉之后的状态，还原只会把"关"再回放一遍')
+
+        src = inspect.getsource(writer_mod.CoordinateWriter._step_setup_messages)
+        self.assertIn('已跳过静音', src,
+                      '快照失败时要跳过静音：宁可多占带宽，也不能关完没法还原')
+
+    def test_restore_replays_snapshot_after_backup(self):
+        """还原：快照回放必须**排在备份速率回放之后**，让快照为准。
+
+        为什么顺序不能反：备份表（`RATE_TARGETS`）只有 12 条、且不含 NAV；
+        快照是静音前那一刻的**全量**真实状态。两者交集里那 4 条
+        （GGA/RMC/GSA/GLL）会被写两遍，谁在后谁说话 —— 必须让快照说话。
+        """
+        import inspect
+        from rtkserver.calibration import writer as writer_mod
+
+        order = self._called_order(
+            writer_mod.CoordinateWriter._restore_messages)
+        self.assertIn('restore_outputs', order,
+                      '_restore_messages 必须按快照放回输出配置')
+        self.assertIn('set_message_rate', order,
+                      '备份速率回放还在（不能因为加了快照就把它删掉）')
+        self.assertLess(order.index('set_message_rate'),
+                        order.index('restore_outputs'),
+                        '快照回放要在备份速率回放之后：快照更全更准，'
+                        '应当覆盖前者写下的值')
+
+    def test_restore_never_writes_flash(self):
+        """还原只碰 RAM：Flash 一个字节不动，出错也能靠重启回到原配置。"""
+        import inspect
+        from rtkserver.calibration import writer as writer_mod
+        from rtkserver.calibration.drivers.ublox_zed_f9p import ZEDF9PDriver
+
+        src = inspect.getsource(ZEDF9PDriver.restore_outputs)
+        self.assertIn('K.LAYER_RAM', src)
+        self.assertNotIn('K.LAYER_FLASH', src,
+                         'restore_outputs 不许写 Flash：还原本身出错时，'
+                         '用户至少还能靠重启回到原来那份落盘配置')
+        self.assertIn('restore_outputs', inspect.getsource(
+            writer_mod.CoordinateWriter._restore_messages))
+
+    def test_readonly_mode_never_touches_outputs(self):
+        """只测不写（external_rover）不许开输出 —— 那台设备不归我们管。"""
+        import inspect
+        from rtkserver.calibration import writer as writer_mod
+
+        src = inspect.getsource(writer_mod.CoordinateWriter._step_prepare_outputs)
+        self.assertIn('_readonly', src,
+                      '开工前开输出必须先看 _readonly，只读模式一条写命令都不能发')
+        self.assertIn('persist=False', src,
+                      '开输出只改 RAM，不许动 Flash（擦写寿命 + 用户可能特意关的）')
+
+    def test_output_prep_runs_before_all_branches(self):
+        """`run()` 里开启输出的调用必须在所有方式分支之前。"""
+        import inspect
+        from rtkserver.calibration import writer as writer_mod
+
+        src = inspect.getsource(writer_mod.CoordinateWriter.run)
+        pos_prep = src.find('self._step_prepare_outputs')
+        self.assertGreater(pos_prep, -1, 'run() 必须调用 _step_prepare_outputs')
+        for later in ('_step_svin_resume', '_step_cors_collect',
+                      '_step_ensure_base_for_write'):
+            pos = src.find(later)
+            if pos > -1:
+                self.assertLess(pos_prep, pos,
+                                f'开启输出要在 {later} 之前：那一步开始就要读模块输出了')
+
+    def test_enable_outputs_is_idempotent(self):
+        """已经是目标值的键不该重复写（Flash 寿命 + 无谓往返）。"""
+        driver, _port = self._driver()
+        keys = driver._output_keys(('USB',))
+        target = [k for k in keys if k.endswith('NAV_PVT_USB')]
+        self.assertTrue(target, '键表里应该有 NAV_PVT_USB')
+
+        writes = []
+
+        original_get = driver._valget_batched
+        original_set = driver._valset
+
+        def fake_get(ks, layer=0):
+            # 全部已经是 1Hz
+            return {k: 1 for k in ks}, 0, []
+
+        def fake_set(items, layers=0):
+            writes.extend(items)
+            return True, 'ACK', {}
+
+        driver._valget_batched = fake_get
+        driver._valset = fake_set
+        try:
+            ok, message, data = driver.enable_outputs(
+                ['NAV_PVT'], rate=1, ports=('USB',))
+        finally:
+            driver._valget_batched = original_get
+            driver._valset = original_set
+
+        self.assertTrue(ok, message)
+        self.assertEqual(writes, [], '已经是目标值还写，等于白烧一次 Flash')
+        self.assertTrue(data.get('already_on'), '应当如实报告"本来就开着"')
+        self.assertEqual(data.get('enabled'), [],
+                         '一条都没写，enabled 就该是空的（别把 already_on 算进去）')
+
+
+class TestOutputSurfaceIsAbstracted(unittest.TestCase):
+    """F9P 的输出面必须是**驱动抽象命令**，不许和标定流程绑死。
+
+    ## 这条契约怎么来的
+
+    用户原话：`他的驱动应该单独抽象成命令 不能和一键标定的代码架构绑定写死
+    写死了会影响别的模块调用`。
+
+    具体病症是流程层里的 `getattr(self.driver, 'snapshot_outputs', None)`
+    这类**特征探测**。它看起来"更兼容"，实际干了两件坏事：
+
+        1. 把"某个驱动有没有这个方法"推迟到运行期才知道 —— 漏实现时
+           静默跳过，用户只看到"流程卡在等 GGA"，没有任何线索指向根因；
+        2. 让 F9P 的私有机制（MSGOUT 一遍 69 个键、按端口分组、还得先
+           detect_port 探链路）事实上升级成了流程层的**可选依赖**，
+           而 LG290P / LC29H(BS) / N4 走的是完全不同的文本单键机制。
+
+    正确形态：`BaseDriver` 声明三个抽象命令并给出**通用默认实现**
+    （Quectel/Unicore 退化成逐条 `set_message_rate`，`snapshot_outputs`
+    回 unsupported 让流程层安全跳过静音），F9P 在**自己内部**覆盖成
+    VALGET/VALSET 整组操作。流程层永远按基类签名调用，不认型号。
+
+    ## 断言锁住四件事
+
+    1. 基类必须有这三个方法（否则"抽象"只是空话，别人也没法实现）；
+    2. 流程层不许再用 `getattr` 探测这三个名字（AST 判，注释不算）；
+    3. 三个方法的**前三个位置参数**两边一致（F9P 多出来的必须带默认值）；
+    4. 键表自描述：`OUTPUT_FANOUT` 与 `_output_keys()` 枚举同一个集合，
+       且端口全集从键表派生而不是驱动里再抄一份。
+    """
+
+    OUTPUT_API = ('snapshot_outputs', 'enable_outputs', 'restore_outputs')
+
+    def test_base_driver_declares_three_commands(self):
+        """基类必须有这三条命令，且真的可调用（不是 NotImplementedError 桩）。"""
+        from rtkserver.calibration.drivers.base import BaseDriver
+
+        for name in self.OUTPUT_API:
+            self.assertTrue(callable(getattr(BaseDriver, name, None)),
+                            f'BaseDriver 缺少抽象命令 {name}()：'
+                            f'没有基类声明，流程层就只能靠 getattr 探测')
+
+    def test_base_defaults_are_usable_not_stubs(self):
+        """默认实现必须是**能用的退路**，不是抛异常。
+
+        `snapshot_outputs` 默认回 unsupported（流程层据此跳过静音）；
+        `enable_outputs` / `restore_outputs` 默认逐条走 `set_message_rate`。
+        抛 NotImplementedError 会让 LG290P / LC29H(BS) / N4 在流程层直接崩。
+        """
+        import inspect
+        from rtkserver.calibration.drivers.base import BaseDriver
+
+        for name in self.OUTPUT_API:
+            src = inspect.getsource(getattr(BaseDriver, name))
+            self.assertNotIn('raise NotImplementedError', src,
+                             f'{name}() 的基类默认实现不能抛 NotImplementedError：'
+                             f'那是"每个驱动都必须自己写"，等于把可选能力变成硬依赖')
+        self.assertIn('set_message_rate', inspect.getsource(
+            BaseDriver.enable_outputs),
+            'enable_outputs 的默认实现应当逐条 set_message_rate')
+        self.assertIn('set_message_rate', inspect.getsource(
+            BaseDriver.restore_outputs),
+            'restore_outputs 的默认实现应当逐条 set_message_rate')
+
+    def test_write_layer_has_no_feature_probing_on_output_api(self):
+        """流程层不许对这三条命令做 `getattr` 探测 —— 只能是直接调用。"""
+        import inspect
+        from rtkserver.calibration import writer as writer_mod
+
+        # 只查**真正会发命令**的那几个方法，不扫全文件：
+        # `_restore_messages` 里 `getattr(self.driver, 'restore_rtcm_config')`
+        # 属于 RTCM 面，是另一条待收口的线，不该让这里的断言假红。
+        targets = [
+            writer_mod.CoordinateWriter._step_prepare_outputs,
+            writer_mod.CoordinateWriter._step_setup_messages,
+            writer_mod.CoordinateWriter._restore_messages,
+        ]
+        for func in targets:
+            tree = ast.parse(inspect.getsource(func).replace('    def ', 'def ', 1))
+            probed = [
+                node.args[1].value
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == 'getattr'
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+                and node.args[1].value in self.OUTPUT_API
+            ]
+            self.assertEqual(probed, [],
+                             f'{func.__name__} 里还在探测 {probed}：'
+                             f'改成直接 self.driver.xxx() —— '
+                             f'基类已经给了默认实现，探测只会掩盖漏实现')
+
+    def test_override_signatures_stay_call_compatible(self):
+        """F9P 覆盖实现的前几个位置参数必须与基类一致，扩展位必须带默认值。
+
+        流程层一律按基类签名调用，所以 `ports` / `strict` 这类 F9P 专有的
+        参数只能作**带默认值的尾巴**，不能插到前面。
+        """
+        import inspect
+        from rtkserver.calibration.drivers.base import BaseDriver
+        from rtkserver.calibration.drivers.ublox_zed_f9p import ZEDF9PDriver
+
+        for name in self.OUTPUT_API:
+            base_ps = list(inspect.signature(
+                getattr(BaseDriver, name)).parameters.values())[1:]   # 去掉 self
+            sub_ps = list(inspect.signature(
+                getattr(ZEDF9PDriver, name)).parameters.values())[1:]
+            self.assertGreaterEqual(len(sub_ps), len(base_ps),
+                                    f'{name}() 的参数比基类少，覆盖后流程层会 TypeError')
+            for i, bp in enumerate(base_ps):
+                self.assertEqual(sub_ps[i].name, bp.name,
+                                 f'{name}() 第 {i + 1} 个位置参数应为 {bp.name!r}，'
+                                 f'实际 {sub_ps[i].name!r}：流程层是按基类位置传的')
+            for extra in sub_ps[len(base_ps):]:
+                self.assertNotEqual(extra.default, inspect.Parameter.empty,
+                                    f'{name}() 的扩展参数 {extra.name!r} 必须带默认值')
+
+    def test_key_table_self_describes_ports(self):
+        """`OUTPUT_FANOUT` 是 MSGOUT 键的唯一登记处，端口全集由它派生。"""
+        from rtkserver.calibration.drivers import ubx_keys as K
+
+        self.assertTrue(K.OUTPUT_FANOUT, 'ubx_keys 必须登记 OUTPUT_FANOUT')
+        known = set(K.ALL_KEYS)
+        self.assertEqual([k for k in K.OUTPUT_FANOUT if k not in known], [],
+                         'OUTPUT_FANOUT 里的每个键都必须在 ALL_KEYS 里，'
+                         '否则 VALGET 会拿一个固件不认识的键去问')
+        self.assertEqual(set(K.OUTPUT_PORTS),
+                         {'I2C', 'UART1', 'UART2', 'USB', 'SPI'},
+                         '五个物理口都要覆盖；少一个会让那个口永远静不掉')
+
+        # RTCM 播发键（`RTCM_1005` 这种纯数字形态）绝不许混进来。
+        # `RXMOUT_RXM_RTCM_*` 是 RXM 族里名为 RTCM 的 UBX 报文，
+        # 不是基站 1005 播发开关 —— 所以按"RTCM_数字"判，不按含 RTCM 判。
+        import re as _re
+        bad = [k for k in K.OUTPUT_FANOUT if _re.search(r'RTCM_\d', k)]
+        self.assertEqual(bad, [], f'RTCM 播发键不该进 MSGOUT 枚举：{bad}')
+
+    def test_output_keys_matches_fanout(self):
+        """`_output_keys()` 结果必须与按端口过滤 `OUTPUT_FANOUT` **完全一致**。
+
+        以前是靠 `f'{prefix}{name}_{port}'` 拼字符串，正确性依赖
+        "这个口真的有这个键"和"UART1 后缀是不是空串"两条隐式约定。
+        现在改成以键表为准，这条断言就是那个改动的锁。
+        """
+        from rtkserver.calibration.drivers.base import Channel
+        from rtkserver.calibration.drivers.ublox_zed_f9p import ZEDF9PDriver
+        from rtkserver.calibration.drivers import ubx_keys as K
+
+        class _Null:
+            port, baudrate, is_open = 'FAKE', 38400, True
+            rx = b''
+
+            def write(self, data):
+                return len(data)
+
+            def flush(self):
+                pass
+
+            def read(self, n=256):
+                return b''
+
+            def reset_input_buffer(self):
+                pass
+
+            def close(self):
+                pass
+
+        driver = ZEDF9PDriver(Channel(port='FAKE', serial_instance=_Null()))
+        for ports in (('USB',), ('UART1',), ('USB', 'UART1')):
+            got = set(driver._output_keys(ports))
+            want = {k for k in K.OUTPUT_FANOUT if k.rsplit('_', 1)[-1] in ports}
+            self.assertEqual(got, want, f'端口 {ports} 的枚举结果与键表不一致')
+
+    def test_driver_ports_derive_from_key_table(self):
+        """驱动里的 `PORTS` 不许再抄一份白名单 —— 两份会漂移。"""
+        from rtkserver.calibration.drivers.ublox_zed_f9p import PORTS
+        from rtkserver.calibration.drivers import ubx_keys as K
+
+        self.assertEqual(set(PORTS), set(K.OUTPUT_PORTS),
+                         'PORTS 要从 K.OUTPUT_PORTS 派生：手抄一份的话，'
+                         '固件多曝一个口时驱动会先把合法的口判成非法并 raise DriverBug')
+
+    def test_other_models_are_unaffected(self):
+        """LG290P / LC29H(BS) / N4 / 未知模块 必须照常工作，不走 F9P 那套。"""
+        from rtkserver.calibration.drivers.base import BaseDriver
+        from rtkserver.calibration.drivers import driver_manager
+
+        driver_manager.load_builtin_drivers()
+        registry = driver_manager._REGISTRY
+        self.assertGreaterEqual(len(registry), 4,
+                                f'内置驱动没加载全，注册表只有 {sorted(registry)}')
+
+        for name, cls in registry.items():
+            for api in self.OUTPUT_API:
+                self.assertTrue(callable(getattr(cls, api, None)),
+                                f'{name} 缺 {api}()：基类改了但子类把它覆盖掉了')
+            # 声称 F9P 专属能力的只能是 F9P 自己
+            caps = getattr(cls, 'CAPS', None) or {}
+            if caps.get('output_snapshot'):
+                self.assertEqual(cls.__name__, 'ZEDF9PDriver',
+                                 f'{name} 不该声明 output_snapshot：'
+                                 f'只有 u-blox 那套 MSGOUT 位表需要"先快照再静音"')
+
+        # 基类默认实现必须是"能用但降级"，不是抛异常。
+        self.assertTrue(hasattr(BaseDriver, 'snapshot_outputs'))
+
+
+class TestNoFeatureProbingOnDriver(unittest.TestCase):
+    """流程层/服务层/备份层**一律不许**对驱动做 `getattr` 特征探测。
+
+    ## 为什么这条要从"输出面三个方法"推广到全部
+
+    上一类 `TestOutputSurfaceIsAbstracted` 只锁住了 `snapshot_outputs` /
+    `enable_outputs` / `restore_outputs` 三个名字，因为当时的现实是"只有这三个
+    引起了事故"。但同一个反模式在另外七处**照旧存在**：
+
+        getattr(self.driver, 'set_mode_memory_only', None)
+        getattr(self.driver, 'enable_survey_status', None)
+        getattr(self.driver, 'set_msm_rate', None)
+        getattr(self.driver, 'set_fix_rate', None)
+        getattr(self.driver, 'ensure_nmea_output', None)
+        getattr(self.driver, 'verify_persisted', None)
+        getattr(self.driver, 'survey_status', None)
+        getattr(self.driver, 'save'/'reboot'/'read_antenna_info'/'read_uart', None)
+
+    每一处的 `if xxx is None: return / skip` 都是一条**静默分支**：
+    漏实现的型号和执行成功的型号，在日志与界面上长得一样。这与
+    `docs/one-click-calibration-framework.zh.md` §"驱动能力必须显式声明"
+    的结论矛盾 —— 那份文档要求"能力不存在时给出可解释的失败"。
+
+    ## 断言
+
+    1. 上面这些方法**全部**在 `BaseDriver` 上有默认实现；
+    2. `writer.py` / `service.py` / `backup.py` 的**函数体**里不再出现
+       `getattr(<驱动对象>, '<方法名>')` 形态（AST 判，注释和 docstring 不算）；
+    3. 类常量（`CAPS` / `PASSIVE` / `RESTART_REQUIRED` / `MODE_VALUE` /
+       `MSM_CONSTELLATIONS`）在基类上都有声明，流程层直接读属性。
+    """
+
+    ABSTRACT_API = (
+        # 已抽到基类、带默认实现（回 unsupported 或退化成通用做法）
+        'snapshot_outputs', 'enable_outputs', 'restore_outputs',
+        'enable_survey_status', 'set_msm_rate', 'set_fix_rate',
+        'verify_persisted', 'survey_status', 'set_mode_memory_only',
+        'restore_rtcm_config', 'ensure_nmea_output', 'read_antenna_info',
+        'read_uart', 'save', 'reboot',
+    )
+    CONST_ATTRS = ('CAPS', 'PASSIVE', 'RESTART_REQUIRED',
+                   'MODE_VALUE', 'MSM_CONSTELLATIONS')
+
+    # 这三个模块是"按型号分支"的重灾区；drivers/ 里的探测是驱动自己的事，不在此限。
+    SCANNED_MODULES = ('writer', 'service', 'backup')
+
+    def _iter_functions(self, module):
+        import inspect
+        for name, obj in vars(module).items():
+            if inspect.isfunction(obj) and obj.__module__ == module.__name__:
+                yield name, obj
+            elif inspect.isclass(obj) and obj.__module__ == module.__name__:
+                for mname, meth in vars(obj).items():
+                    if inspect.isfunction(meth):
+                        yield f'{name}.{mname}', meth
+
+    def _probed_attrs(self, func):
+        """返回该函数体里 `getattr(x, '字面量')` 的全部字面量。"""
+        import inspect
+        try:
+            src = inspect.getsource(func)
+        except (OSError, TypeError):
+            return []
+        # 去掉首行缩进，否则嵌套函数/方法源码无法单独 parse
+        lines = src.splitlines()
+        indent = len(lines[0]) - len(lines[0].lstrip()) if lines else 0
+        src = '\n'.join(line[indent:] if len(line) > indent else line.lstrip()
+                        for line in lines)
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return []
+        out = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == 'getattr'
+                    and len(node.args) >= 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)):
+                out.append(node.args[1].value)
+        return out
+
+    def test_base_declares_every_abstract_api(self):
+        from rtkserver.calibration.drivers.base import BaseDriver
+
+        missing = [n for n in self.ABSTRACT_API
+                   if not callable(getattr(BaseDriver, n, None))]
+        self.assertEqual(missing, [],
+                         f'BaseDriver 缺这些抽象命令：{missing}。'
+                         f'缺一个，流程层就会退回 getattr 探测，'
+                         f'漏实现时静默跳过而不报错')
+
+    def test_default_impls_never_raise_notimplemented(self):
+        import inspect
+        from rtkserver.calibration.drivers.base import BaseDriver
+
+        bad = []
+        for name in self.ABSTRACT_API:
+            src = inspect.getsource(getattr(BaseDriver, name))
+            if 'raise NotImplementedError' in src:
+                bad.append(name)
+        self.assertEqual(bad, [],
+                         f'这些默认实现抛了 NotImplementedError：{bad}。'
+                         f'那不是"抽象"，而是"每个驱动都必须自己写"，'
+                         f'等于把可选能力变成硬依赖')
+
+    def test_no_getattr_probing_in_business_layers(self):
+        import importlib
+        offenders = {}
+        for mod_name in self.SCANNED_MODULES:
+            module = importlib.import_module(f'rtkserver.calibration.{mod_name}')
+            for qualname, func in self._iter_functions(module):
+                hits = [a for a in self._probed_attrs(func) if a in self.ABSTRACT_API]
+                if hits:
+                    offenders[f'{mod_name}.{qualname}'] = hits
+        self.assertEqual(offenders, {},
+                         f'这些地方还在探测驱动方法是否存在：{offenders}。'
+                         f'改成直接调用 —— 基类已有默认实现，'
+                         f'探测只会把"漏实现"变成"什么都没发生"')
+
+    def test_class_constants_declared_on_base(self):
+        """类常量不许用 getattr 兜底：基类已经声明，直接用属性读。"""
+        from rtkserver.calibration.drivers.base import BaseDriver
+
+        missing = [a for a in self.CONST_ATTRS if not hasattr(BaseDriver, a)]
+        self.assertEqual(missing, [],
+                         f'BaseDriver 没声明这些类常量：{missing}。'
+                         f'流程层用 getattr(driver, x, 默认值) 兜底，'
+                         f'会让"驱动没声明"和"驱动声明了默认值"两种情况混在一起')
+
+    def test_persist_check_cap_implies_real_impl(self):
+        """声明了 `persist_check` 的型号必须真的实现 `verify_persisted`。
+
+        以前这里有个 `if not callable(checker): return {'reason': 'no_method'}`
+        分支 —— 它把"声明了能力但没实现"和"这型号本来没这能力"报成了同一种结果。
+        现在要求两者一致：要么都声明、要么都不声明。
+        """
+        from rtkserver.calibration.drivers import driver_manager
+
+        driver_manager.load_builtin_drivers()
+        for name, cls in driver_manager._REGISTRY.items():
+            caps = getattr(cls, 'CAPS', None) or {}
+            if not caps.get('persist_check'):
+                continue
+            impl = cls.__dict__.get('verify_persisted')
+            self.assertIsNotNone(
+                impl,
+                f'{name} 声明了 CAPS["persist_check"] 却没自己实现 '
+                f'verify_persisted()：基类默认实现只回 unsupported，'
+                f'这条能力位就成了空头承诺')
 
 
 if __name__ == '__main__':

@@ -249,6 +249,19 @@
                      所以候选与结果都贴在这里，不依赖任何浮层。 -->
                 <p class="field-hint" id="cal-port-hint"></p>
                 <div class="port-chips is-hidden" id="cal-port-chips"></div>
+                <!-- 协议嗅探结果：每个口一行，给出家族判定（GNSS / 未知 / 噪声 / 忙）
+                     与命中的数据特征。**只判定不做决断** —— 扫到的口全列出来，
+                     不因为"不像 GNSS"就藏起来，用户自己点选。
+                     扫描与标定完全独立：不占串口租约、不受标定看门狗管辖。 -->
+                <div class="scan-panel is-hidden" id="cal-scan-panel">
+                  <div class="scan-head">
+                    <span class="scan-title" id="cal-scan-title"></span>
+                    <button type="button" class="btn btn-link scan-close" id="cal-scan-close"
+                            data-i18n="cal.scan.hide">收起</button>
+                  </div>
+                  <div class="scan-progress is-hidden" id="cal-scan-progress"></div>
+                  <div class="scan-table-wrap" id="cal-scan-table"></div>
+                </div>
               </div>
 
               <div class="cal-grid">

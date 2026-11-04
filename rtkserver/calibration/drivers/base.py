@@ -93,6 +93,34 @@ class DriverBug(Exception):
     """
 
 
+# ==================== 标定方式的规范化 ====================
+# 页面上有 4 张卡，API 里却出现过 6 个名字。先把别名收口成 4 个规范键，
+# 后面所有"支持不支持"的判断才有唯一口径。
+#
+#   cors            一键固定（测完写进去，切基准站）
+#   survey_in       自收敛（SVIN）
+#   manual          写入已知坐标（历史坐标 / 手填 ECEF / 经纬高）
+#   external_rover  仅测量（测完落库就结束，不改模块）
+#
+# 'measure' 曾是"只测不写"的别名，'known' 是"写已知坐标"的别名，
+# 'svin' 是 survey-in 的简称。**保留这些别名**是因为历史记录与老脚本
+# 里存的就是它们，删掉会让"复用上次参数"这条路径失效。
+METHOD_ALIASES = {
+    'cors': 'cors', 'ntrip': 'cors', 'vrs': 'cors',
+    'survey_in': 'survey_in', 'survey-in': 'survey_in', 'svin': 'survey_in',
+    'survey': 'survey_in',
+    'manual': 'manual', 'known': 'manual', 'fixed': 'manual',
+    'external_rover': 'external_rover', 'measure': 'external_rover',
+    'measure_only': 'external_rover', 'rover': 'external_rover',
+}
+
+
+def _normalize_method(method):
+    """把各种写法收成一个规范键；认不出来原样返回（小写）。"""
+    key = str(method or '').strip().lower().replace(' ', '_')
+    return METHOD_ALIASES.get(key, key)
+
+
 # ==================== 超时与重试策略（方案 §4.3） ====================
 # (首等秒, 重试次数, 重试间隔秒)
 TIMING = {
@@ -327,6 +355,13 @@ class Channel:
         self.reply_aliases = {}
         self.cache = {}                   # gga / rmc / gsa / svin / ver / last_line
         self.counters = {'lines': 0, 'frames': 0, 'noise': 0}
+        # 心跳回调：由租约层注入（`CalibrationLease.open()` 里赋值），默认空实现。
+        # 为什么驱动层需要它：`send_ubx()` 的重试循环是**最深的阻塞点** ——
+        # 单条命令等 ACK 最长 1.5s×3 次，一批 10 个键就 40 秒以上，而这段代码
+        # 全在驱动内部，写链路的 `_beat()` 只能包在它外面、包不进循环里。
+        # 驱动层不该直接 import 租约（那样会把"串口工具"绑死在"标定流程"上），
+        # 所以这里只留一个回调口子，谁占着串口谁负责往里塞。
+        self.on_beat = None
         # 链路活性（方案 §14 #1 / #28）：只用来判"**曾经有数据、现在突然没有**"。
         # 从未收到过任何字节时不能判死——模块本来就可能不输出（基准站模式关 NMEA），
         # 那种情况要靠命令应答超时去兜，判据不是这里。
@@ -560,7 +595,21 @@ class Channel:
         `wait_ack=False` 用于 UBX-CFG-RST（重启）—— 它不回 ACK，回了也读不到。
         """
         ack_id = None
+        _t0 = time.time()
         for attempt in range(max(0, int(retries)) + 1):
+            # 每次重试前喂一次心跳。这里是最深的阻塞点：单条命令最坏 1.5s×3 ≈ 5s，
+            # 而 `config_rtcm()` 一批要发十来条 —— 整段 50 秒没有任何阶段变化，
+            # 看门狗按"30 秒不动 = 线程已死"就会把租约收走。
+            if self.on_beat is not None:
+                try:
+                    self.on_beat()
+                except Exception as e:           # noqa: BLE001 - 心跳失败不该影响收发
+                    logging.warning(f'UBX 喂心跳失败：{e}')
+            # 注意：`on_beat is None` 是**正常情况**，不是故障。
+            # 租约层（`CalibrationLease`）打开通道时才注入心跳回调；驱动层的
+            # 单元测试、离线自测、`_poll_ubx()` 这类裸调用都没有心跳。以前这里
+            # 走 `else: logging.warning(...)`，把配置状态当异常刷 —— 一次 `info()`
+            # 就能刷 8 条，真机日志里全是这行，真正的错（timeout）反而被淹没。
             self.cache.get('ubx', {}).pop((0x05, 0x01), None)
             self.cache.get('ubx', {}).pop((0x05, 0x00), None)
             self.write_ubx(cls, msg_id, payload)
@@ -574,16 +623,26 @@ class Channel:
                 line = self.read_line(min(remaining, 0.5))
                 if line is not None:
                     self.absorb(line)        # UBX 型号也可能同时吐 NMEA
+                # 等 ACK 的内层循环里也要喂：`read_line` 可能连续几次都返回 None，
+                # 一轮 1.5 秒看着短，但重试之间叠起来就是几十秒。
+                if self.on_beat is not None:
+                    try:
+                        self.on_beat()
+                    except Exception:            # noqa: BLE001
+                        pass
                 cached = self.cache.get('ubx') or {}
                 if (0x05, 0x01) in cached:   # UBX-ACK-ACK
+                    logging.debug(f'UBX {cls:02X}/{msg_id:02X} ACK（{time.time() - _t0:.2f}s）')
                     return 'ack', 0x01, {}
                 if (0x05, 0x00) in cached:   # UBX-ACK-NAK
+                    logging.debug(f'UBX {cls:02X}/{msg_id:02X} NAK（{time.time() - _t0:.2f}s）')
                     return 'nak', 0x00, {}
                 if remaining <= 0:
                     break
             if attempt < int(retries):
                 logging.debug(f'UBX {cls:02X}/{msg_id:02X} 无 ACK，第 {attempt + 1} 次重试')
                 time.sleep(0.15)
+        logging.debug(f'UBX {cls:02X}/{msg_id:02X} 无应答（{time.time() - _t0:.2f}s）')
         return 'timeout', None, {}
 
     # ---------- 接收 ----------
@@ -814,12 +873,16 @@ class BaseDriver:
         CAPS            能力标记（见下）
 
     CAPS 的固定键（缺键按 False 处理，前端据此灰掉按钮）：
-        dual_mode   能切移动站/基站
-        set_mode    有模式命令
-        svin        支持 Survey-in
-        fixed       支持写固定坐标
-        ant_info    支持写天线信息（1033）
-        ant_delta   支持写天线偏移（1006 DF028）
+        dual_mode       能切移动站/基站
+        set_mode        有模式命令
+        svin            支持 Survey-in
+        svin_has_status 有"收敛进度语句"（$PQTMSVINSTATUS 这类）。
+                        缺键按 True 处理 —— 有 svin 能力的多数型号都有状态输出；
+                        只有 Unicore N4（MODE BASE TIME）明确声明 False，
+                        流程层据此走"按时间等 + 看坐标是否稳定"的降级判定。
+        fixed           支持写固定坐标
+        ant_info        支持写天线信息（1033）
+        ant_delta       支持写天线偏移（1006 DF028）
         msg_rate    支持逐条配置语句速率
         err3        会返回错误码 3（"该命令不支持"）
     """
@@ -830,7 +893,80 @@ class BaseDriver:
     # 自动探测不试它。用于"协议支持但业务上用不上"的型号（例：UM982 双天线定向板
     # 不适合做 RTK 基准站）。隐藏不等于删除 —— 历史记录/手工指定型号仍可正常加载。
     HIDDEN = False
+
+    # ---------- 角色 → 支持哪几种标定方式 ----------
+    # 这张表是**唯一真相**：前端灰化哪几张卡、后端 start_* 放不放行，
+    # 都从这里派生。以前四处各写一套判据（前端 computeLocks、后端
+    # _reject_without_caps、writer 里的 _step_cors_rover_setup），
+    # 改一处忘一处就会出现"按钮能点、点了 400"。现在只有这一份。
+    #
+    # 方式键与 API 的 method 对齐（'external_rover' 就是"仅测量"）。
+    METHODS_BY_ROLE = {
+        # 双模：4 种全支持
+        'dual':   ('cors', 'survey_in', 'manual', 'external_rover'),
+        # 单模（纯基准站）：收不了改正数 → 测不出自己的坐标。
+        # 只能自收敛（靠自己长时间取均值）或直接写已知坐标。
+        'single': ('survey_in', 'manual'),
+        # 流动站：只能测量，固不成基准站
+        'rover':  ('external_rover',),
+    }
+
+    def role(self):
+        """本型号的角色：'dual' / 'single' / 'rover'。
+
+        `ROLE` 是主字段；老驱动只声明了 `DUAL_MODE` 的，按它折算 ——
+        但**纯基准站**（CAPS['set_mode'] is False 且 dual_mode False）必须
+        显式写 ROLE='single'，否则会被误当成流动站。
+        这里的兜底顺序是：ROLE 有值就用 → 否则 dual_mode True 就是 dual
+        → 否则看 CAPS['fixed']：能写固定坐标说明它能当基准站，是 single，
+        不能写就是 rover。
+        """
+        role = str(getattr(self, 'ROLE', '') or '').strip().lower()
+        if role in self.METHODS_BY_ROLE:
+            return role
+        if getattr(self, 'DUAL_MODE', False):
+            return 'dual'
+        caps = getattr(self, 'CAPS', {}) or {}
+        if caps.get('fixed') is True or caps.get('svin') is True:
+            return 'single'
+        return 'rover'
+
+    def supports(self, method):
+        """本型号支持某一种标定方式吗（method 是 API 里的键）。"""
+        return _normalize_method(method) in self.METHODS_BY_ROLE.get(self.role(), ())
+
+    def methods(self):
+        """本型号支持的规范方式键元组（顺序与页面显示一致）。"""
+        return self.METHODS_BY_ROLE.get(self.role(), ())
+
+    def role_label(self):
+        """角色中文名，给界面直接显示。"""
+        return {'dual': '双模（基准站 + 流动站）',
+                'single': '单模（仅基准站）',
+                'rover': '流动站（仅测量）'}.get(self.role(), self.role())
     MATCH_PREFIX = ''
+    # ==================== 模块角色（决定前端显示哪几种标定方式） ====================
+    # 三档，**互斥**，从能力最强到最弱：
+    #
+    #   ROLE_DUAL    'dual'    双模：既能当流动站也能当基准站。
+    #                          4 种标定方式全支持（CORS 一键固定 / 自收敛 /
+    #                          已知坐标写入 / 仅测量）。
+    #   ROLE_SINGLE  'single'  单模：**只能当基准站**，没有流动站模式。
+    #                          只支持「自收敛」和「已知坐标写入」两种。
+    #                          （它收不了 CORS 改正数，所以测不出自己的坐标，
+    #                          "CORS 一键固定"和"仅测量"都做不了 —— 不是懒得做，
+    #                          是物理上做不到：没有差分源就没有厘米级结果。）
+    #   ROLE_ROVER   'rover'   流动站：**只能测量**，不能固定成基准站。
+    #                          只支持「仅测量」。未知模块默认按这一档处理 ——
+    #                          这是最保守的假设：我们不知道它有什么命令，
+    #                          但它只要能吐 NMEA 就能被 CORS 测出坐标。
+    #
+    # `DUAL_MODE` 是历史字段（布尔），保留是为了兼容旧记录与既有判断，
+    # 新代码一律读 `ROLE`。两者由 `role_of()` 统一收口，看到不一致以 ROLE 为准。
+    ROLE = 'rover'
+    # 是否"完全没有命令集"的被动模块（只有 PASSIVE=True 的那个）。流程层据此
+    # 决定"能不能下发命令"，与前端的"能不能写"判据同源。
+    PASSIVE = False
     DUAL_MODE = False
     CAPS = {}
     CMD = {}
@@ -839,6 +975,11 @@ class BaseDriver:
     # 基站要播发哪些 MSM 星座（每项一个独立开关）。流程层按这个清单逐条下发，
     # 少配一个星座，下游就少一个系统的差分。不支持多星座的型号就保持这一档。
     MSM_CONSTELLATIONS = ('RTCM3-107X',)
+    # 配置层面的用户模式名 → 该型号协议里的**物理值**（TMODE / MODE 字段值）。
+    # 流程层只用 'rover' / 'base' 这类角色名，持久化自检却要拿物理值去比对，
+    # 于是由驱动在这张表里自己做翻译。没有模式概念的型号保持空表 ——
+    # 空表意味着"没有可映射的值"，自检就不带期望值，而不是让流程层猜。
+    MODE_VALUE = {}
 
     # ---------- 波特率（官方口径） ----------
     # 该型号厂商文档里写明支持的波特率档位，**按厂商文档原样抄**，不要自行扩展。
@@ -1270,6 +1411,194 @@ class BaseDriver:
     def set_message_rate(self, name, rate, port=None, **kwargs):
         """配某条语句的输出速率。"""
         return self._unsupported(f'配置报文 {name} 的速率')
+
+    # ---------- 输出面（快照 / 开启 / 还原）：型号私有机制，流程层只按语义调 ----------
+    #
+    # 为什么单独抽成一组，而不是塞进 `set_message_rate()` 就完事：
+    # `set_message_rate()` 的粒度是"一条报文一个速率"，背后是**文本单键**
+    # （Quectel 的 `PQTMCFGMSGRATE,W,GGA,1,1`、Unicore 的 `GPGGA COM1 1`）。
+    # 而 u-blox 那套 MSGOUT 是**按端口分组的位表**（NAV/NMEA/RXM 三族 ×
+    # 5 个物理口 × 每条一个键，实测 USB 口就有 69 个键），"整组关掉 / 整组开回来"
+    # 需要对同一批次键做 VALGET / VALSET，还得知道链路到底在哪个口上。
+    # 这层知识**必须留在 F9P 驱动内部**：一旦流程层去拼 `NAVOUT_*_USB` 这种键名，
+    # 或者去判断"是不是 u-blox"，就等于把厂商私有机制写进了公共标定链路。
+    #
+    # 所以约定是：**流程层只认这里的三个语义动作，不认任何键名、任何端口名**。
+    #   型号没有这套机制（Quectel / Unicore / 被动模块）→ 继承下面的默认实现，
+    #   动作退化成"逐条 set_message_rate"，或者直接回"本型号没有"。
+    #   型号有（F9P）→ 在驱动内部覆盖，流程层一个字都不用改。
+    #
+    # 三条能力位（CAPS，缺键按 False）：
+    #   output_snapshot  能做全量快照 + 按快照还原。**没有它就不许静音**：
+    #                    静音关掉的那批键没有任何东西记得住，还原等于凭空猜。
+    #   silence          该型号切基准站后**不会**自动停掉多余输出，需要显式关。
+    #   enable_outputs   支持"按语义名主动打开某几条输出"（GGA / NAV_PVT ...）。
+
+    def snapshot_outputs(self):
+        """把当前链路端口上**全部**输出配置记成一份可回放的快照。
+
+        返回 `(ok, message, data)`，`data` 至少含 `rates`（`{名字: 速率}`，
+        **必须含 0**：本来就是关的也要记，否则还原会把用户关着的输出打开）。
+
+        默认实现：本型号没有"整组快照"的概念，回 `unsupported`。
+        流程层拿到 False 就**跳过静音** —— 宁可不做优化，也不能关完没法还原。
+        """
+        return self._unsupported(
+            '输出配置快照', hint='本型号没有整组输出键，静音会被跳过')
+
+    def enable_outputs(self, want=(), rate=1, persist=False):
+        """把 `want` 里点名的输出按 `rate` 打开（**只开点名的，不碰别的**）。
+
+        `want` 用**语义名**（'GGA' / 'RMC' / 'NAV_PVT' / 'NAV_SVIN' ...），
+        写法与 `set_message_rate()` 一致，驱动负责翻成自家命令。
+
+        默认实现：逐条 `set_message_rate(name, rate)`。对文本单键型号
+        （Quectel / Unicore）这就够了；对按端口分组的型号（F9P）必须覆盖，
+        因为"开哪几个物理口的键"只有驱动自己知道。
+        """
+        if not want:
+            return False, '没有指定要开启的输出', {'error': 'empty'}
+        try:
+            rate = max(1, int(rate))
+        except (TypeError, ValueError):
+            return False, f'速率必须是正整数，收到 {rate!r}', {'error': 'bad_rate'}
+
+        applied, failed = {}, {}
+        for name in want:
+            try:
+                ok, message, _data = self.set_message_rate(name, rate)
+            except Exception as e:                    # noqa: BLE001 - 单条失败不炸整条
+                ok, message = False, f'{type(e).__name__}: {e}'
+            if ok:
+                applied[name] = rate
+            else:
+                failed[name] = message
+        data = {'enabled': sorted(applied), 'already_on': [], 'failed': sorted(failed),
+                'unknown': [], 'rate': rate, 'persist': bool(persist)}
+        if not applied:
+            return False, f'输出一条都没开成：{failed}', data
+        if failed:
+            return False, f'部分输出开启失败：{failed}', data
+        return True, f'已开启 {len(applied)} 条输出（{rate}Hz）', data
+
+    def restore_outputs(self, snapshot):
+        """按 `snapshot_outputs()` 的快照把输出配置放回。
+
+        默认实现：快照里有什么就往 `set_message_rate()` 喂什么。
+        **只写快照里有的名字** —— 快照没读到的保持模块当前值，硬写 0 会把
+        一条原本开着的输出关掉，等于换个方向继续破坏。
+        """
+        if isinstance(snapshot, dict) and 'rates' in snapshot:
+            rates = snapshot.get('rates') or {}
+        elif isinstance(snapshot, dict):
+            rates = snapshot
+        else:
+            return False, f'需要快照 dict 或 {{名字:速率}}，收到 {type(snapshot).__name__}', {
+                'error': 'bad_snapshot'}
+        if not rates:
+            return False, '快照为空，没有可还原的输出配置', {'error': 'empty'}
+
+        restored, failed = [], {}
+        for name, raw in rates.items():
+            try:
+                rate = max(0, int(raw))
+            except (TypeError, ValueError):
+                continue
+            try:
+                ok, message, _data = self.set_message_rate(name, rate)
+            except Exception as e:                    # noqa: BLE001
+                ok, message = False, f'{type(e).__name__}: {e}'
+            if ok:
+                restored.append(name)
+            else:
+                failed[name] = message
+        data = {'restored': restored, 'unchanged': [], 'failed': sorted(failed)}
+        if failed:
+            return False, f'{len(failed)} 条输出还原失败：{failed}', data
+        return True, f'已按快照还原 {len(restored)} 条输出配置', data
+
+    def enable_survey_status(self, enabled=True, rate=1):
+        """打开/关闭"收敛进度语句"的输出（`$PQTMSVINSTATUS` 一类）。
+
+        默认实现：本型号没有进度语句，回 `unsupported`。
+        这与 `CAPS['svin_has_status']=False` 是同一件事的两面：
+        能力位说"别等了，没有"，这里说"也别去开它了"。
+        流程层**不再探测 `hasattr`** —— 探测不到就静默跳过，等于把一个
+        本该报出来的"型号不支持"变成了一次无声的成功。
+        """
+        return self._unsupported(
+            '收敛进度输出', hint='本型号没有进度语句，请按时间等待收敛')
+
+    def set_msm_rate(self, rate=1, offset=0, name='RTCM3-107X'):
+        """单独改某一条 MSM 报文的播发间隔（与 GPS/北斗等星座一一对应）。
+
+        默认实现：不支持逐条 MSM 间隔的型号（比如只有 `RTCM3-107X` 一档的），
+        回 `unsupported`；调用方据此跳过该条，而不是按普通语句去写 ——
+        MSM 的 Rate **不允许 0**，拿 `set_message_rate(name, 0)` 去关它
+        会被模块判参数非法，看起来像"还原失败"。
+        """
+        return self._unsupported(f'单独设置 {name} 的间隔')
+
+    def set_fix_rate(self, interval_ms):
+        """设置定位解算频率（毫秒）。不支持时回 `unsupported`。"""
+        return self._unsupported('设置定位频率')
+
+    def verify_persisted(self, expected=None):
+        """重启前自检：确认刚才写的配置**真的进了 NVM**（而不是只改了内存）。
+
+        默认实现：没有持久化自检的型号，回 `unsupported`；
+        流程层据此记一条"本型号无持久化自检"，**不判失败**。
+        """
+        return self._unsupported('持久化自检')
+
+    def ensure_nmea_output(self, enabled=True, names=('GGA',), persist=False):
+        """确保某几条 NMEA 语句**正在输出**（CORS 采集前的冗余保险）。
+
+        为什么需要这一步：现场有一类很常见的情况 —— 模块当前是基准站模式，
+        基站模式按协议**默认关闭全部 NMEA** 只播 RTCM；或者上一次标定被人为
+        关掉了 GGA。这时串口里一条 `$GxGGA` 都没有，CORS 采集只会一直空转到超时，
+        用户看到的是"等固定解失败"，真正的原因是"根本没让它说话"。
+
+        与 `config_rtcm` / `set_message_rate` 的关系：
+        这里只做"打开输出"这一件事，**不改报文内容、不改频率以外的任何参数**，
+        而且 `persist=False` 是默认值 —— 这条保险通常发生在切到流动站之后、
+        真正写 NVM 之前，不该为此多一次 NVM 写寿命消耗。
+
+        不同的驱动发送方式不同（PQTM 文本 / UBX 二进制 / ASCII 指令），
+        所以基类只给"逐条调 set_message_rate"的通用实现，厂商驱动可以覆盖。
+        返回 `(ok, message, data)`；不支持命令集的驱动由 `_unsupported` 报错，
+        调用方据此决定是告警还是继续。
+        """
+        targets = tuple(names or ('GGA',))
+        rate = 1 if enabled else 0
+        applied, failed = {}, {}
+        for name in targets:
+            try:
+                ok, message, _data = self.set_message_rate(name, rate)
+            except Exception as e:                    # noqa: BLE001 - 单条失败不该炸整条链路
+                ok, message = False, f'{type(e).__name__}: {e}'
+            if ok:
+                applied[name] = rate
+            else:
+                failed[name] = message
+        if not applied:
+            return False, f'NMEA 输出一条都没设上：{failed}', {
+                'applied': applied, 'failed': failed}
+        saved = False
+        if persist:
+            try:
+                saved, save_message, _data = self.save()
+            except Exception as e:                    # noqa: BLE001
+                saved, save_message = False, f'{type(e).__name__}: {e}'
+            if not saved:
+                return False, f'NMEA 输出已改但保存失败：{save_message}', {
+                    'applied': applied, 'failed': failed}
+        if failed:
+            return False, f'部分失败：{failed}', {
+                'applied': applied, 'failed': failed, 'saved': saved}
+        action = '开启' if enabled else '关闭'
+        return True, f'已{action} NMEA 输出：{sorted(applied)}', {
+            'applied': applied, 'saved': saved}
 
     def disable_survey_in(self, persist=True, restart=False):
         """停用 Survey-in / 固定坐标，避免旧配置继续收敛。"""

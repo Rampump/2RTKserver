@@ -112,6 +112,29 @@ CAPS = {
     'valdel': True,         # CFG-VALDEL 删键（只能作用 BBR/Flash，不能作用 RAM）
     'factory_reset': True,  # CFG-CFG clear+load，注意会把波特率打回 38400
     'persist_check': True,  # 能 poll Flash 层回读，证明配置真的落盘（不是只读 RAM）
+    # 切到基准站后**不会自动停掉**多余的 NAV / NMEA 输出，必须显式逐条写 0。
+    # Quectel（LG290P / LC29H(BS)）切 base 就自动改播 RTCM，没有这个需求，
+    # 所以它们不置这个 cap —— 流程层只按 cap 走，不按型号分支。
+    'silence': True,
+    # 能对 NAV / NMEA / RXM 那组 MSGOUT 键做"整组快照 / 整组开启 / 整组还原"。
+    # `silence` 只会关；没有这个 cap，关掉的输出就**无从放回** ——
+    # 流程层据此决定"静音前要不要先快照"（见 writer._step_setup_messages）。
+    'output_snapshot': True,
+    # **没定位就不发 NMEA**。真机实测（2026-11，COM12，无天线）：
+    #   NMEAMOUT_GGA_USB/I2C/UART1/UART2/SPI 全部 = 1、RATE_MEAS=1000（1 Hz），
+    #   6 秒原始字节里 **0 个 `$GNGGA`**，而同期 NAV-PVT 稳定 1 Hz
+    #   （fixType=0 gnssFixOk=0 numSV=0，时间停在 2026-07 未同步）。
+    # 原因是 NAV-PVT 内容合法、GGA 的经纬度/质量位/星数字段在 fixType=0 时
+    # 无值可填，u-blox 干脆整句不出。Quectel 系在无定位时仍吐 GGA（字段留空），
+    # 所以它们不置这个 cap —— 流程层只按 cap 换解释文案，判定逻辑不变。
+    'nmea_needs_fix': True,
+    # **没有定位时精度字段是垃圾值，不是"信号差"**。真机实测（无天线，
+    # fixType=0）：NAV-SVIN 的 meanAcc 原始值 0xE8D4A510（=4e9×0.1mm），
+    # 折算出来是 94868.3264 m —— 这是个毫无物理意义的溢出数。流程层如果
+    # 原样打印，现场只会看到「当前 3D 精度 94868.3264 m」，把它当成
+    # "天线没接好、精度很差"，而真相是模块压根没在解算（obs 恒为 0）。
+    # Quectel 的 $PQTMSVINSTATUS 在未定位时给的是 0 或小值，不需要这个 cap。
+    'svin_acc_meaningless_when_no_fix': True,
 }
 
 # TMODE_MODE 取值（§3.1.5 + ubx_keys 注释）
@@ -135,8 +158,22 @@ COORD_MSG = ('RTCM3-1005',)
 # 1006 / 1007 / 1033 在本模块**只支持输入**（§3.1.5 输出表）
 COORD_MSG_UNSUPPORTED = ('RTCM3-1006', 'RTCM3-1007', 'RTCM3-1033')
 
-# 本型号能逐星座配速率的星座（流程层按这张表逐条下发）
-MSM_CONSTELLATIONS = ('GPS', 'GLO', 'GAL', 'BDS')
+# 本型号能逐星座配速率的星座（流程层按这张表逐条下发）。
+#
+# 这张表描述的是**"这块板子能同时播哪几个星座"**，不是报文名。
+# 流程层 `_step_setup_messages` 会把它逐条喂给 `set_message_rate()`
+# 当成"再确认一遍"，所以每条都必须能被 `_resolve_msg_key()` 认下来 ——
+# F9P 这边用具体号（1074 等），X 占位写法是 Quectel 的口径，F9P 不认。
+# 用 MSM4 的具体号：`config_rtcm()` 默认就配 MSM4，两者一致；
+# 若流程要 MSM7，`config_rtcm()` 会把 1077 等一并打开，这里的补确认不影响结果
+# （补的是 1074=1，本来就是 1，幂等）。
+# **只列本固件真有键的四个星座。** QZSS（111X）在 ZED-F9P 的 MSGOUT 表里没有
+# 输出键 —— 真机 VALGET 直接静默不回。列进来只会换来一条"不支持"的假警告，
+# 让人以为漏配了一个星座。MSM_TIER 表里也没有 111x，两处保持一致。
+MSM_CONSTELLATIONS = ('RTCM3-1074',   # GPS      MSM4
+                      'RTCM3-1084',   # GLONASS  MSM4
+                      'RTCM3-1094',   # Galileo  MSM4
+                      'RTCM3-1124')   # BDS      MSM4
 
 # 输出观测报文时必须带上的 1230（否则 GLO 只能浮点解）
 REQUIRED_RTCM = (1005, 1230)
@@ -159,12 +196,71 @@ PERSIST_CHECK_KEYS = (
     'RTCM_1230',
 )
 
+# ==================== 端口维度（MSGOUT 键按口拆分） ====================
+# `CFG-MSGOUT-*` 每条报文都有 5 个端口各一份键，**后缀不同、ID 不同**：
+#     I2C → UART1 → UART2 → USB → SPI   （ID 逐个 +1）
+# 写错端口的键模块**照样 ACK**，但那个物理口上的输出纹丝不动 ——
+# 这是本项目在 F9P 上踩过的最贵的一个坑（真机排查记录见 ubx_keys 头部注释）：
+# COM12 是 USB CDC（`VID:PID=1546:01A9`），驱动却一律写 `_UART1` 键，
+# 于是"关掉多余输出"这个动作在 USB 口上完全无效，模块继续吐 NAV-SAT/NAV-SIG。
+#
+# 所以端口不能写死，必须按**实际链路**选：`detect_port()` 探出来，
+# 探不到再按端口名猜（COM / /dev/ttyACM 都是 USB CDC）。
+# 这里只用来**校验端口名合法**；后缀一律是 `_<端口名>`，由 `_port_key()` 拼。
+# 端口全集以**键表**为准（`K.OUTPUT_PORTS` 是 `OUTPUT_FANOUT` 里真实出现过的
+# 后缀去重），不在这里再抄一份 —— 两处各写一份的话，将来固件多一个口，
+# 驱动会先把"合法的口"判成非法并 `raise DriverBug`，整条静音/快照链路直接废掉。
+PORTS = tuple(K.OUTPUT_PORTS) or ('I2C', 'UART1', 'UART2', 'USB', 'SPI')
+PORT_SUFFIX = {p: f'_{p}' for p in PORTS}
+# 每类输出在整个键表里的实际键名，以及"裸名 → 键名"的映射前缀。
+# `(裸名所在组, 键名前缀, 规范名去前缀)`，三组共用一套逻辑。
+OUTPUT_GROUPS = (
+    ('NAV', 'NAVOUT_', 'NAV_'),
+    ('NMEA', 'NMEAMOUT_', ''),
+    ('RXM', 'RXMOUT_', 'RXM_'),
+)
+
 # ACK 等待上限。F9P 处理一条 VALSET 是毫秒级（实测 <50 ms），
 # 但刚开机时要等 Flash 读完，给 1.5 s 足够宽。
 ACK_TIMEOUT = 1.5
 # 读 VALGET 应答的上限：一条 VALGET 最多回 1~2 KB，38400 下约 0.5 s，
 # 但若同时有 RTCM 流在抢带宽，得留余量。
 VALGET_TIMEOUT = 2.0
+# 一次 VALGET 最多问几个键。
+#
+# 真机教训（ZED-F9P，EXT CORE 1.00）：**只要请求里有哪怕一个本固件不认识的键，
+# 模块就整条请求静默丢弃** —— 不回应答、也不回 NAK，2 秒超时后我们得到空结果，
+# 看起来像"链路坏了"。而 F9P 的 HPG 1.00 固件并不带全 pyubx2 键表里的全部
+# CFG-MSGOUT 项（实测 `NAVOUT_NAV_AOPSTATUS_USB`、`NAVOUT_NAV_ATT_USB`
+# 单独问、原样发帧也是零应答；这两条是 ADR / 姿态用的，单频板没有）。
+#
+# 所以读多个键必须**小批量 + 失败降级**：一批不通就拆开逐个问，
+# 把"这个固件没有"的键挑出来单独标注 —— 而不是让整批一起超时。
+VALGET_BATCH = 12
+
+# 查询类报文的等待上限。
+#
+# 与 `ACK_TIMEOUT` 分开写、且**必须分开**：ACK_TIMEOUT 等的是 8 字节的
+# `05 01`，查询等的是带载荷的整条报文（MON-VER 228 字节、MON-HW 68 字节）。
+# 38400 下 228 字节 ≈ 60 ms，但 USB CDC 有主机侧缓冲、模块也可能正在吐
+# NAV-* 流，实测首帧有时要 300 ms 才到；1.5 s 留了 5 倍余量。
+#
+# 为什么不能省成"复用 ACK_TIMEOUT"：ACK 超时要短（配置键多，一条一条等，
+# 5 秒一条会让一批 10 键的配置拖到一分钟），查询却必须长。两个语义
+# 用一个常量，就得在两边都不合适。
+MON_VER_TIMEOUT = 1.5
+MON_HW_TIMEOUT = 1.5
+
+# 配置类报文（模块回 ACK/NAK，**不回内容**）。只用于 `_poll_ubx()` 的误用拦截，
+# 不参与任何收发 —— 见 `_poll_ubx` 的注释。
+_CONFIG_CLASS_MESSAGES = frozenset({
+    (0x06, 0x8A),   # CFG-VALSET
+    (0x06, 0x8C),   # CFG-VALDEL
+    (0x06, 0x09),   # CFG-CFG
+    (0x06, 0x04),   # CFG-RST
+    (0x06, 0x00),   # CFG-PRT
+    (0x06, 0x31),   # CFG-TP5
+})
 
 
 def windows_bitlen(baud):
@@ -303,6 +399,9 @@ class ZEDF9PDriver(BaseDriver):
     # 型号认领在 `detect()` 里按完整固件串做（见那里的注释），
     # 这里的 MATCH_PREFIX 只用于"粗筛"，不当唯一判据。
     MATCH_PREFIX = 'HPG'
+    # 双模：TMODE_MODE 0=disabled（流动站）/ 2=fixed（基准站），两边都能跑。
+    # 4 种标定方式全支持。
+    ROLE = 'dual'
     DUAL_MODE = True
     CAPS = CAPS
     # UBX 没有文本命令模板：`CMD` 留空，所有下发走 `_valset` / `_valget`。
@@ -310,6 +409,12 @@ class ZEDF9PDriver(BaseDriver):
     CMD = {}
     CS_EXPECT = {}
     MSM_CONSTELLATIONS = MSM_CONSTELLATIONS
+    # 持久化自检键集（模块级常量同名，这里挂到类上）。
+    # 不加这行的话 `read_persisted()` / `verify_persisted()` 里的
+    # `self.PERSIST_CHECK_KEYS` 直接 AttributeError —— 而 CAPS 里
+    # `persist_check=True` 会让流程层在每次标定收尾时调用它，
+    # 真机表现就是"配置都写成功了，最后一步自检崩掉，整单标定判失败"。
+    PERSIST_CHECK_KEYS = PERSIST_CHECK_KEYS
 
     # 官方波特率（§3.8.1 UART 表 28，文档原样八档）
     BAUDS = (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600)
@@ -457,6 +562,43 @@ class ZEDF9PDriver(BaseDriver):
         names = [n for n in key_names if K.lookup(n) is not None]
         if not names:
             return {}, 0
+        values, layer, _missing = self._valget_batched(names, layer)
+        return values, layer
+
+    def _valget_batched(self, names, layer, batch=VALGET_BATCH):
+        """小批量问 + 失败降级，返回 `({name: value}, layer, [本固件没有的键])`。
+
+        为什么要降级（真机教训）：一条 VALGET 里只要含一个本固件不认识的键，
+        模块就**整条静默丢弃**（不回应答也不回 NAK）。原先一次性问 69 个
+        MSGOUT 键，2 秒后拿到空结果，`silence_outputs()` 报"读取当前输出速率失败"，
+        现象和"串口断了"一模一样，查了很久才发现是两个未实现的键在拖累整批。
+
+        策略：
+            一批正常 → 收下；
+            一批没应答 → 拆成单个逐个问，谁不应答谁就是"这个固件没有的键"，
+                        记账后跳过，不影响其余键。
+        代价是最坏情况多花几次超时，但静音只在标定开头跑一次，值得。
+        """
+        values, got_layer, missing = {}, layer, []
+        for start in range(0, len(names), max(1, int(batch))):
+            chunk = names[start:start + max(1, int(batch))]
+            got, sub_layer = self._valget_once(chunk, layer)
+            if got:
+                values.update(got)
+                got_layer = sub_layer or got_layer
+                continue
+            # 整批被静默丢弃 → 逐个归因
+            for name in chunk:
+                one, sub_layer = self._valget_once([name], layer)
+                if one:
+                    values.update(one)
+                    got_layer = sub_layer or got_layer
+                else:
+                    missing.append(name)
+        return values, got_layer, missing
+
+    def _valget_once(self, names, layer):
+        """一条 VALGET 请求/应答。没应答返回 `({}, 0)`，**不抛**。"""
         payload = bytearray([0x00, layer & 0xFF, 0x00, 0x00])
         by_id = {}
         for name in names:
@@ -480,7 +622,7 @@ class ZEDF9PDriver(BaseDriver):
         if raw is None or len(raw) < 4:
             return {}, 0
 
-        layer = raw[1]
+        got_layer = raw[1]
         pos = 4
         values = {}
         while pos + 4 <= len(raw):
@@ -496,7 +638,7 @@ class ZEDF9PDriver(BaseDriver):
             raw_value = unpack_value(type_info, raw[pos:pos + size])
             pos += size
             values[name] = raw_value * scale if scale != 1.0 else raw_value
-        return values, layer
+        return values, got_layer
 
     def _valdel(self, key_names, layers=None):
         """删掉一组配置键（UBX-CFG-VALDEL，0x06/0x8C）。
@@ -542,21 +684,47 @@ class ZEDF9PDriver(BaseDriver):
         (30 字节 extension) 串。ZED-F9P 的 extension 里有 `PROTVER=` / `MOD=`，
         固件串含 `HPG`。**不能只认 `ZED-F9P` 字面量**：有的固件不把它写进
         swVersion，只在 extension 里带 `F9P`。
+
+        ## 必须走"查询语义"，不能走"配置语义"（本驱动最贵的一条教训）
+
+        UBX 报文分两类，**应答方式完全不同**：
+
+            配置类（CFG-VALSET / CFG-VALDEL / CFG-RST …）
+                → 模块回 `UBX-ACK-ACK`(05 01) 或 `UBX-ACK-NAK`(05 00)，**不带内容**
+                  → 用 `_send_ubx()`，判 ACK 即可
+
+            查询类（MON-VER / MON-HW / MON-COMMS / CFG-VALGET …）
+                → 模块**不回 ACK**，只回一条带载荷的同名报文（0A 04 等）
+                  → **必须**用 `_poll_ubx()`，等的是载荷本身
+
+        旧实现这里调的是 `_send_ubx(*K.MSG_MON_VER, b'', retries=3)` ——
+        那是个等 `05 01` 的函数。MON-VER 永远不会回 `05 01`，于是：
+        每轮白等到超时（1.5 s），重试 3 次共 **4.5 s + 0.15×3 ≈ 5 s**，
+        返回 `'timeout'`；而**模块其实早就把 MON-VER 答完了**，只是被这个
+        函数当成"无关帧"丢在缓存里没人看。失败文案于是写着
+        "未收到 UBX-MON-VER 应答"，把上层彻底带偏：
+
+          · 扫描器（裸读字节）说"有 MON-VER"
+          · 驱动说"没收到"
+          · 两个组件对同一块板、同一帧给出相反结论
+
+        现场还会被这句话误导去查硬件（流控、TX/RX 接反、固件升级模式），
+        而真正的错因是"用错了等应答的方式"。`detect_port()` 一直是对的
+        （它走 `_poll_ubx(MON-COMMS)`），这也解释了为什么同一驱动里
+        有的查询通、有的查询不通 —— 不是硬件，是两条路径写法不一致。
+
+        修法：改成 `_poll_ubx()`，超时给足（查询 + USB CDC 缓冲，1.5 s 够），
+        且**不再重试补发** —— 查询是幂等的，重发只会让模块多答一遍、
+        白白把 5 秒拉长到 15 秒。
         """
         self.channel.drain()
-        self.channel.cache.get('ubx', {}).pop(K.MSG_MON_VER, None)
-        ok, message = self._send_ubx(*K.MSG_MON_VER, b'', retries=3)
-        raw = self.channel.ubx_last(*K.MSG_MON_VER)
+        raw = self._poll_ubx(K.MSG_MON_VER, timeout=MON_VER_TIMEOUT)
         if raw is None:
-            # 有的固件对 MON-VER 不回 ACK（查询类只回内容本身），多等一会儿
-            deadline = time.time() + 1.0
-            while time.time() < deadline and raw is None:
-                line = self.channel.read_line(0.3)
-                if line is not None:
-                    self.channel.absorb(line)
-                raw = self.channel.ubx_last(*K.MSG_MON_VER)
-        if raw is None:
-            return False, f'未收到 UBX-MON-VER 应答（{message}），不是 u-blox Gen9 模块', {}
+            return False, (
+                '未收到 UBX-MON-VER 应答：模块没有对查询回内容。'
+                '已确认帧格式与 CRC 正确，请检查 TX/RX 是否接反、'
+                '是否处于命令静默（CFG-PRT inProtoMask 关了 UBX）、'
+                '或该口被别的程序占用'), {'error': 'no_reply'}
 
         sw = raw[:30].split(b'\x00')[0].decode('ascii', 'replace').strip()
         hw = ''
@@ -582,17 +750,12 @@ class ZEDF9PDriver(BaseDriver):
         if not ok:
             return False, message, data
 
-        # MON-HW 里有唯一 ID 与天线状态（F9P 的 MON-HW 载荷 60 字节）
+        # MON-HW 里有唯一 ID 与天线状态（F9P 的 MON-HW 载荷 60 字节）。
+        # 同样是**查询类**报文（不回 ACK、只回内容），必须走 `_poll_ubx`，
+        # 不能手写"写一帧 + 读循环"—— 那种写法每个调用方一份，
+        # 迟早有一份忘了清缓存或忘了喂 `absorb()`，症状就是"偶发读不到"。
         hw_info = {}
-        self.channel.cache.get('ubx', {}).pop(K.MSG_MON_HW, None)
-        self.channel.write_ubx(*K.MSG_MON_HW)
-        deadline = time.time() + 1.0
-        raw = None
-        while time.time() < deadline and raw is None:
-            line = self.channel.read_line(0.25)
-            if line is not None:
-                self.channel.absorb(line)
-            raw = self.channel.ubx_last(*K.MSG_MON_HW)
+        raw = self._poll_ubx(K.MSG_MON_HW, timeout=MON_HW_TIMEOUT)
         if raw and len(raw) >= 60:
             hw_info['unique_id'] = ''.join(f'{b:02X}' for b in raw[0:8])
             hw_info['a_status'] = raw[28]
@@ -734,7 +897,8 @@ class ZEDF9PDriver(BaseDriver):
             'z': _combine('TMODE_ECEF_Z', 'TMODE_ECEF_Z_HP'),
             'mode': MODE_LABEL.get(mode, 'unknown'),
             'pos_type': 'LLH' if int(values.get('TMODE_POS_TYPE', 0)) == 1 else 'ECEF',
-            'acc_mm': float(values.get('TMODE_FIXED_POS_ACC', 0)) * 0.1,
+            # 不要 * 0.1：`_valget_once()` 已按 scale 折算成物理 mm
+            'acc_mm': float(values.get('TMODE_FIXED_POS_ACC', 0)),
             'layer': layer,
         }
         if mode != MODE_FIXED:
@@ -875,14 +1039,78 @@ class ZEDF9PDriver(BaseDriver):
             'mode': MODE_LABEL.get(mode, 'unknown'),
             'pos_type': 'LLH' if int(values.get('TMODE_POS_TYPE', 0)) == 1 else 'ECEF',
             'svin_min_dur': float(values.get('TMODE_SVIN_MIN_DUR', 0)),
-            'svin_acc_limit_mm': float(values.get('TMODE_SVIN_ACC_LIMIT', 0)) * 0.1,
+            # **不要再乘 0.1**：`_valget_once()` 已经按 key 表的 scale（=0.1）
+            # 把原始 0.1mm 折算成物理 mm 了。这里再乘一次会得到 1/10 的值
+            # （真机 3000mm 的门限被读成 300mm），而且"看起来像合理的数"
+            # 所以极难发现。测试 `test_get_svin_config_provides_flow_field_names`
+            # 用 30000 → 3000.0 钉住了这条。
+            'svin_acc_limit_mm': float(values.get('TMODE_SVIN_ACC_LIMIT', 0)),
             'x': _combine('TMODE_ECEF_X', 'TMODE_ECEF_X_HP'),
             'y': _combine('TMODE_ECEF_Y', 'TMODE_ECEF_Y_HP'),
             'z': _combine('TMODE_ECEF_Z', 'TMODE_ECEF_Z_HP'),
-            'acc_mm': float(values.get('TMODE_FIXED_POS_ACC', 0)) * 0.1,
+            # 不要 * 0.1：`_valget_once()` 已按 scale 折算成物理 mm
+            'acc_mm': float(values.get('TMODE_FIXED_POS_ACC', 0)),
             'layer': layer,
         }
+        # **流程层契约：必须同时给出 `ecef_x/y/z`。**
+        # 真机踩过一次：驱动只回 `x/y/z`，而 writer 的 `_compare_fixed()` 和
+        # `_step_svin_resume()` 都读 `ecef_x/y/z` —— 于是每个轴都取到 None → 兜成 0.0，
+        # 顶点（-2428448, 5028827, 3071012）与 0 的差就是 5 026 715 m，
+        # 报"回读不一致：最大轴差 5028827 m"，看起来像写失败了，
+        # 而实际上模块里存的是完全正确的坐标。这种"写对了却判失败"最难查，
+        # 因为现场只有一句含糊的差值。
+        #
+        # 两个名字都保留：`x/y/z` 是 UBX 键的自然写法（TMODE_ECEF_X），
+        # `ecef_x/y/z` 是与 Quectel / Unicore 对齐的统一口径。
+        # 复制而不是改名，是为了不让已有的调用方（诊断页、备份）掉。
+        data['ecef_x'] = data['x']
+        data['ecef_y'] = data['y']
+        data['ecef_z'] = data['z']
+
+        # **同一个坑的第二次**：流程层的 `_svin_config_verified()` 判据写的是
+        # `readback.get('count') != int(count)`，而这里返回的叫 `svin_min_dur`，
+        # 于是 `_to_int(None) != 600` 永远成立 —— 真机表现是
+        #   回读次数是 None，应为 600（重发一次再读，仍然 None）
+        # 然后整条子收敛流程判失败并回滚。而模块里 `TMODE_SVIN_MIN_DUR` 分明是 600。
+        # 补 `count` 别名，语义与 `svin_min_dur` 完全相同（都是**秒**）。
+        # 注意单位：F9P 是秒，Quectel 的 count 是历元数；1 Hz 下相等，10 Hz 下不等。
+        # 这里不换算，只保证"同一份配置读回来能对上写入值"。
+        data['count'] = data['svin_min_dur']
+        # `acc` 是流程层口径（**米**），`svin_acc_limit_mm` 是驱动原生的毫米。
+        data['acc'] = data['svin_acc_limit_mm'] / 1000.0
         return True, '坐标配置已读取', data
+
+    def enable_survey_status(self, enabled=True, rate=1):
+        """开关 NAV-SVIN 的周期输出（F9P 的"收敛状态"就是 UBX-NAV-SVIN）。
+
+        **这个方法之前漏了**，而流程层是用 `getattr` 探测的：
+        `_step_svin_cfg()` 里 `enabler is None` 就**静默跳过**，于是 NAV-SVIN
+        速率一直是 0，`survey_status()` 永远读不到状态，SVIN_WAIT 只能干等到超时。
+        真机表现（2026-11，COM12）：
+            [SVIN_WAIT] 等待状态输出…（已 3 秒）…（已 22 秒）
+            然后报"Survey-in 在 20 秒内未收敛（已 0/600 次）"
+        看起来像"信号差、收不到卫星"，实际是**根本没打开状态输出**。
+        两个坑叠在一起时最难查：一个是信号（真），一个是配置（假）。
+
+        与 Quectel 的差别：那边是 `PQTMCFGMSGRATE,W,PQTMSVINSTATUS,1,1` 文本语句，
+        这边是 MSGOUT 键 `NAVOUT_NAV_SVIN_<PORT>`，且**必须写在当前链路的口上**
+        （按端口分的键，写错口会安静 ACK 而毫无效果）。
+
+        `persist=True`：收敛状态是标定期间的临时输出，但流程失败回滚会把它
+        连同其它速率一起回放，所以这里随写入一起落盘，保证"回滚也能关回去"。
+        """
+        name = 'NAV-SVIN'
+        want = int(rate) if enabled else 0
+        if want < 0:
+            return False, 'NAV-SVIN 输出速率不能为负', {'error': 'bad_rate'}
+        port = self.detect_port()[0] or 'UART1'
+        ok, message, data = self.set_message_rate(name, want, port=port)
+        if not ok:
+            return False, f'开启收敛状态输出失败：{message}', {
+                'error': 'nak' if message == 'NAK' else 'timeout', 'port': port}
+        return True, f'收敛状态输出已{"开启（%d Hz）" % want if want else "关闭"}', {
+            'msg': name, 'rate': want, 'port': port,
+            'key': f'NAVOUT_NAV_SVIN_{port}'}
 
     def survey_status(self):
         """读 Survey-in 收敛状态（UBX-NAV-SVIN，§3.1.5.5）。
@@ -905,9 +1133,14 @@ class ZEDF9PDriver(BaseDriver):
                     self.channel.absorb(line)
                 raw = self.channel.ubx_last(*K.MSG_NAV_SVIN)
         if raw is None:
-            return False, ('没有收到 UBX-NAV-SVIN。F9P 的收敛状态是周期输出，'
-                           '需要先把 CFG-MSGOUT-UBX_NAV_SVIN_UART1 设为 ≥1'), {
-                'error': 'no_nav_svin', 'hint': 'set_message_rate("RTCM3-NAVSVIN", 1)'}
+            # 名字必须写对它自己能认的那个：这个 hint 会被现场直接照抄进诊断页，
+            # 写 `RTCM3-NAVSVIN` 的话 `set_message_rate()` 会回"不认识报文名"，
+            # 用户就以为模块不支持 —— 而真正要设的只是 NAV-SVIN 的输出速率。
+            port = (self.detect_port()[0] or 'UART1')
+            return False, (f'没有收到 UBX-NAV-SVIN。F9P 的收敛状态是周期输出，'
+                           f'需要先把 NAV-SVIN 在 {port} 口的输出速率设为 ≥1'), {
+                'error': 'no_nav_svin',
+                'hint': f'set_message_rate("NAV-SVIN", 1)  # 当前链路 {port}'}
 
         if len(raw) < 40:
             return False, f'NAV-SVIN 载荷长度异常（{len(raw)} 字节）', {'error': 'bad_length'}
@@ -927,12 +1160,26 @@ class ZEDF9PDriver(BaseDriver):
             'duration_s': dur,
             'obs': obs,
             'mean_acc_mm': mean_acc * 0.1,
+            # **流程层契约（第三个同类坑）**：`_step_svin_wait()` 的收敛判定、
+            # 进度文案、以及落库字段全读 `mean_acc`（口径是**米**），
+            # 驱动只给 `mean_acc_mm` 的话每个读点都拿到 None ——
+            # 真机表现是 `当前 3D 精度 ? m`，然后哪怕 obs 攒够了也永远判不收敛，
+            # 一路等到超时。米/毫米同时给，谁用哪套都不会错。
+            'mean_acc': mean_acc * 0.1 / 1000.0,
             'valid': valid,
             'active': active,
             'x': _combine(mx, mxhp),
             'y': _combine(my, myhp),
             'z': _combine(mz, mzhp),
         }
+        # **流程层契约**：`_step_svin_wait()` 收敛后读的是 `mean_x/mean_y/mean_z`。
+        # 驱动给 `x/y/z` 的话，每个轴都是 None，收敛判定通过后照样会抛
+        # "没有拿到任何有效收敛均值（观测数为 0），无法写入" ——
+        # 明明模块已经收敛出坐标了，我们却因为读错字段名把整次标定判失败。
+        # 和 `mean_acc` / `count` / `ecef_x` 是同一类错的第四次。
+        data['mean_x'] = data['x']
+        data['mean_y'] = data['y']
+        data['mean_z'] = data['z']
         if valid:
             return True, f'Survey-in 已收敛（{dur}s，精度 {mean_acc * 0.1:.1f}mm）', data
         if active:
@@ -946,13 +1193,16 @@ class ZEDF9PDriver(BaseDriver):
     # ==================== 报文速率 / RTCM ====================
     @staticmethod
     def _resolve_msg_key(name):
-        """把报文名翻成键表里的键名。返回 `(key_name, err)`，`err` 非空即失败。
+        """把报文名翻成键表里的**裸键名**（不带端口后缀）。返回 `(key_name, err)`。
 
-        支持四类写法（不区分大小写，`RTCM3-` / `RTCM-` / `RTCM` 前缀可省）：
+        支持四类写法（不区分大小写，`RTCM3-` / `RTCM-` / `NMEA-` 前缀可省）：
             1005 / RTCM3-1005          → `RTCM_1005`
             NAVSVIN / NAV_SVIN         → `NAVOUT_NAV_SVIN`
             GGA / NMEA-GGA             → `NMEAMOUT_GGA`
             RAWX / RXM-RAWX            → `RXMOUT_RXM_RAWX`
+
+        **返回的是不带端口的键名**，加哪个端口后缀由 `_port_key()` 决定 ——
+        端口在 F9P 上不是常量（见 `PORT_SUFFIX` 上方那段注释）。
 
         **设置和读取共用这一个函数**：以前两处各写一份 if/elif，
         加一个报文类型就得记着改两个地方，漏一个就表现为"能设不能读"。
@@ -993,6 +1243,22 @@ class ZEDF9PDriver(BaseDriver):
 
         if token in K.NAV_OUT:
             return f'NAVOUT_{token}', None
+        # `107X` / `108X` … 里的 X 是"MSM 档位"的占位符（Quectel 口径），
+        # 不是通配符：`RTCM3-107X` 表示"GPS 的 MSM 观测报文，具体档位另一处定"。
+        # F9P 这边 1074 和 1077 是两个独立键，**单个键解析不了** ——
+        # 所以这里明确返回"请用具体号"，而不是含混的"不认识"，
+        # 免得流程层看到报错还以为是自己传错了名字。
+        #
+        # 注意：`MSM_CONSTELLATIONS` 里保留 `RTCM3-107X` 是给流程层描述
+        # "要开哪几个星座"用的；真正配速率走 `config_rtcm(msm_type=4|7)`，
+        # 那一步会把 X 展开成 1074/1077。
+        msm_placeholder = token.rstrip('X')
+        if token.endswith('X') and msm_placeholder.isdigit():
+            num = int(msm_placeholder)
+            if num in (107, 108, 109, 110, 111, 112, 113):
+                return None, (f'{name!r} 是 MSM 占位写法，X 代表档位；'
+                              f'F9P 请用具体号（MSM4 = {num}4，MSM7 = {num}7）'
+                              f'或直接用 config_rtcm(msm_type=...) 一次配齐')
         # NMEA 常写成 GGA / GPGGA / NMEA-GGA，剥掉 2 字母 talker 前缀再认一次
         nmea = token[2:] if len(token) == 5 and token[:2].isalpha() else token
         if nmea in K.NMEA_OUT:
@@ -1001,12 +1267,13 @@ class ZEDF9PDriver(BaseDriver):
         # 归一化兜底：把两边的下划线全去掉再比，让 `NAVSVIN` / `NAV_SVIN`
         # 与 `RAWX` / `RXM_RAWX` 都能命中。**不做前缀穷举** —— 键表里
         # 每个组的前缀不一样（NAVOUT_/RXMOUT_/NMEAMOUT_），穷举必漏。
+        # 这里只认 UART1 视图（`K.*_OUT`）；端口后缀由 `_port_key()` 事后加，
+        # 所以不必也不该把分端口的 `*_PORTS` 表列进来。
         flat = token.replace('_', '').replace('-', '')
         for group, prefix, strip in (
                 (K.NAV_OUT, 'NAVOUT_', 'NAV_'),
                 (K.RXM_OUT, 'RXMOUT_', 'RXM_'),
-                (K.NMEA_OUT, 'NMEAMOUT_', ''),
-                (K.NAV_OUT_USB, 'NAVOUT_', 'NAV_')):
+                (K.NMEA_OUT, 'NMEAMOUT_', '')):
             for key in group:
                 candidates = {key.replace('_', ''),
                               key[len(strip):].replace('_', '') if strip else None}
@@ -1018,19 +1285,25 @@ class ZEDF9PDriver(BaseDriver):
         """配某条报文的输出速率。
 
         `name` 的写法见 `_resolve_msg_key()`：
-            'RTCM3-1005' / '1005'  → CFG-MSGOUT-RTCM_3X_TYPE1005_UART1
-            'NAVSVIN' / 'NAV_SVIN' → CFG-MSGOUT-UBX_NAV_SVIN_UART1
-            'GGA' / 'NMEA-GGA'     → CFG-MSGOUT-NMEA_ID_GGA_UART1
-            'RAWX'                 → CFG-MSGOUT-RXM_RAWX_UART1
+            'RTCM3-1005' / '1005'  → CFG-MSGOUT-RTCM_3X_TYPE1005
+            'NAVSVIN' / 'NAV_SVIN' → CFG-MSGOUT-UBX_NAV_SVIN_<port>
+            'GGA' / 'NMEA-GGA'     → CFG-MSGOUT-NMEA_ID_GGA_<port>
+            'RAWX'                 → CFG-MSGOUT-RXM_RAWX_<port>
         `rate` = 每历元输出次数（Hz），0 = 关闭。
+
+        `port` 默认 `None` = 用 `detect_port()` 探出的链路端口。
+        **不要传 'UART1' 当默认值** —— 链路在 USB 上时那组键是另一个物理口，
+        写完 ACK 正常、输出一动不动。
+        RTCM 键没有端口维度，`port` 对它无效。
 
         流程层只会用 `COORD_MSG` 里的名字（'RTCM3-1005'）来"表达要播坐标"，
         本驱动把它翻成 1005 的 MSGOUT 键 —— 和 LC29H(BS) 把
         `set_message_rate('RTCM3-1005', 1)` 翻成 PAIR434 是同一件事。
         """
-        key_name, err = self._resolve_msg_key(name)
-        if key_name is None:
+        bare_key, err = self._resolve_msg_key(name)
+        if bare_key is None:
             return False, err, {'error': 'unsupported', 'msg': name}
+        key_name = self._port_key(bare_key, port)
 
         try:
             value = max(0, int(rate))
@@ -1044,16 +1317,613 @@ class ZEDF9PDriver(BaseDriver):
         data.update({'msg': name, 'rate': value, 'key': key_name})
         return True, f'{name} 速率已设为 {value}', data
 
-    def get_message_rate(self, name, msg_ver=None):
-        """查某条报文的输出速率。解析规则与 `set_message_rate` 完全一致。"""
-        key_name, err = self._resolve_msg_key(name)
-        if key_name is None:
+    def get_message_rate(self, name, msg_ver=None, port=None):
+        """查某条报文的输出速率。解析规则与 `set_message_rate` 完全一致。
+
+        ## `fields` 不是装饰，是流程层的唯一读法
+
+        `writer._read_rate()` 写的是：
+
+            fields = data.get('fields') or []
+            return int(float(fields[1]))        # 速率是第 2 个字段
+
+        这是 Quectel `$PQTMCFGMSGRATE,R` 的口径（`msg,rate,ver` → `fields[1]`）。
+        F9P 早期只返回 `{'rate': ...}`，没有 `fields`，于是**每一次速率回读都得到
+        `None`**，writer 就判"回读速率是 None（应为 1），配置没有生效"，
+        在 `MSG_SETUP` 直接中止。但这不能让流程层去认 F9P 的字段名 ——
+        反过来才安全：驱动把 `fields` 按通用形状补出来，流程层不用知道型号。
+
+        形状对齐 Quectel：`[报文名, 速率]`（Quectel 还有第 3 个版本号，
+        F9P 没有，就不硬凑一个假的 —— `fields[1]` 才是被读的那个）。
+        """
+        bare_key, err = self._resolve_msg_key(name)
+        if bare_key is None:
             return False, err, {'error': 'unsupported', 'msg': name}
+        key_name = self._port_key(bare_key, port)
         values, _ = self._valget([key_name])
         if key_name not in values:
             return False, f'读取 {name} 速率失败（无应答）', {'error': 'timeout'}
         rate = int(values[key_name])
-        return True, f'{name} 速率 = {rate}', {'msg': name, 'rate': rate, 'key': key_name}
+        return True, f'{name} 速率 = {rate}', {
+            'msg': name, 'rate': rate, 'key': key_name,
+            # 流程层契约：fields[1] 必须是速率
+            'fields': [str(name), str(rate)],
+            'port': self._port,
+        }
+
+    # ==================== 构造 ====================
+    def __init__(self, channel):
+        super().__init__(channel)
+        # 链路端口缓存（'UART1' / 'USB'）。None = 还没探过，`detect_port()` 会去探。
+        # 不在这里主动探：构造驱动时串口可能刚打开、缓冲里全是开机流，
+        # 探测会被淹没；等真正要用端口的动作（set_message_rate / silence_outputs）
+        # 发生时再探，那时流已经稳定。
+        self._port = None
+
+    # ==================== 端口识别 ====================
+    def _port_from_name(self, port_name=None):
+        """按串口名猜它是哪个 UBX 端口。猜不出返回 None。
+
+        **只作兜底**：Windows 的 COM 号不带任何物理口信息，它是不是 CDC 只能靠
+        `detect_port()` 真去问模块。但 `detect_port()` 要读几百字节、
+        没星时还得等超时，所以先用名字做一次便宜判断：
+            COM* / /dev/ttyACM*  → 可能是 USB（CDC）；也可能是 FTDI 转串口的 UART1
+            其它（/dev/ttyS*、/dev/ttyUSB*）→ 偏 UART1
+        名字判断只用来定"先探哪个"，最终以 `detect_port()` 的结果为准。
+        """
+        name = str(port_name or getattr(self.channel, 'port', '') or '').upper()
+        if name.startswith('COM') or 'TTYACM' in name:
+            return 'USB'
+        return None
+
+    def _candidate_ports(self):
+        """要探测的端口，按可能性从高到低。"""
+        # 按链路名猜出来的排前面（省一次没必要的探测）
+        guessed = self._port_from_name()
+        order = ['USB', 'UART1'] if guessed == 'USB' else ['UART1', 'USB']
+        return order
+
+    def detect_port(self, force=False):
+        """探出**当前这条链路**实际走的是 USB 还是 UART1，返回端口名。
+
+        ## 为什么非探不可（真机教训）
+
+        `CFG-MSGOUT-*` 的键是**按端口分开**的：`NAVOUT_NAV_PVT`（UART1）和
+        `NAVOUT_NAV_PVT_USB` 是两个不同的键 ID。往 UART1 那组写 0，
+        模块回一个漂亮的 ACK，而 USB 口上的输出一个字节都不会变 ——
+        表现为"关不掉的多余输出"，非常难查。
+
+        探测方法不靠猜名字，也不靠"看哪个口的键非 0"（用户可能本来就把
+        两个口都关着，那样全是 0，判不出来）。改成**问模块要"最近的输出口"**：
+
+            UBX-MON-COMMS（0x0A/0x36）的 `protIds` 数组列出所有当前激活的
+            协议端口，每个元素 40 字节，第一个字节就是 portId：
+                0=I2C 1=UART1 2=UART2 3=USB 4=SPI
+            **本机正在用的那个口一定在列表里且 `txPending`/`msgs` 有值。**
+
+        拿不到 MON-COMMS（老固件 / 被关掉了）时退回名字判断，
+        并明确标注 `source`，让上层知道这个结论有多可信。
+
+        结果缓存到 `self._port`；`force=True` 重新探。
+        """
+        if self._port and not force:
+            return self._port, f'链路端口：{self._port}（缓存）', {
+                'port': self._port, 'source': 'cache'}
+
+        raw = self._poll_ubx(K.MSG_MON_COMMS, timeout=1.2)
+        if raw:
+            port_id = self._active_port_from_comms(raw)
+            if port_id is not None:
+                name = {0: 'I2C', 1: 'UART1', 2: 'UART2', 3: 'USB', 4: 'SPI'}.get(port_id)
+                if name in ('UART1', 'USB'):
+                    self._port = name
+                    return name, f'链路端口：{name}（MON-COMMS 识别）', {
+                        'port': name, 'source': 'MON-COMMS', 'port_id': port_id}
+
+        guessed = self._port_from_name() or 'UART1'
+        self._port = guessed
+        return guessed, f'链路端口：{guessed}（按串口名推断，MON-COMMS 未应答）', {
+            'port': guessed, 'source': 'name', 'port_id': None}
+
+    @staticmethod
+    def _active_port_from_comms(raw):
+        """从 MON-COMMS 载荷里挑出"本轮对话所在的那个端口"。
+
+        载荷头（PROTVER 27 起）：
+            version(1) reserved1(1) nPorts(1) txErrors(1) reserved2(1)
+            protIds[0..nPorts-1]  其中 reserved2 是配置个数，容易和 nPorts 搞混，
+            所以**以 nPorts 为准**并做长度校验。
+
+        `nPorts` 最多的版本是 5；每个 port 结构 40 字节：
+            portId(2) txPending(2) txBytes(4) txUsage(1) txPeakUsage(1)
+            rxPending(2) rxBytes(4) rxUsage(1) rxPeakUsage(1)
+            overrunErrs(2) msgs[4](8) reserved3(8) skipped(4)
+        第一个字节的低 8 位是 portId。
+
+        选法：优先出现顺序里**第一个**有流量的 UART1/USB。理由：模块是按
+        内部顺序报的，两者同时存在时（边充边连的板子很少见）以先报的为准，
+        且顺序稳定比"取最新"更可预测。真正的判断依据是"这个口有没有在收发"，
+        所以先筛 `msgs` 非 0 的，再退回第一个合法口。
+
+        **返回的是整数 portId（1=UART1、3=USB），不是名字。**
+        调用方 `detect_port()` 负责翻译成名字 —— 这里只做解包，
+        让"怎么认"和"叫什么"分开，测试也能直接钉住原始字节含义。
+        """
+        if len(raw) < 5:
+            return None
+        n_ports = raw[2]
+        if not (0 < n_ports <= 8):
+            return None
+        body = raw[5:]
+        if len(body) < n_ports * 40:
+            return None
+        candidates = []
+        for index in range(n_ports):
+            rec = body[index * 40:(index + 1) * 40]
+            if len(rec) < 40:
+                break
+            port_id = rec[0] & 0xFF
+            # msgs[0..3] 是四个协议方向的计数（每 2 字节），全 0 表示这口没流量
+            msgs = sum(int.from_bytes(rec[24 + k * 2:26 + k * 2], 'little')
+                       for k in range(4))
+            candidates.append((port_id, msgs))
+        if not candidates:
+            return None
+        # ① 有流量且是 UART1/USB 的，按列表顺序取第一个
+        for port_id, msgs in candidates:
+            if msgs > 0 and port_id in (1, 3):
+                return port_id
+        # ② 都没流量（只发不收也会 msgs=0 的旧固件）：取第一个合法口
+        for port_id, msgs in candidates:
+            if port_id in (1, 3):
+                return port_id
+        return None
+
+    def _poll_ubx(self, msg_id, timeout=1.0):
+        """发一条无载荷查询（MON-VER / MON-HW / MON-COMMS 这类）并回传载荷。
+
+        `_send_ubx()` 只把 ACK 结果返回，**拿不到载荷**；查询类报文
+        **模块根本不回 ACK、只回内容本身**，所以这里独立走一遍：
+        清缓存 → 写帧 → 边读边喂解析器 → 超时就放弃。
+
+        与 `_send_ubx()` 的分工是**报文类别**，不是"想不想拿载荷"：
+
+            `_send_ubx`  → 配置类（CFG-VALSET/VALDEL/RST），等 `05 01`/`05 00`
+            `_poll_ubx`  → 查询类（MON-*, CFG-VALGET），等同名报文本身
+
+        传错了不会报错，只会**静默超时**（等一个永远不来的 ACK），
+        然后失败文案还指向硬件 —— 这类误用在 `detect()` 里真实发生过一次。
+        所以这里显式拦一下：配置类报文不该出现在查询路径上。
+        """
+        if msg_id in _CONFIG_CLASS_MESSAGES:
+            raise DriverBug(
+                f'UBX {msg_id[0]:02X}/{msg_id[1]:02X} 是配置类报文（模块会回 ACK/NAK、'
+                f'不回内容），不能走 _poll_ubx；请改用 _send_ubx()')
+        cls, mid = msg_id
+        self.channel.cache.get('ubx', {}).pop((cls, mid), None)
+        self.channel.write_ubx(cls, mid)
+        deadline = time.time() + float(timeout)
+        while time.time() < deadline:
+            line = self.channel.read_line(min(0.25, max(0.05, deadline - time.time())))
+            if line is not None:
+                self.channel.absorb(line)
+            raw = self.channel.ubx_last(cls, mid)
+            if raw is not None:
+                return raw
+        return None
+
+    def _port_key(self, bare_key, port=None):
+        """给裸键名加端口后缀。RTCM 键**没有端口维度**（RTCM 只从指定口出，
+        且键表里只有一组），原样返回。
+
+        `bare_key` 形如 `NAVOUT_NAV_PVT` / `NMEAMOUT_GGA` / `RXMOUT_RXM_RAWX` /
+        `RTCM_1005`。返回 `NAVOUT_NAV_PVT_UART1` / `NAVOUT_NAV_PVT_USB` 这样
+        **带完整端口后缀**的名字。
+
+        **UART1 的后缀是 `_UART1`，不是空串**。旧实现把 UART1 映射成空串，
+        靠键表里那些"裸名"记录兜着 —— 但裸名只是 UART1 的兼容别名，
+        一旦键表按端口重新登记（2026-11 的改动），空串就会拼出查不到的名字，
+        `silence_outputs()` 于是静默跳过，症状又是"关不掉输出"。
+        宁可多打五个字符，也不要一个隐式约定。
+        """
+        if port is None:
+            port, _msg, _data = self.detect_port()
+        if bare_key.startswith('RTCM_'):
+            return bare_key
+        suffix = PORT_SUFFIX.get(port)
+        if suffix is None:
+            raise DriverBug(f'不认识的端口 {port!r}，可选 {sorted(PORT_SUFFIX)}')
+        # NAVOUT_ / NMEAMOUT_ / RXMOUT_ 三组一律拼后缀，规则完全相同
+        for prefix in ('NAVOUT_', 'NMEAMOUT_', 'RXMOUT_'):
+            if bare_key.startswith(prefix):
+                return f'{prefix}{bare_key[len(prefix):]}_{port}'
+        return bare_key
+
+    def _output_keys(self, ports):
+        """列出 `ports` 上**本固件键表里存在**的全部 NAV / NMEA / RXM 输出键。
+
+        `silence_outputs()` / `snapshot_outputs()` / `restore_outputs()` /
+        `enable_outputs()` 共用这一个枚举，保证"关掉的那批键"和"能开回来、
+        能还原的那批键"是**同一集合**。三处各写一份枚举的话，键表一改
+        （比如某固件多一条 NAV 报文）就会出现"静音关了 49 条，恢复只认得 37 条"
+        这种不对称。它不会报错，只会让用户觉得"还原了但流还是不对"。
+
+        用分端口表遍历，**不用** `K.NAV_OUT` 那几个 UART1 视图：
+        视图里的键名是 `NAV_SVIN`（已带 `NAV_`），拼上前缀正好等于规范名；
+        但 NMEA 视图里的键名是 `GGA`（不带 `NMEA_`），三组规则不一致，
+        靠视图拼会拼出 `NAVOUT_AOPSTATUS_UART1` 这种查不到的半截名字。
+        直接按 `(family, 规范名)` 走 `_port_key()`，三组一条路。
+        """
+        keys = []
+        fanout = getattr(K, 'OUTPUT_FANOUT', None)
+        for port in ports:
+            if port not in PORT_SUFFIX:
+                raise DriverBug(f'不认识的端口 {port!r}，可选 {sorted(PORT_SUFFIX)}')
+            if fanout:
+                # 键表自己宣称了这个口有哪些键（`ubx_keys` 是按固件实测登记的表，
+                # 它比"用端口名拼字符串"权威）。拼完仍要 `K.lookup()` 复验：
+                # 两者一旦不一致，宁可少枚举一条，也不能下发一个不存在的键。
+                candidates = [k for k in fanout if k.endswith(f'_{port}')]
+                keys.extend(k for k in candidates if K.lookup(k) is not None)
+                continue
+            for _family, prefix, name_prefix in OUTPUT_GROUPS:
+                table = {'NAVOUT_': K.NAV_OUT_PORTS,
+                         'NMEAMOUT_': K.NMEA_OUT_PORTS,
+                         'RXMOUT_': K.RXM_OUT_PORTS}[prefix]
+                for name, ids in table.items():
+                    if not ids.get(port):
+                        continue          # 固件里这个口没这个键（如 RXM-MEAS20 无 USB）
+                    full = f'{prefix}{name_prefix}{name}_{port}'
+                    if K.lookup(full) is None:
+                        continue          # 键表里查不到，跳过而不是报错
+                    keys.append(full)
+        return keys
+
+    def silence_outputs(self, keep=(), persist=True, ports=None):
+        """把**当前链路端口**上除 `keep` 以外的所有 NAV / NMEA / RXM 输出全关掉。
+
+        **为什么 F9P 必须单独做这件事**（和 LG290P / LC29H(BS) 不一样）：
+            Quectel 那两家切到 base 模式后会**自动**停掉 NMEA、改播 RTCM，
+            所以流程层只要配好 RTCM 就行。F9P **没有这个自动行为** ——
+            模式一切，NAV-PVT / NAV-SAT / NAV-ODO / NAV-TIMEUTC 照旧按 1 Hz 往外吐，
+            外加模块出厂默认开着的 GGA/GSA/GSV/RMC/VTG。真机实测（无天线）：
+            38400 下多出来的那几路已经吃掉 ~5% 带宽；有星时 NMEA-GSV 一条
+            就是几百字节，串口 3840 B/s 的预算会被 RTCM 观测值挤爆 ——
+            下游拿到的是"坐标有、观测值缺"的基站。
+
+        `keep` 接受 `set_message_rate()` 认的任何写法（'NAV_SVIN' / 'GGA' / 'PVT'）。
+        返回值里分开列"关掉了哪些 / 本来就没开哪些"：只报"关掉 N 条"会让用户
+        以为白折腾一场，看不出哪些本来就是关的。
+
+        ## `ports` 默认跟着链路走（`None` = 只关当前链路那一个口）
+
+        以前默认写死 `('UART1',)`，在本机（USB CDC）上 100% 无效：
+        键名对不上物理口，模块 ACK 了但输出照旧。现在默认取
+        `detect_port()` 的结果 —— 链路在 USB 就关 USB 口的键。
+        **另一个口一概不动**：USB 口常被用来接 u-center 看星图，
+        UART1 口可能接着电台，替用户关掉等于断了他的调试通道。
+        要同时清两个口得显式传 `('UART1','USB')`。
+        """
+        keep_keys = set()
+        port_note = {}
+        if ports is None:
+            port, _msg, port_note = self.detect_port()
+            ports = (port,)
+        ports = tuple(ports)
+
+        # `_resolve_msg_key()` 给的是**不带端口后缀**的裸名（RTCM 除外，它本就没有
+        # 端口维度），这里按要清的每个口把后缀补上，才能和 targets 里的名字比。
+        keep_raw = []
+        for name in keep:
+            key_name, err = self._resolve_msg_key(name)
+            if key_name is None:
+                # `keep` 写错算调用方编程错误：默默忽略会让"以为留着"的报文被关掉
+                raise DriverBug(f'silence_outputs 的 keep 里有无法识别的报文名 {name!r}：{err}')
+            keep_raw.append(key_name)
+        for key_name in keep_raw:
+            for port in ports:
+                keep_keys.add(self._port_key(key_name, port))
+
+        targets = [k for k in self._output_keys(ports) if k not in keep_keys]
+        if not targets:
+            return True, '没有需要关闭的输出', {'turned_off': [], 'already_off': [],
+                                              'skipped': sorted(keep_keys)}
+
+        # 先读一遍现状：只有真开着的才写 0，避免把"本来就是 0"也算进"关掉了"，
+        # 更避免对没开过的键做无谓写入（Flash 有擦写寿命）。
+        #
+        # 走批量降级版：单条请求里混进本固件没有的键（如 HPG 1.00 没有
+        # NAV-AOPSTATUS / NAV-ATT 的输出键）会让模块**整条静默丢弃**，
+        # 不降级的话这里会拿到空结果并报"读取失败"，看起来像链路故障。
+        before, _layer, absent = self._valget_batched(targets, K.POLL_LAYER_RAM)
+        if not before and not absent:
+            return False, '读取当前输出速率失败（无 VALGET 应答）', {'error': 'timeout'}
+        if not before:
+            return False, (f'{len(absent)} 个键本固件不回应，且没有一个能读到当前值'), {
+                'error': 'no_key', 'absent': sorted(absent)[:10]}
+
+        to_zero, already = [], []
+        for key in targets:
+            if key not in before:
+                continue              # 这个键在本端口不存在，静默跳过
+            if int(before[key]) > 0:
+                to_zero.append((key, 0))
+            else:
+                already.append(key)
+
+        layers = (K.LAYER_RAM | K.LAYER_FLASH) if persist else K.LAYER_RAM
+        if to_zero:
+            # 一条 VALSET 装得下（NAV 13 + NMEA 7 + RXM 4 = 24 个键，上限 64），
+            # 不用分批 —— 分批就得按 windows_bitlen() 算间隔，38 条命令能慢到几秒。
+            ok, message, data = self._valset(to_zero, layers=layers)
+            if not ok:
+                return False, f'关闭多余输出失败（{message}）', {
+                    'error': 'nak' if message == 'NAK' else 'timeout',
+                    'attempted': [k for k, _ in to_zero]}
+
+        # 回读验证：写了 0 不等于模块真的停了。这条对 F9P 尤其要紧 ——
+        # VALSET 的 ACK 只代表"消息被接受"，不代表"值已经换掉"。
+        after, _layer2 = self._valget([k for k, _ in to_zero]) if to_zero else ({}, 0)
+        still_on = [k for k, _ in to_zero if int(after.get(k, 0) or 0) > 0]
+
+        result = {
+            'turned_off': [k for k, _ in to_zero if k not in still_on],
+            'already_off': already,
+            'kept': sorted(keep_keys),
+            'still_on': still_on,
+            # 本固件没有这些键（问了不回）：**不是错误**，只是这块板子没实现那条报文。
+            # 单独列出来，免得用户看到 "turned_off 少了三条" 以为是漏关了。
+            'absent': sorted(absent),
+            'persist': bool(persist),
+            'ports': list(ports),
+            'port_source': port_note.get('source', 'explicit'),
+        }
+        if still_on:
+            return False, (f'{len(still_on)} 条输出关闭后回读仍非 0：' +
+                           '、'.join(still_on[:5])), result
+        note = ''
+        if absent:
+            note = f'；{len(absent)} 条本固件不支持，已跳过'
+        return True, (f'已关闭 {len(result["turned_off"])} 条非必要输出'
+                      f'（{len(already)} 条本来就关着，保留 {len(keep_keys)} 条{note}）'), result
+
+    # ---------- 输出配置：快照 / 开启 / 还原 ----------
+    #
+    # `silence_outputs()` 只能关，配套必须有三件事，缺一个就是单向破坏：
+    #
+    #   ① `snapshot_outputs()` —— 关之前刮一份，记住"原来开的哪些"
+    #   ② `enable_outputs()`   —— 模块处于"被别的流程关光了"的状态时，
+    #                             按流程需要把该开的开回来（不依赖模块里存着啥）
+    #   ③ `restore_outputs()`  —— 关完按快照放回
+    #
+    # 真机教训（ZED-F9P / COM12，HPG 1.32）：那块板子上 `RTCM_1005/1074/1084/
+    # 1094/1124/1230` 全是 1，而 NAV / NMEA / RXM 那 69 个输出键里只有
+    # `NAVOUT_NAV_SVIN_USB = 1`，其余全 0 —— 它是一台"只剩 RTCM 的纯净基站"。
+    # 这种状态本身没错（是用户自己配的），但流程层一旦按出厂默认去要
+    # GGA / NAV-PVT，就会拿到一坨沉默的数据，然后在界面上显示"模块无数据"，
+    # 排查方向全被带去查接线。所以流程开始前必须能**主动开**，
+    # 而不是指望模块里恰好留着需要的输出。
+
+    def snapshot_outputs(self, ports=None):
+        """把**当前链路端口**上的全部 NAV / NMEA / RXM 输出速率原样记下来。
+
+        这是 `BaseDriver.snapshot_outputs()` 的**覆盖实现**：签名兼容
+        （无位置参数时行为一致），`ports` 只是给驱动自测/诊断用的扩展位；
+        流程层一律 `driver.snapshot_outputs()` 无参调用，
+        端口由 `detect_port()` 按真实链路探出来。
+
+        `silence_outputs()` 会把除 `keep` 以外的输出全写 0，但流程层的备份表
+        `backup.RATE_TARGETS` 只记 12 条（GGA/RMC/GSA/GLL + 七条 RTCM），
+        **一条 NAV-* 都不在里面**。于是：
+
+            模块开着 NAV-SVIN + 用户自己配的 NAV-PVT/POSLLH/...
+            → silence_outputs 把 49 个键写 0
+            → 标定失败，流程回滚
+            → `_restore_messages()` 只回放那 12 条，NAV 一条都不放回
+            → 模块从此只剩 RTCM + NAV-SVIN，用户在 u-center 里星图没了
+
+        这个损坏**不报任何错**，还原界面还会显示"已按备份回放"。
+        所以要另存一份完整快照，还原时按它放回。
+
+        返回 `(ok, message, data)`，`data['rates']` 是**全量**（含 0 的）——
+        0 也要记：还原时"本来是关的"同样得写回去，否则会把用户原本关着的
+        输出打开。
+        """
+        if ports is None:
+            port, _msg, port_note = self.detect_port()
+            ports = (port,)
+        else:
+            port_note = {'source': 'explicit'}
+        ports = tuple(ports)
+
+        keys = self._output_keys(ports)
+        if not keys:
+            return False, ('没有可快照的输出键（端口不认识）'), {
+                'error': 'no_key', 'ports': list(ports)}
+
+        values, layer, absent = self._valget_batched(keys, K.POLL_LAYER_RAM)
+        if not values:
+            return False, (f'{len(keys)} 个输出键全部无应答，无法快照；'
+                           f'此时静音会关掉一批无从恢复的输出'), {
+                'error': 'timeout', 'ports': list(ports), 'keys': len(keys)}
+
+        rates = {k: int(v) for k, v in values.items()}
+        on = {k: v for k, v in rates.items() if v > 0}
+        data = {
+            'ports': list(ports),
+            'layer': layer,
+            'rates': rates,
+            'on': on,
+            'absent': sorted(absent),
+            'port_source': port_note.get('source', 'detect'),
+        }
+        return True, (f'已快照 {len(ports)} 个口的 {len(rates)} 条输出配置'
+                      f'（其中 {len(on)} 条开着）'), data
+
+    def enable_outputs(self, want=(), rate=1, persist=False, ports=None,
+                       strict=False):
+        """把 `want` 里点名的输出按 `rate` 打开（**只开点名的，不碰别的**）。
+
+        这是 `BaseDriver.enable_outputs()` 的**覆盖实现**：签名兼容
+        （前 3 个位置参数与基类完全相同），多出来的 `ports` / `strict`
+        都是**带默认值的扩展位** —— 流程层永远按基类签名调用，
+        F9P 特有的"开哪个物理口"由驱动自己 `detect_port()` 决定，
+        **流程层不需要知道世界上存在 USB / UART1 这种概念**。
+
+        与 `silence_outputs()` 正好互补。场景是"模块的输出被之前的流程关光了，
+        现在需要 GGA / NAV-PVT 这些才能干活"。
+
+        `want` 接受 `set_message_rate()` 认的写法（'GGA' / 'NAV_PVT' / 'PVT' /
+        'GSA' ...）。`strict=True` 时任一名子解析不出来就抛 `DriverBug`；
+        默认 `strict=False` 记为 `unknown` 返回，因为报文名多半来自配置，
+        不该让一条写错的配置把整个流程炸掉。
+
+        `persist` 默认 **False**：只改 RAM。开输出属于"临时让链路有数据"，
+        没有理由动 Flash —— Flash 有擦写寿命，而且用户可能是特意关掉的。
+        真要落盘由调用方显式传 True。
+
+        回读验证与 `silence_outputs()` 同口径：VALSET 的 ACK 只代表
+        "消息被接受"，不代表"值已经换掉"。
+        """
+        if ports is None:
+            port, _msg, port_note = self.detect_port()
+            ports = (port,)
+        else:
+            port_note = {'source': 'explicit'}
+        ports = tuple(ports)
+
+        try:
+            rate = max(1, int(rate))
+        except (TypeError, ValueError):
+            raise DriverBug(f'开启输出时 rate 必须是正整数，收到 {rate!r}')
+
+        items, resolved, unknown = [], [], []
+        for name in want:
+            bare_key, err = self._resolve_msg_key(name)
+            if bare_key is None:
+                if strict:
+                    raise DriverBug(f'enable_outputs 的 want 里有无法识别的报文名 {name!r}：{err}')
+                unknown.append({'msg': name, 'reason': err})
+                continue
+            for p in ports:
+                key_name = self._port_key(bare_key, p)
+                if key_name not in resolved:
+                    resolved.append(key_name)
+                    items.append((key_name, rate))
+
+        if not items:
+            return False, '没有可开启的报文（want 全部无法识别）', {
+                'error': 'unsupported', 'unknown': unknown}
+
+        # 先读现状：已经是目标值的就不写（省一次 VALSET，也免得给 Flash
+        # 无谓地增加擦写；persist=True 时这点尤其要紧）。
+        before, _layer, absent = self._valget_batched(
+            [k for k, _ in items], K.POLL_LAYER_RAM)
+        to_write = [(k, r) for k, r in items
+                    if int(before.get(k, 0) or 0) != r]
+
+        layers = (K.LAYER_RAM | K.LAYER_FLASH) if persist else K.LAYER_RAM
+        if to_write:
+            ok, message, data = self._valset(to_write, layers=layers)
+            if not ok:
+                return False, f'开启输出失败（{message}）', {
+                    'error': 'nak' if message == 'NAK' else 'timeout',
+                    'attempted': [k for k, _ in to_write]}
+
+        after, _layer2 = self._valget([k for k, _ in items])
+        failed = [k for k, r in items if int(after.get(k, 0) or 0) != r]
+
+        written = {k for k, _r in to_write}
+        result = {
+            # `enabled` = 本次真正写进去并回读通过的
+            'enabled': [k for k, _r in to_write if k not in failed],
+            # 读的时候就已经是目标值，一条都没写
+            'already_on': [k for k, _r in items if k not in written],
+            'failed': failed,
+            'unknown': unknown,
+            'absent': sorted(absent),
+            'rate': rate,
+            'persist': bool(persist),
+            'ports': list(ports),
+            'port_source': port_note.get('source', 'explicit'),
+        }
+        if failed:
+            return False, (f'{len(failed)} 条输出开启后回读不符：'
+                           + '、'.join(failed[:5])), result
+        note = f'，{len(result["already_on"])} 条本来就开着' if result['already_on'] else ''
+        unknown_note = f'，{len(unknown)} 条报文名不认识已跳过' if unknown else ''
+        return True, (f'已开启 {len(result["enabled"])} 条输出'
+                      f'（速率 {rate}Hz{note}{unknown_note}）'), result
+
+    def restore_outputs(self, snapshot):
+        """按 `snapshot_outputs()` 的快照把输出速率放回。
+
+        这是 `BaseDriver.restore_outputs()` 的**覆盖实现**：签名与基类完全一致
+        （只吃快照本身）。基类那份是"逐条喂 set_message_rate"的通用版，
+        F9P 这边必须整批走 VALGET / VALSET，并且**只写快照里有的键**。
+
+        `snapshot` 接受：
+            · `snapshot_outputs()` 返回的整个 data（取其中 `rates`）
+            · 直接给 `{键名: 速率}` 的 dict
+
+        **只写快照里有的键**，快照没读到的键保持模块当前值 —— 快照时
+        无应答的键（`absent`）本来就不知道该写什么，硬写 0 会把一个
+        原本可能开着的输出关掉，等于换了个方向继续破坏。
+
+        写入用 RAM 层：快照本身是 RAM 快照，回放也只回放 RAM。
+        落盘配置（Flash）在快照/还原这条路上完全不动 —— 这样即使还原
+        出错，模块重启后仍是用户原来那份 Flash 配置，不会两头都坏。
+        """
+        if isinstance(snapshot, dict) and 'rates' in snapshot:
+            rates = snapshot.get('rates') or {}
+            layer = snapshot.get('layer', 0)
+        elif isinstance(snapshot, dict):
+            rates = snapshot
+            layer = 0
+        else:
+            raise DriverBug(f'restore_outputs 需要快照 dict 或 {{键名:速率}}，收到 {type(snapshot).__name__}')
+
+        if not rates:
+            return False, '快照为空，没有可还原的输出配置', {'error': 'empty'}
+
+        items = []
+        for key, val in rates.items():
+            try:
+                items.append((key, max(0, int(val))))
+            except (TypeError, ValueError):
+                continue
+        if not items:
+            return False, '快照里的值都不是整数，无法还原', {'error': 'bad_snapshot'}
+
+        # 现状读一遍：已经一致的不写
+        current, _l, _absent = self._valget_batched([k for k, _ in items],
+                                                    K.POLL_LAYER_RAM)
+        to_write = [(k, v) for k, v in items
+                    if int(current.get(k, 0) or 0) != v]
+        if not to_write:
+            return True, f'输出配置与快照一致（{len(items)} 条），无需还原', {
+                'restored': [], 'unchanged': [k for k, _ in items],
+                'snapshot_layer': layer}
+
+        ok, message, data = self._valset(to_write, layers=K.LAYER_RAM)
+        if not ok:
+            return False, f'还原输出配置失败（{message}）', {
+                'error': 'nak' if message == 'NAK' else 'timeout',
+                'attempted': [k for k, _ in to_write]}
+
+        after, _layer2 = self._valget([k for k, _ in to_write])
+        bad = [k for k, v in to_write if int(after.get(k, 0) or 0) != v]
+        written = {k for k, _v in to_write}
+        result = {
+            'restored': [k for k, _v in to_write if k not in bad],
+            'unchanged': [k for k, _v in items if k not in written],
+            'failed': bad,
+            'snapshot_layer': layer,
+        }
+        if bad:
+            return False, (f'{len(bad)} 条输出还原后回读不符：'
+                           + '、'.join(bad[:5])), result
+        return True, f'已按快照还原 {len(result["restored"])} 条输出配置', result
 
     def read_rtcm_config(self):
         """回读 RTCM 播发配置（诊断报告、备份都要用）。
@@ -1117,6 +1987,12 @@ class ZEDF9PDriver(BaseDriver):
             'GPS': tier_msgs[0], 'GLO': tier_msgs[1], 'GLONASS': tier_msgs[1],
             'GAL': tier_msgs[2], 'GALILEO': tier_msgs[2],
             'BDS': tier_msgs[3], 'BDS2': tier_msgs[3], 'BEIDOU': tier_msgs[3],
+            # `MSM_CONSTELLATIONS` 用的是流程层口径的报文名（`RTCM3-107X`），
+            # 它同时也是 `set_message_rate()` 认的名字 —— 两种写法都得认，
+            # 否则默认值一改就和上面的映射对不上了。
+            'RTCM3-107X': tier_msgs[0], 'RTCM3-108X': tier_msgs[1],
+            'RTCM3-109X': tier_msgs[2], 'RTCM3-111X': tier_msgs[3],
+            'RTCM3-112X': tier_msgs[3],
         }
 
         plan = {1005: 1, 1230: 1}
@@ -1124,6 +2000,12 @@ class ZEDF9PDriver(BaseDriver):
             num = constellation_map.get(name)
             if num:
                 plan[num] = 1
+                continue
+            # 也接受直接给具体号（`RTCM3-1074` / `1074`）—— `MSM_CONSTELLATIONS`
+            # 用的就是这种写法，两个入口得能对接上。
+            digits = name.replace('RTCM3-', '').replace('RTCM-', '').replace('RTCM', '')
+            if digits.isdigit() and int(digits) in OBSERVATION_RTCM:
+                plan[int(digits)] = 1
         ok_plan, problems = validate_rtcm_plan(plan.keys())
         if not ok_plan:
             return False, '；'.join(problems), {'error': 'bad_plan', 'problems': problems}
@@ -1175,15 +2057,47 @@ class ZEDF9PDriver(BaseDriver):
 
     # ==================== 串口 ====================
     def _baud_key(self, port=None):
-        """本型号只走 UART1（USB 口在 F9P 上是另一个物理口，不在本项目范围）。"""
-        return 'UART1_BAUDRATE'
+        """带 `port` 就按它选，否则跟链路走。
+
+        与 MSGOUT 同一个道理：`UART1_BAUDRATE` 和 `UART1_BAUD` 是 UART1 口的键，
+        链路在 USB 上时改它们的波特率毫无意义 —— USB CDC 的速率由主机侧决定，
+        模块的 `USB_*` 配置里根本没有波特率这一项。所以：
+            链路 = UART1 → 返回 'UART1_BAUDRATE'
+            链路 = USB   → 返回 None（USB 没有波特率概念）
+        调用方拿到 None 要如实回答"USB 链路没有波特率可设"，不要硬写 UART1。
+        """
+        if port is None:
+            port, _msg, _data = self.detect_port()
+        if port == 'UART1':
+            return 'UART1_BAUDRATE'
+        if port == 'UART2':
+            return 'UART2_BAUDRATE'
+        return None
 
     def read_uart(self, port=None):
-        """回读模块自己报的串口配置。"""
-        names = ['UART1_BAUDRATE', 'UART1_DATABITS', 'UART1_PARITY',
-                 'UART1_STOPBITS', 'UART1_ENABLED']
+        """回读模块自己报的串口配置。
+
+        `port=None` 时跟链路走：链路在 USB 上就**如实说 USB 无波特率配置**，
+        不再像以前那样硬读 UART1 的值然后标成 `'port': 'UART1'` ——
+        那种"看起来读到了"的谎报，正是排查"改了没反应"时最误导人的地方。
+        """
+        link_port, _msg, port_note = self.detect_port() if port is None else (port, '', {})
+        if port_note.get('source') == 'explicit':
+            port_note = {'port': link_port, 'source': 'explicit'}
+        baud_key = self._baud_key(link_port)
+        if baud_key is None:
+            return True, f'链路走 {link_port}，该口没有波特率配置（由主机侧决定）', {
+                'port': link_port, 'baud': None, 'databits': None,
+                'parity': None, 'stopbits': None, 'enabled': True,
+                'raw': {}, 'note': 'USB CDC 无波特率/帧格式配置项',
+                'port_source': port_note.get('source', 'detect'),
+            }
+
+        prefix = baud_key[:-len('BAUDRATE')]           # 'UART1_'
+        names = [f'{prefix}BAUDRATE', f'{prefix}DATABITS', f'{prefix}PARITY',
+                 f'{prefix}STOPBITS', f'{prefix}ENABLED']
         values, _layer = self._valget(names)
-        if 'UART1_BAUDRATE' not in values:
+        if baud_key not in values:
             return False, '读取串口配置失败（无 VALGET 应答）', {'error': 'timeout'}
         raw = {k: int(v) for k, v in values.items()}
         # 枚举值（E1）的**具体编号**在集成手册里没有、Interface description 里
@@ -1192,19 +2106,20 @@ class ZEDF9PDriver(BaseDriver):
         # 所以这组编号不能按"0=1位、1=1.5位"去猜 —— 猜错会把用户带偏。
         # 因此：原始值照实给（`*_raw`），推断值放前面但标注为推断。
         data = {
-            'port': 'UART1',
-            'baud': raw['UART1_BAUDRATE'],
+            'port': link_port,
+            'baud': raw[baud_key],
             # DATABITS: 0 → 8（默认），1 → 7。依据是默认值必须等于出厂 8 位。
-            'databits': 7 if raw.get('UART1_DATABITS', 0) == 1 else 8,
-            'parity': {0: 'N', 1: 'E', 2: 'O'}.get(raw.get('UART1_PARITY', 0), 'N'),
+            'databits': 7 if raw.get(f'{prefix}DATABITS', 0) == 1 else 8,
+            'parity': {0: 'N', 1: 'E', 2: 'O'}.get(raw.get(f'{prefix}PARITY', 0), 'N'),
             # STOPBITS: 默认 1 位停止位，真机读到 1 且能 8N1 通讯 → 1 就是"1 位"。
-            'stopbits': 1 if raw.get('UART1_STOPBITS', 1) in (0, 1) else
-                        (1.5 if raw.get('UART1_STOPBITS') == 2 else 2),
-            'enabled': bool(raw.get('UART1_ENABLED', 1)),
-            'raw': {k: v for k, v in raw.items() if k != 'UART1_BAUDRATE'},
+            'stopbits': 1 if raw.get(f'{prefix}STOPBITS', 1) in (0, 1) else
+                        (1.5 if raw.get(f'{prefix}STOPBITS') == 2 else 2),
+            'enabled': bool(raw.get(f'{prefix}ENABLED', 1)),
+            'raw': {k: v for k, v in raw.items() if k != baud_key},
             'enum_note': '枚举编号来自真机回读推断，手册未给出对应表',
+            'port_source': port_note.get('source', 'detect'),
         }
-        return True, (f'UART1 = {data["baud"]} {data["databits"]}'
+        return True, (f'{link_port} = {data["baud"]} {data["databits"]}'
                       f'{data["parity"]}{data["stopbits"]}'), data
 
     def set_baud(self, baud, persist=True, restart=False):
@@ -1213,6 +2128,10 @@ class ZEDF9PDriver(BaseDriver):
         §3.8.1：改完要留 **100 ms** 再按新速率喂数据，否则模块还没切完，
         后面那几帧会被当成帧错误（一秒内超 100 个帧错误会让 RX 直接关闭）。
         所以这里发完配置就 sleep 0.2 s，并主动把通道的波特率改到新值。
+
+        链路在 USB 上时**直接拒绝**：USB CDC 的速率由主机侧协商，
+        改 `UART1_BAUDRATE` 对当前链路没有任何作用，写进去只会让
+        UART1 口下次被插上时跑在一个用户不知道的速率上。
         """
         try:
             value = int(baud)
@@ -1223,9 +2142,16 @@ class ZEDF9PDriver(BaseDriver):
                            f'{", ".join(str(b) for b in self.BAUDS)}'), {
                 'error': 'bad_baud', 'baud': value, 'supported': list(self.BAUDS)}
 
+        link_port, _msg, _note = self.detect_port()
+        baud_key = self._baud_key(link_port)
+        if baud_key is None:
+            return False, (f'当前链路是 {link_port}，该口没有波特率配置'
+                           f'（USB CDC 由主机侧决定速率），无需也不能修改'), {
+                'error': 'unsupported', 'port': link_port, 'baud': value}
+
         layers = (K.LAYER_RAM | K.LAYER_FLASH) if persist else K.LAYER_RAM
         old = self.channel.baud
-        ok, message, data = self._valset([('UART1_BAUDRATE', value)], layers=layers)
+        ok, message, data = self._valset([(baud_key, value)], layers=layers)
         if not ok:
             return False, f'修改波特率失败（{message}）', {
                 'error': 'nak' if message == 'NAK' else 'timeout'}
@@ -1238,16 +2164,22 @@ class ZEDF9PDriver(BaseDriver):
                 self.channel._serial.baudrate = value      # 本端口同步切档
             except Exception as e:                          # noqa: BLE001
                 logging.debug(f'切换串口波特率失败（忽略）：{e}')
-        data.update({'old_baud': old, 'baud': value, 'persist': bool(persist)})
-        return True, f'UART1 波特率 {old} → {value}', data
+        data.update({'old_baud': old, 'baud': value, 'persist': bool(persist),
+                     'port': link_port})
+        return True, f'{link_port} 波特率 {old} → {value}', data
 
     def get_baud(self):
         """回读当前波特率（`BAUD_READ_KEY` 指向本方法）。"""
-        values, _ = self._valget(['UART1_BAUDRATE'])
-        if 'UART1_BAUDRATE' not in values:
+        link_port, _msg, _note = self.detect_port()
+        baud_key = self._baud_key(link_port)
+        if baud_key is None:
+            return False, (f'当前链路是 {link_port}，该口没有波特率配置'), {
+                'error': 'unsupported', 'port': link_port, 'baud': None}
+        values, _ = self._valget([baud_key])
+        if baud_key not in values:
             return False, '读取波特率失败', {'error': 'timeout'}
-        return True, f'当前波特率 {int(values["UART1_BAUDRATE"])}', {
-            'baud': int(values['UART1_BAUDRATE'])}
+        return True, f'当前波特率 {int(values[baud_key])}', {
+            'baud': int(values[baud_key]), 'port': link_port}
 
     # ==================== 保存 / 重启 ====================
     def save(self):

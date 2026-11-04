@@ -277,6 +277,11 @@ class SerialLease:
 
         if self.channel is None:
             self.channel = Channel(port=self.port, baud=self.baud)
+        # 把心跳递进串口通道：驱动层 `send_ubx()` 的重试循环是最深的阻塞点
+        # （单条命令等 ACK 最长 1.5s×3），整段可能几十秒没有阶段变化，
+        # 而它埋在驱动内部，写链路的 `_beat()` 包不进去。
+        # 无条件覆盖：通道可能是上一轮留下来的，hook 必须指向**本次**租约。
+        self.channel.on_beat = self.beat
 
         last_error = ''
         for attempt in range(OPEN_ATTEMPTS):
@@ -289,7 +294,7 @@ class SerialLease:
                 self.beat()
                 time.sleep(OPEN_INTERVAL)
         else:
-            hint = self._open_hint(last_error)
+            hint = self._open_hint(last_error, self.port)
             self._drop_gate()
             self._write_terminal('FAILED', f'打开串口失败：{last_error}')
             self.channel = None
@@ -308,14 +313,49 @@ class SerialLease:
         return True, f'{self.port} 已独占打开'
 
     @staticmethod
-    def _open_hint(error_text):
-        """把 errno 翻译成用户能照做的动作（方案 §3.2 第 6 步的失败提示）。"""
+    def _existing_ports():
+        """枚举此刻真实存在的串口名，供失败提示对比。枚举本身失败就返回空表。"""
+        try:
+            import serial.tools.list_ports as list_ports
+            return [p.device for p in list_ports.comports()]
+        except Exception:                            # noqa: BLE001 - 只是提示，失败不影响判定
+            return []
+
+    @classmethod
+    def _open_hint(cls, error_text, port=''):
+        """把 errno 翻译成用户能照做的动作（方案 §3.2 第 6 步的失败提示）。
+
+        这里必须**按平台分流**：Windows 打开一个不存在的串口，pyserial 报的是
+        `PermissionError(13, '拒绝访问。')` —— errno 13 在 Linux 上确实意味着
+        "要加 dialout 组"，在 Windows 上却只是"这个口不存在"。以前不分平台
+        一律回 `usermod -aG dialout`，Windows 现场会照着做，然后发现根本没有
+        dialout 这个概念，白绕一圈。所以 Windows 先做一次端口枚举校验。
+        """
         text = str(error_text).lower()
-        if 'permission' in text or 'access is denied' in text or 'errno 13' in text:
-            return '。当前用户没有串口权限，把账号加入 dialout 组后重新登录（sudo usermod -aG dialout $USER）'
+        denied = ('permission' in text or 'access is denied' in text
+                  or '拒绝访问' in text or 'errno 13' in text)
+        missing = 'not exist' in text or '找不到' in text or 'errno 2' in text
+
+        if os.name == 'nt':
+            ports = cls._existing_ports()
+            if port and ports and port not in ports:
+                # 最确定的一类：配置里写的口，机器上压根没有。
+                return (f'。本机当前没有 {port} 这个串口，实际可用的是 '
+                        f'{", ".join(ports)}。请到配置页把 GNSS 串口改成实际设备')
+            if denied or missing:
+                # 口存在但打不开：Windows 下几乎都是被别的程序独占
+                # （u-center / GNSS 厂商工具 / 另一个串口助手）。
+                return ('。串口可能被别的程序占用：先关掉 u-center、串口助手、'
+                        'GNSS 厂商工具，并确认没有第二个 2RTK 实例在跑')
+            return ''
+
+        # ---- Linux / 其它 POSIX ----
+        if denied:
+            return ('。当前用户没有串口权限，把账号加入 dialout 组后重新登录'
+                    '（sudo usermod -aG dialout $USER）')
         if 'busy' in text or 'being used' in text or 'errno 16' in text:
             return '。串口仍被别的进程占用：确认没有第二个 2RTK 实例或 minicom 开着'
-        if 'not exist' in text or '找不到' in text or 'errno 2' in text:
+        if missing:
             return '。设备节点不存在：检查 USB 是否插好、是否已枚举（dmesg | tail）'
         return ''
 
@@ -574,10 +614,30 @@ def _selftest():
         ok6, _msg6 = broken.acquire()
         assert ok6, 'acquire 本身应当成功'
         ok7, message7 = broken.open()
-        assert not ok7 and 'Permission' in message7 and 'dialout' in message7, message7
+        assert not ok7 and 'Permission' in message7, message7
+        # 提示文案按平台分流：Linux 指向 dialout，Windows 指向"被别的程序占用"。
+        # 这里断言的是"给了该平台可执行的下一步"，而不是写死某个平台的关键词。
+        if os.name == 'nt':
+            assert ('被别的程序占用' in message7 or '没有' in message7), message7
+        else:
+            assert 'dialout' in message7, message7
         assert not state.calibration_hold.is_set(), '打开失败必须清 gate'
         assert state.restart_event.is_set(), '打开失败必须唤醒主循环'
         print(f'[10] 打开失败自动放开 gate OK  {message7[-26:]}')
+
+        # 11) 提示分流：不存在的口在 Windows 上必须点名"本机没有它 + 实际可用的口"，
+        #     不能把 Linux 的 dialout 方案搬过来（现场照着做会找不到 dialout 这个东西）。
+        if os.name == 'nt':
+            hint11 = SerialLease._open_hint(
+                "could not open port 'NO_SUCH_PORT': PermissionError(13, '拒绝访问。')",
+                'NO_SUCH_PORT')
+            assert '没有 NO_SUCH_PORT' in hint11, hint11
+            assert 'dialout' not in hint11, f'Windows 上不该出现 dialout：{hint11}'
+            print(f'[11] 端口不存在提示分流 OK  {hint11[:38]}…')
+        else:
+            hint11 = SerialLease._open_hint('errno 13 Permission denied', 'ttyUSB0')
+            assert 'dialout' in hint11, hint11
+            print(f'[11] 权限提示分流 OK  {hint11[:38]}…')
 
         print('=== lease 自测全部通过 ===')
         return 0

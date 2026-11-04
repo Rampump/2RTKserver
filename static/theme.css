@@ -900,6 +900,184 @@ select.form-input {
   opacity: 0.55;
 }
 
+/* ---------- 串口协议嗅探结果（static/calibration.js: scanPorts） ----------
+   扫描器把每个口都读一遍、判一遍，结果全列出来。这里是一张紧凑的表格，
+   不折叠、不弹窗：现场调试时"哪个口是 GNSS、波特率多少、收到的是什么数据"
+   必须一眼看完，藏在浮层里就等于没扫。
+   家族色只用左侧 3px 竖条 + 一行小标签表示，不整行上色 —— 四五个口连排时
+   整行色块会糊成一片，反而看不出谁是 GNSS。 */
+.scan-panel {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--surface-2, #f8fafc);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+}
+
+.scan-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.scan-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.scan-close {
+  padding: 0;
+  font-size: 12px;
+  color: var(--muted);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+.scan-close:hover { color: var(--accent); }
+
+.scan-progress {
+  margin-bottom: 8px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.scan-table-wrap { overflow-x: auto; }
+
+.scan-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.scan-table th {
+  padding: 4px 8px;
+  font-weight: 600;
+  font-size: 11px;
+  text-align: left;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border-strong);
+  white-space: nowrap;
+}
+
+.scan-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+  vertical-align: top;
+}
+
+.scan-table tr:last-child td { border-bottom: 0; }
+
+.scan-row { cursor: pointer; }
+.scan-row:hover td { background: var(--accent-soft); }
+.scan-row.is-current td { background: var(--accent-soft); }
+
+.scan-row td:first-child {
+  font-family: var(--mono);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.scan-dev {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 家族辨识条：gnss 绿、noise 灰、busy 橙、unknown 蓝。 */
+.scan-dot {
+  width: 3px;
+  height: 14px;
+  border-radius: 2px;
+  background: var(--muted);
+  flex: none;
+}
+
+.scan-fam-gnss .scan-dot { background: #16a34a; }
+.scan-fam-unknown .scan-dot { background: #2563eb; }
+.scan-fam-noise .scan-dot { background: var(--muted); }
+.scan-fam-busy .scan-dot { background: #d97706; }
+
+.scan-baud {
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+
+.scan-feats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.scan-feat {
+  display: inline-block;
+  padding: 1px 6px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--ink);
+  background: var(--surface, #fff);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.scan-feat.is-primary {
+  color: var(--accent-ink, #fff);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.scan-note {
+  font-size: 11px;
+  color: var(--muted);
+  word-break: break-word;
+}
+
+/* 波特率"多档可疑"的行：左侧加一条琥珀色提示，但不改变家族点的颜色 ——
+   这一行的判定本身没错（确实读到了 GNSS 数据），只是波特率需要人确认。
+   用透明度而不是换色，是为了不跟 `scan-fam-*` 的家族色打架。 */
+.scan-row.is-unverified .scan-baud {
+  color: #b45309;
+}
+
+/* `?` 角标：告诉用户"这个数字是扫出来的，别无条件信任"。
+   用 CSS 画的问号气泡，不引入图标资源。 */
+.scan-warn {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  line-height: 13px;
+  text-align: center;
+  font-size: 9.5px;
+  font-weight: 700;
+  color: #92400e;
+  background: #fde68a;
+  border-radius: 50%;
+  cursor: help;
+  vertical-align: 1px;
+}
+
+/* USB 直连口：这一格不该显示数字，因为数字不存在。
+   显示成灰色小字"直连"，比显示一个假的波特率诚实。 */
+.scan-ratefree {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: var(--sans, inherit);
+}
+
+.scan-desc {
+  font-size: 11px;
+  color: var(--muted);
+  word-break: break-word;
+}
+
 /* ---------- 候选下拉面板（static/picker.js） ----------
    必须挂在 body 下并 `position: fixed`、坐标由脚本现算。
    当初的直接原因是卡片带着 `.fade-in` 的末帧 transform（那时是 `both` +

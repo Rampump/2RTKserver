@@ -192,6 +192,10 @@ class LC29HBSDriver(BaseDriver):
     # 固件串 `LC29HBSNR01A01S` 的前 6 位。不能写 'LC29H'：
     # LC29H(AA) 是流动站/基站双模模块，命令集不一样，两者必须分开认。
     MATCH_PREFIX = 'LC29HB'
+    # 单模：整份文档里没有 `PQTMCFGRCVRMODE`，也没有任何"移动站"字样，
+    # 它天生就是基准站。只支持「自收敛」和「写入已知坐标」两种 ——
+    # 收不了 CORS 改正数（没有流动站模式），所以测不出自己的坐标。
+    ROLE = 'single'
     DUAL_MODE = False
     CAPS = CAPS
     CMD = CMD
@@ -409,14 +413,20 @@ class LC29HBSDriver(BaseDriver):
         if cfg.get('mode') == 'fixed':
             return True, '当前已是基站（固定坐标模式，Mode=2）', {**data, 'svin': cfg}
 
-        if verify:
-            return False, (
-                f'当前不是基站（Mode={cfg.get("mode")}）：本型号没有模式命令，'
-                f'必须先写入固定坐标（PQTMCFGSVIN,W,2,...）才会成为基站'), {
-                **data, 'svin': cfg, 'error': 'base_needs_coords'}
-
-        return True, (f'本型号无模式命令：已确认可写坐标（当前 Mode={cfg.get("mode")}），'
-                      f'写入固定坐标后即为基站'), {**data, 'svin': cfg}
+        # 本型号**本来就是单基准站模块**：不存在 rover↔base 的角色切换，
+        # 也不存在"必须先切过去再写"这一步。当前是 disabled / survey_in 都算
+        # "已经是基站侧"，真正决定身份的是后续的 set_fixed_ecef()。
+        #
+        # 所以这里一律返回成功（noop），**不再按 verify 返回 base_needs_coords**：
+        #   - 自收敛链：SWITCH_MODE 在 SVIN_CFG 之前，此刻 Mode 必然是 disabled，
+        #     按 verify 判失败会让"全新模块走自收敛"第一步就卡住；而这一步对
+        #     LC29H 本来就没有可下发的命令，判失败没有任何信息量。
+        #   - 已知坐标链 / 还原链：随后的 set_fixed_ecef() 才是真正的动作，
+        #     失败会在那一步如实暴露，不需要在这里提前拦。
+        return True, (f'本型号是单基准站模块，无需切换模式'
+                      f'（当前 SVIN Mode={cfg.get("mode")}，'
+                      f'由 PQTMCFGSVIN 决定，写入坐标后即为基站）'), \
+                     {**data, 'svin': cfg, 'already_base_side': True}
 
     def set_mode_memory_only(self, mode):
         """只改配置不重启。LC29HBS 的 Mode 字段本身就即时生效，所以直接复用。"""

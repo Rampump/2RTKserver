@@ -246,59 +246,123 @@ RTCM_CFG = {
     'RTCM_MSM_OUT_RANGERATE_SIGN': (0x10090011, L, 1.0,  'MSM 伪距率符号反转（兼容老接收机）'),
 }
 
-# ==================== NAV 输出（CFG-MSGOUT-UBX_NAV_*，group 0x91） ====================
-# 只列标定/日常运维真正会用的那些；全 60 多条见 pyubx2 的配置库。
-# 端口规律：USB = UART1 + 2（I2C→UART1→UART2→USB→SPI，中间隔着 UART2）。
+# ==================== NAV / RXM / NMEA 输出的全端口 MSGOUT 表 ====================
+# **这几张表是驱动 `_port_key()` 的唯一数据源，禁止手改。**
+# 生成方式（pyubx2 仓库在 E:/GitHub/pyubx2）：
+#     from pyubx2.ubxtypes_configdb import UBX_CONFIG_DATABASE
+#     遍历 `CFG_MSGOUT_UBX_NAV_*` / `CFG_MSGOUT_UBX_RXM_*` / `CFG_MSGOUT_NMEA_ID_*`，
+#     按后缀 `_I2C/_UART1/_UART2/_USB/_SPI` 拆成 {name: {port: id}}。
+#
+# 为什么要按端口拆开存：**MSGOUT 键是分端口的**。同一个 NAV-PVT 有五个键，
+# 分别管 I2C / UART1 / UART2 / USB / SPI 五个物理口各自的输出速率。
+# 驱动早期只存 UART1 那一份 ID，于是出了两个真机上抓到的 bug：
+#   1. 「关不掉输出」——真机链路是 COM12 = USB CDC（VID:PID=1546:01A9），
+#      写 `..._UART1` 键模块照样 ACK，但 USB 口上的 NAV-PVT/NAV-SAT 一个字节没少。
+#   2. 键表不全——NAV 40 条、NMEA 15 条、RXM 18 条是权威表全量，
+#      原先只录了 13/7/4 条，不在表里的键 `silence_outputs()` 连"有这条"都不知道。
+#
+# `None` 的语义是「该端口没有这个键」，**不是**「值是 0」。模块固件里
+# RXM-MEAS20/MEAS50/MEASC12/MEASD12 四个只给了 I2C/UART1/SPI 三个口的键，
+# 没有 UART2/USB 的。调用方遇到 None 必须跳过，不能当成 0 去写。
+
+# --- NAV ---
+NAV_OUT_PORTS = {
+    'AOPSTATUS'     : {'I2C': 0x20910079, 'UART1': 0x2091007a, 'UART2': 0x2091007b, 'USB': 0x2091007c, 'SPI': 0x2091007d},
+    'ATT'           : {'I2C': 0x2091001f, 'UART1': 0x20910020, 'UART2': 0x20910021, 'USB': 0x20910022, 'SPI': 0x20910023},
+    'CLOCK'         : {'I2C': 0x20910065, 'UART1': 0x20910066, 'UART2': 0x20910067, 'USB': 0x20910068, 'SPI': 0x20910069},
+    'COV'           : {'I2C': 0x20910083, 'UART1': 0x20910084, 'UART2': 0x20910085, 'USB': 0x20910086, 'SPI': 0x20910087},
+    'DAHEADING'     : {'I2C': 0x209103df, 'UART1': 0x209103e0, 'UART2': 0x209103e1, 'USB': 0x209103e2, 'SPI': 0x209103e3},
+    'DGPS'          : {'I2C': 0x20910074, 'UART1': 0x20910075, 'UART2': 0x20910076, 'USB': 0x20910077, 'SPI': 0x20910078},
+    'DOP'           : {'I2C': 0x20910038, 'UART1': 0x20910039, 'UART2': 0x2091003a, 'USB': 0x2091003b, 'SPI': 0x2091003c},
+    'EELL'          : {'I2C': 0x20910313, 'UART1': 0x20910314, 'UART2': 0x20910315, 'USB': 0x20910316, 'SPI': 0x20910317},
+    'EOE'           : {'I2C': 0x2091015f, 'UART1': 0x20910160, 'UART2': 0x20910161, 'USB': 0x20910162, 'SPI': 0x20910163},
+    'GEOFENCE'      : {'I2C': 0x209100a1, 'UART1': 0x209100a2, 'UART2': 0x209100a3, 'USB': 0x209100a4, 'SPI': 0x209100a5},
+    'HPPOSECEF'     : {'I2C': 0x2091002e, 'UART1': 0x2091002f, 'UART2': 0x20910030, 'USB': 0x20910031, 'SPI': 0x20910032},
+    'HPPOSLLH'      : {'I2C': 0x20910033, 'UART1': 0x20910034, 'UART2': 0x20910035, 'USB': 0x20910036, 'SPI': 0x20910037},
+    'NMI'           : {'I2C': 0x20910590, 'UART1': 0x20910591, 'UART2': 0x20910592, 'USB': 0x20910593, 'SPI': 0x20910594},
+    'ODO'           : {'I2C': 0x2091007e, 'UART1': 0x2091007f, 'UART2': 0x20910080, 'USB': 0x20910081, 'SPI': 0x20910082},
+    'ORB'           : {'I2C': 0x20910010, 'UART1': 0x20910011, 'UART2': 0x20910012, 'USB': 0x20910013, 'SPI': 0x20910014},
+    'PL'            : {'I2C': 0x20910415, 'UART1': 0x20910416, 'UART2': 0x20910417, 'USB': 0x20910418, 'SPI': 0x20910419},
+    'POSECEF'       : {'I2C': 0x20910024, 'UART1': 0x20910025, 'UART2': 0x20910026, 'USB': 0x20910027, 'SPI': 0x20910028},
+    'POSLLH'        : {'I2C': 0x20910029, 'UART1': 0x2091002a, 'UART2': 0x2091002b, 'USB': 0x2091002c, 'SPI': 0x2091002d},
+    'PVAT'          : {'I2C': 0x2091062a, 'UART1': 0x2091062b, 'UART2': 0x2091062c, 'USB': 0x2091062d, 'SPI': 0x2091062e},
+    'PVT'           : {'I2C': 0x20910006, 'UART1': 0x20910007, 'UART2': 0x20910008, 'USB': 0x20910009, 'SPI': 0x2091000a},
+    'RELPOSNED'     : {'I2C': 0x2091008d, 'UART1': 0x2091008e, 'UART2': 0x2091008f, 'USB': 0x20910090, 'SPI': 0x20910091},
+    'SAT'           : {'I2C': 0x20910015, 'UART1': 0x20910016, 'UART2': 0x20910017, 'USB': 0x20910018, 'SPI': 0x20910019},
+    'SBAS'          : {'I2C': 0x2091006a, 'UART1': 0x2091006b, 'UART2': 0x2091006c, 'USB': 0x2091006d, 'SPI': 0x2091006e},
+    'SIG'           : {'I2C': 0x20910345, 'UART1': 0x20910346, 'UART2': 0x20910347, 'USB': 0x20910348, 'SPI': 0x20910349},
+    'SLAS'          : {'I2C': 0x20910336, 'UART1': 0x20910337, 'UART2': 0x20910338, 'USB': 0x20910339, 'SPI': 0x2091033a},
+    'SOL'           : {'I2C': 0x20910001, 'UART1': 0x20910002, 'UART2': 0x20910003, 'USB': 0x20910004, 'SPI': 0x20910005},
+    'STATUS'        : {'I2C': 0x2091001a, 'UART1': 0x2091001b, 'UART2': 0x2091001c, 'USB': 0x2091001d, 'SPI': 0x2091001e},
+    'SVIN'          : {'I2C': 0x20910088, 'UART1': 0x20910089, 'UART2': 0x2091008a, 'USB': 0x2091008b, 'SPI': 0x2091008c},
+    'SVINFO'        : {'I2C': 0x2091000b, 'UART1': 0x2091000c, 'UART2': 0x2091000d, 'USB': 0x2091000e, 'SPI': 0x2091000f},
+    'TIMEBDS'       : {'I2C': 0x20910051, 'UART1': 0x20910052, 'UART2': 0x20910053, 'USB': 0x20910054, 'SPI': 0x20910055},
+    'TIMEGAL'       : {'I2C': 0x20910056, 'UART1': 0x20910057, 'UART2': 0x20910058, 'USB': 0x20910059, 'SPI': 0x2091005a},
+    'TIMEGLO'       : {'I2C': 0x2091004c, 'UART1': 0x2091004d, 'UART2': 0x2091004e, 'USB': 0x2091004f, 'SPI': 0x20910050},
+    'TIMEGPS'       : {'I2C': 0x20910047, 'UART1': 0x20910048, 'UART2': 0x20910049, 'USB': 0x2091004a, 'SPI': 0x2091004b},
+    'TIMELS'        : {'I2C': 0x20910060, 'UART1': 0x20910061, 'UART2': 0x20910062, 'USB': 0x20910063, 'SPI': 0x20910064},
+    'TIMENAVIC'     : {'I2C': 0x209106a2, 'UART1': 0x209106a3, 'UART2': 0x209106a4, 'USB': 0x209106a5, 'SPI': 0x209106a6},
+    'TIMEQZSS'      : {'I2C': 0x20910386, 'UART1': 0x20910387, 'UART2': 0x20910388, 'USB': 0x20910389, 'SPI': 0x2091038a},
+    'TIMETRUSTED'   : {'I2C': 0x209103a8, 'UART1': 0x209103a9, 'UART2': 0x209103aa, 'USB': 0x209103ab, 'SPI': 0x209103ac},
+    'TIMEUTC'       : {'I2C': 0x2091005b, 'UART1': 0x2091005c, 'UART2': 0x2091005d, 'USB': 0x2091005e, 'SPI': 0x2091005f},
+    'VELECEF'       : {'I2C': 0x2091003d, 'UART1': 0x2091003e, 'UART2': 0x2091003f, 'USB': 0x20910040, 'SPI': 0x20910041},
+    'VELNED'        : {'I2C': 0x20910042, 'UART1': 0x20910043, 'UART2': 0x20910044, 'USB': 0x20910045, 'SPI': 0x20910046},
+}
+
+# --- RXM ---
+RXM_OUT_PORTS = {
+    'ALM'           : {'I2C': 0x20910173, 'UART1': 0x20910174, 'UART2': 0x20910175, 'USB': 0x20910176, 'SPI': 0x20910177},
+    'COR'           : {'I2C': 0x209106b6, 'UART1': 0x209106b7, 'UART2': 0x209106b8, 'USB': 0x209106b9, 'SPI': 0x209106ba},
+    'EPH'           : {'I2C': 0x20910169, 'UART1': 0x2091016a, 'UART2': 0x2091016b, 'USB': 0x2091016c, 'SPI': 0x2091016d},
+    'IMES'          : {'I2C': 0x2091015a, 'UART1': 0x2091015b, 'UART2': 0x2091015c, 'USB': 0x2091015d, 'SPI': 0x2091015e},
+    'MEAS20'        : {'I2C': 0x20910643, 'UART1': 0x20910644, 'UART2': None, 'USB': None, 'SPI': 0x20910647},
+    'MEAS50'        : {'I2C': 0x20910648, 'UART1': 0x20910649, 'UART2': None, 'USB': None, 'SPI': 0x2091064c},
+    'MEASC12'       : {'I2C': 0x2091063e, 'UART1': 0x2091063f, 'UART2': None, 'USB': None, 'SPI': 0x20910642},
+    'MEASD12'       : {'I2C': 0x20910639, 'UART1': 0x2091063a, 'UART2': None, 'USB': None, 'SPI': 0x2091063d},
+    'MEASX'         : {'I2C': 0x20910204, 'UART1': 0x20910205, 'UART2': 0x20910206, 'USB': 0x20910207, 'SPI': 0x20910208},
+    'PMP'           : {'I2C': 0x2091031d, 'UART1': 0x2091031e, 'UART2': 0x2091031f, 'USB': 0x20910320, 'SPI': 0x20910321},
+    'QZSSL6'        : {'I2C': 0x2091033f, 'UART1': 0x20910340, 'UART2': 0x20910341, 'USB': 0x20910342, 'SPI': 0x20910343},
+    'RAWX'          : {'I2C': 0x209102a4, 'UART1': 0x209102a5, 'UART2': 0x209102a6, 'USB': 0x209102a7, 'SPI': 0x209102a8},
+    'RLM'           : {'I2C': 0x2091025e, 'UART1': 0x2091025f, 'UART2': 0x20910260, 'USB': 0x20910261, 'SPI': 0x20910262},
+    'RTCM'          : {'I2C': 0x20910268, 'UART1': 0x20910269, 'UART2': 0x2091026a, 'USB': 0x2091026b, 'SPI': 0x2091026c},
+    'SFRBX'         : {'I2C': 0x20910231, 'UART1': 0x20910232, 'UART2': 0x20910233, 'USB': 0x20910234, 'SPI': 0x20910235},
+    'SPARTN'        : {'I2C': 0x20910605, 'UART1': 0x20910606, 'UART2': 0x20910607, 'USB': 0x20910608, 'SPI': 0x20910609},
+    'SVSI'          : {'I2C': 0x20910150, 'UART1': 0x20910151, 'UART2': 0x20910152, 'USB': 0x20910153, 'SPI': 0x20910154},
+    'TM'            : {'I2C': 0x20910610, 'UART1': 0x20910611, 'UART2': 0x20910612, 'USB': 0x20910613, 'SPI': 0x20910614},
+}
+
+# --- NMEA ---
+NMEA_OUT_PORTS = {
+    'DTM'           : {'I2C': 0x209100a6, 'UART1': 0x209100a7, 'UART2': 0x209100a8, 'USB': 0x209100a9, 'SPI': 0x209100aa},
+    'GBS'           : {'I2C': 0x209100dd, 'UART1': 0x209100de, 'UART2': 0x209100df, 'USB': 0x209100e0, 'SPI': 0x209100e1},
+    'GGA'           : {'I2C': 0x209100ba, 'UART1': 0x209100bb, 'UART2': 0x209100bc, 'USB': 0x209100bd, 'SPI': 0x209100be},
+    'GLL'           : {'I2C': 0x209100c9, 'UART1': 0x209100ca, 'UART2': 0x209100cb, 'USB': 0x209100cc, 'SPI': 0x209100cd},
+    'GNS'           : {'I2C': 0x209100b5, 'UART1': 0x209100b6, 'UART2': 0x209100b7, 'USB': 0x209100b8, 'SPI': 0x209100b9},
+    'GRS'           : {'I2C': 0x209100ce, 'UART1': 0x209100cf, 'UART2': 0x209100d0, 'USB': 0x209100d1, 'SPI': 0x209100d2},
+    'GSA'           : {'I2C': 0x209100bf, 'UART1': 0x209100c0, 'UART2': 0x209100c1, 'USB': 0x209100c2, 'SPI': 0x209100c3},
+    'GST'           : {'I2C': 0x209100d3, 'UART1': 0x209100d4, 'UART2': 0x209100d5, 'USB': 0x209100d6, 'SPI': 0x209100d7},
+    'GSV'           : {'I2C': 0x209100c4, 'UART1': 0x209100c5, 'UART2': 0x209100c6, 'USB': 0x209100c7, 'SPI': 0x209100c8},
+    'RLM'           : {'I2C': 0x20910400, 'UART1': 0x20910401, 'UART2': 0x20910402, 'USB': 0x20910403, 'SPI': 0x20910404},
+    'RMC'           : {'I2C': 0x209100ab, 'UART1': 0x209100ac, 'UART2': 0x209100ad, 'USB': 0x209100ae, 'SPI': 0x209100af},
+    'THS'           : {'I2C': 0x209100e2, 'UART1': 0x209100e3, 'UART2': 0x209100e4, 'USB': 0x209100e5, 'SPI': 0x209100e6},
+    'VLW'           : {'I2C': 0x209100e7, 'UART1': 0x209100e8, 'UART2': 0x209100e9, 'USB': 0x209100ea, 'SPI': 0x209100eb},
+    'VTG'           : {'I2C': 0x209100b0, 'UART1': 0x209100b1, 'UART2': 0x209100b2, 'USB': 0x209100b3, 'SPI': 0x209100b4},
+    'ZDA'           : {'I2C': 0x209100d8, 'UART1': 0x209100d9, 'UART2': 0x209100da, 'USB': 0x209100db, 'SPI': 0x209100dc},
+}
+
+# ---- 以下是 `_resolve_msg_key()` 用的 UART1 视图，从上面三张表派生，勿手改 ----
+# 单独留这几个名字是为了让老代码 / 测试不必关心端口维度。
 NAV_OUT = {
-    'NAV_PVT':       (0x20910007, U1, 1.0, 'NAV-PVT 定位解算结果'),
-    # 曾有 bug：写成 0x20910088，那是 _I2C 端口，Survey-in 状态永远收不到
-    'NAV_SVIN':      (0x20910089, U1, 1.0, 'NAV-SVIN Survey-in 状态'),
-    'NAV_HPPOSLLH':  (0x20910034, U1, 1.0, 'NAV-HPPOSLLH 高精度经纬高'),
-    # 曾有 bug：写成 0x20910263 —— 这个 ID 在权威表里根本不存在
-    'NAV_EOE':       (0x20910160, U1, 1.0, 'NAV-EOE 历元结束标志'),
-    'NAV_SAT':       (0x20910016, U1, 1.0, 'NAV-SAT 卫星状态（调试用）'),
-    'NAV_SIG':       (0x20910346, U1, 1.0, 'NAV-SIG 信号质量（调试用）'),
-    'NAV_STATUS':    (0x2091001B, U1, 1.0, 'NAV-STATUS 解状态'),
-    'NAV_RELPOSNED': (0x2091008E, U1, 1.0, 'NAV-RELPOSNED 相对位置（移动站看基线）'),
-    'NAV_HPPOSECEF': (0x2091002F, U1, 1.0, 'NAV-HPPOSECEF 高精度 ECEF'),
-    'NAV_CLOCK':     (0x20910066, U1, 1.0, 'NAV-CLOCK 钟差'),
-    'NAV_DOP':       (0x20910039, U1, 1.0, 'NAV-DOP 精度因子'),
-    'NAV_TIMEUTC':   (0x2091005C, U1, 1.0, 'NAV-TIMEUTC UTC 时间'),
-    'NAV_VELNED':    (0x20910043, U1, 1.0, 'NAV-VELNED 地速'),
+    'NAV_' + name: (ids['UART1'], U1, 1.0, 'NAV-' + name + ' 输出速率（UART1 视图，见 NAV_OUT_PORTS）')
+    for name, ids in NAV_OUT_PORTS.items() if ids.get('UART1')
 }
-
-NAV_OUT_USB = {
-    'NAV_PVT_USB':       (0x20910009, U1, 1.0, 'NAV-PVT 从 USB 输出'),
-    'NAV_SVIN_USB':      (0x2091008B, U1, 1.0, 'NAV-SVIN 从 USB 输出'),
-    'NAV_HPPOSLLH_USB':  (0x20910036, U1, 1.0, 'NAV-HPPOSLLH 从 USB 输出'),
-    'NAV_EOE_USB':       (0x20910162, U1, 1.0, 'NAV-EOE 从 USB 输出'),
-    'NAV_SAT_USB':       (0x20910018, U1, 1.0, 'NAV-SAT 从 USB 输出'),
-    'NAV_SIG_USB':       (0x20910348, U1, 1.0, 'NAV-SIG 从 USB 输出'),
-    'NAV_STATUS_USB':    (0x2091001D, U1, 1.0, 'NAV-STATUS 从 USB 输出'),
-    'NAV_RELPOSNED_USB': (0x20910090, U1, 1.0, 'NAV-RELPOSNED 从 USB 输出'),
-}
-
-# ==================== RXM 原始观测（CFG-MSGOUT-UBX_RXM_*_UART1） ====================
-# 做原始数据记录 / 后处理解算（PPK）才需要，日常基准站不用开。
-# **RAWX 在 38400 下塞不下**（每历元几 KB），开了会把 RTCM 挤掉。
 RXM_OUT = {
-    'RXM_RAWX':  (0x209102A5, U1, 1.0, 'RXM-RAWX 原始观测（PPK/后处理用，需 ≥115200）'),
-    'RXM_SFRBX': (0x20910232, U1, 1.0, 'RXM-SFRBX 原始星历（需 ≥115200）'),
-    'RXM_MEASX': (0x20910205, U1, 1.0, 'RXM-MEASX 测量值'),
-    'RXM_RTCM':  (0x20910269, U1, 1.0, 'RXM-RTCM 收到的差分统计（诊断移动站用）'),
+    'RXM_' + name: (ids['UART1'], U1, 1.0, 'RXM-' + name + ' 输出速率（UART1 视图，见 RXM_OUT_PORTS）')
+    for name, ids in RXM_OUT_PORTS.items() if ids.get('UART1')
 }
-
-# ==================== NMEA 输出（CFG-MSGOUT-NMEA_ID_*_UART1） ====================
-# 基准站默认只留 UBX+RTCM，NMEA 全关省带宽。但接老式上位机 / 电台转发时
-# 常常必须留 GGA+RMC。
 NMEA_OUT = {
-    'GGA': (0x209100BB, U1, 1.0, 'NMEA GGA 定位质量'),
-    'GLL': (0x209100CA, U1, 1.0, 'NMEA GLL 经纬度'),
-    'GSA': (0x209100C0, U1, 1.0, 'NMEA GSA DOP/参与解算卫星'),
-    'GSV': (0x209100C5, U1, 1.0, 'NMEA GSV 可见卫星（带宽大户）'),
-    'RMC': (0x209100AC, U1, 1.0, 'NMEA RMC 推荐最小定位信息'),
-    'VTG': (0x209100B1, U1, 1.0, 'NMEA VTG 地面速度航向'),
-    'ZDA': (0x209100D7, U1, 1.0, 'NMEA ZDA 日期时间'),
+    name: (ids['UART1'], U1, 1.0, 'NMEA ' + name + ' 输出速率（UART1 视图，见 NMEA_OUT_PORTS）')
+    for name, ids in NMEA_OUT_PORTS.items() if ids.get('UART1')
 }
 
 # ==================== NMEA 格式配置（CFG-NMEA-*，group 0x93） ====================
@@ -422,24 +486,86 @@ MISC = {
     'HW_RF_LNA_MODE':      (0x20A30057, E1, 1.0, 'RF LNA 模式 0=正常 1=低增益'),
 }
 
+# MSGOUT 三组的全部端口键都在这儿登记：查找名形如
+#   NAVOUT_NAV_PVT / NAVOUT_NAV_PVT_UART1 / NAVOUT_NAV_PVT_USB ...
+# 不带端口后缀的裸名（`NAVOUT_NAV_PVT`）是 UART1 那份的兼容别名，
+# 老调用方靠它；新代码一律走 `_port_key()` 把后缀拼好再来查。
+#
+# 为什么不把裸名当作「任何端口都行」的通配：写错的代价是静默的
+# ——模块照 ACK，输出纹丝不动。宁可查不到报错，也不要猜。
+def _msgout_port_names(prefix, table, name_prefix):
+    """把 {name: {port: id}} 摊平成 {'NAVOUT_NAV_PVT_UART1': id, ...}。"""
+    out = {}
+    for name, ids in table.items():
+        for port, key_id in ids.items():
+            if key_id:                      # None = 该端口固件里没这个键
+                out[f'{prefix}{name_prefix}{name}_{port}'] = key_id
+    return out
+
+
 # 全表合并：写入时按 key 名查。
 ALL_KEYS = {}
 for _group in (TMODE, UART1, UART2, USB, I2C, SPI, OUTPROT, INPROT,
                NAVSPG, RATE, SIGNAL, SEC, MISC, NMEA_CFG, HW_ANT,
-               NAV_OUT, NAV_OUT_USB, RXM_OUT, NMEA_OUT, RTCM_CFG,
-               RTCM_INPUT_ONLY):
+               NAV_OUT, RXM_OUT, NMEA_OUT, RTCM_CFG, RTCM_INPUT_ONLY):
     ALL_KEYS.update(_group)
 ALL_KEYS.update({f'RTCM_{num}': rec for num, rec in RTCM_OUT.items()})
 ALL_KEYS.update({f'RTCM_{num}': rec for num, rec in RTCM_INPUT_ONLY.items()})
 ALL_KEYS.update({f'NAVOUT_{name}': rec for name, rec in NAV_OUT.items()})
-ALL_KEYS.update({f'NAVOUT_{name}': rec for name, rec in NAV_OUT_USB.items()})
 ALL_KEYS.update({f'RXMOUT_{name}': rec for name, rec in RXM_OUT.items()})
 ALL_KEYS.update({f'NMEAMOUT_{name}': rec for name, rec in NMEA_OUT.items()})
+
+# 端口维度的登记：ID 与上面裸名那份**完全相同**（裸名就是 UART1），
+# 所以不给 note，靠 `_self_check()` 的别名机制（_canonical 剥端口后缀）合并。
+for _prefix, _table, _np in (('NAVOUT_', NAV_OUT_PORTS, 'NAV_'),
+                             ('RXMOUT_', RXM_OUT_PORTS, 'RXM_'),
+                             ('NMEAMOUT_', NMEA_OUT_PORTS, '')):
+    for _name, _key_id in _msgout_port_names(_prefix, _table, _np).items():
+        ALL_KEYS[_name] = (_key_id, U1, 1.0, 'MSGOUT 输出速率（分端口键）')
+
+
+# ==================== 输出键的端口归属 ====================
+# 这组 MSGOUT 键（NAV/NMEA/RXM 三族）是"整组快照 / 整组静音 / 整组还原"
+# 的操作对象。哪些键属于哪个物理口，**只在这里登记一次** ——
+# 以前是驱动用 `f'{prefix}{name}_{port}'` 现拼，拼出来的名字对不对
+# 取决于端口命名约定（UART1 的后缀到底是空串还是 `_UART1`），
+# 改一次约定就要全库找一遍拼接点。现在键表自己说话，驱动只做 `lookup()` 复验。
+#
+# RTCM 键**不在这里**：它没有端口维度，由 `RTCM_OUT` 单独管，
+# 也绝不能被静音逻辑碰到（关掉 1005 等于把基站掐死）。
+# 注意 `RXMOUT_RXM_RTCM_*` 是 **RXM 族里名为 RTCM 的 UBX 报文**
+# （周期播发的 RTCM 原始数据 UBX 封装），不是 RTCM3 播发开关 ——
+# 它的键名里带 RTCM 不等于能掐断基站的 1005，测试里按 `RTCM_数字` 形式判。
+OUTPUT_FANOUT = tuple(
+    f'{_prefix}{_np}{_name}_{_port}'
+    for _prefix, _table, _np in (('NAVOUT_', NAV_OUT_PORTS, 'NAV_'),
+                                 ('RXMOUT_', RXM_OUT_PORTS, 'RXM_'),
+                                 ('NMEAMOUT_', NMEA_OUT_PORTS, ''))
+    for _name, _ids in _table.items()
+    for _port, _key_id in _ids.items()
+    if _key_id
+)
+
+# 端口名全集（`OUTPUT_FANOUT` 里出现过的），供驱动做端口名合法性校验，
+# 免得驱动里再写一份 `PORT_SUFFIX` 的白名单。
+OUTPUT_PORTS = tuple(sorted({key.rsplit('_', 1)[-1] for key in OUTPUT_FANOUT}))
 
 
 def lookup(name):
     """按名字取 `(key_id, type, scale, note)`；没有返回 None。"""
     return ALL_KEYS.get(name)
+
+
+def lookup_msgout(family, name, port):
+    """取某端口上某个输出的 ID，取不到返回 None。
+
+    `family` ∈ {'NAV', 'RXM', 'NMEA'}；`name` 不带 `NAV_`/`RXM_` 前缀也不带端口后缀。
+    这是**唯一**正确的取端口键的入口；查不到就说明固件没给这个口这个键
+    （比如 RXM-MEAS20 没有 USB），调用方应当跳过而不是猜一个相邻 ID。
+    """
+    table = {'NAV': NAV_OUT_PORTS, 'RXM': RXM_OUT_PORTS, 'NMEA': NMEA_OUT_PORTS}[family]
+    ids = table.get(name) or {}
+    return ids.get(port)
 
 
 # ==================== UBX 消息号 ====================
@@ -455,6 +581,10 @@ MSG_CFG_CFG = (0x06, 0x09)
 
 MSG_MON_VER = (0x0A, 0x04)
 MSG_MON_HW = (0x0A, 0x09)
+# MON-COMMS（0x0A/0x36）：报告每个协议口的收发统计，用来判断**当前链路
+# 实际走的是 UART1 还是 USB**。MSGOUT 的键是按端口分的，端口认错就关不掉输出
+# （写 UART1 的键模块照样 ACK，USB 口纹丝不动）。详见 F9P 驱动 detect_port()。
+MSG_MON_COMMS = (0x0A, 0x36)
 MSG_NAV_SVIN = (0x01, 0x3B)
 MSG_NAV_PVT = (0x01, 0x07)
 MSG_NAV_HPPOSLLH = (0x01, 0x14)
@@ -511,13 +641,22 @@ DEFAULT_BAUD = 38400
 # 其余前缀之间撞 ID 就是真的抄错了，自检会拦。
 _ALIAS_PREFIXES = ('NAVOUT_', 'RXMOUT_', 'NMEAMOUT_', 'RTCM_')
 
+# 端口后缀。分端口登记后，同一个 ID 会同时出现在
+#   `NAV_PVT`（裸名）和 `NAVOUT_NAV_PVT_UART1`（端口名）两处 ——
+# canonical 必须把这俩归成一个，否则自检会误报撞车。
+_PORT_SUFFIXES = ('_I2C', '_UART1', '_UART2', '_USB', '_SPI')
+
 
 def _canonical(name):
-    """把别名前缀剥掉，得到"这条记录究竟代表哪个键"。"""
+    """把别名前缀和端口后缀都剥掉，得到"这条记录究竟代表哪个键"。"""
     name = str(name)        # RTCM_OUT 的键是 int 报文号
     for prefix in _ALIAS_PREFIXES:
         if name.startswith(prefix):
-            return name[len(prefix):]
+            name = name[len(prefix):]
+            break
+    for suffix in _PORT_SUFFIXES:
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
     return name
 
 
