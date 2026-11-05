@@ -788,47 +788,94 @@
     if (kind) hint.classList.add(kind);
   }
 
-  function pickPort(device) {
+  // **必须先 blur 再赋值**：`#cal-port` 挂着 `list="cal-port-list"`，浏览器会把
+  // 这个输入框当成"正在输入"，赋值后自动弹出 datalist 候选浮层 —— 浮层正好盖住
+  // 刚填进去的串口名，现场看到的就是"只弹了个列表、并没有选中"。
+  // 波特率框也有 list，但它的候选（cal-baud-list）通常为空/不匹配，不弹，
+  // 于是表现成"波特率填上了、串口没填"的不对称，正是这条 bug 的由来。
+  // blur 让输入框退出编辑态，浮层不会弹；再赋值，值就是最终值。
+  // 这两个接口的端口名**字段名不一样**，是个真坑：
+  //   GET /api/serial_ports          → ports[].device
+  //   GET /api/calibration/scan/status → ports[].port
+  // 前端原先一律按 `device` 读，于是扫描结果表里端口名一列全是空白、
+  // 点行时 `pickPort(undefined)` 把输入框写成了空字符串 —— 表现就是
+  // "波特率填上了、串口名没填"，再点「读取模块信息」自然报"请先选择串口"。
+  // 统一在这里取值，两个名字都认，后端以后改哪个都不会再断。
+  function portName(p) {
+    if (!p) return '';
+    return String(p.device || p.port || '').trim();
+  }
+
+  // **换口必须重置"上一次的识别结果"**。串口的型号选择是"人告诉程序这个口上是什么"，
+  // 它只对某一个口成立 —— 换了口，上一口的选择就变成了一条错误的断言。
+  // 实测：先点 COM3（LG290P）→ 读取成功，再点 COM12 直接点「读取模块信息」，
+  // 下拉框仍停在「Quectel LG290P」，后端按所选型号去问，于是报
+  // "模块型号与所选不符：你选的是 lg290p，实际检测到 ZED-F9P" —— 用户没有任何
+  // 操作失误，是页面把旧答案带过去了。
+  // 所以 portChanged 时把型号退回「自动探测」，并清掉上一口的硬件信息卡。
+  function resetModuleForPort() {
+    var sel = $('cal-module');
+    if (sel && sel.value && sel.value !== '__auto__') {
+      sel.value = '__auto__';
+      // 能力位、波特率候选、提示文案都挂在 change 上，必须补派发。
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+    } else {
+      // 已经是自动探测也要刷一遍：提示文案里带着"上次回读的波特率"，
+      // 那是上一个口的数据，不能留在新口上。
+      applyCapabilities();
+      refreshBaudOptions();
+      refreshModuleHint();
+    }
+    // 硬件信息卡（固件 / SN / UART）描述的是上一个口上的模块，留着就是误导。
+    var hw = $('cal-hw');
+    if (hw) hw.innerHTML = '';
+    STATE.hwTaskId = null;
+  }
+
+  // 内部调用（扫描预填、点击结果行）时 `changed` 由这里自己判：值真变了才重置，
+  // 重复点同一行不会把用户已经选好的型号清掉。
+  function pickPort(device, opts) {
     var input = $('cal-port');
     if (!input) return;
-    input.value = device || '';
-    // 联动都挂在 input/change 上（波特率提示、型号能力重算），必须补派发
+    var prev = String(input.value || '').trim();
+    var next = String(device || '').trim();
+    var changed = prev !== next;
+    if (document.activeElement === input) input.blur();
+    input.value = next;
+    if (changed && !(opts && opts.keepModule)) resetModuleForPort();
+    // 联动都挂在 input/change 上（波特率提示、型号能力重算），必须补派发。
+    // 这里派发的是合成事件，不会重新打开 datalist —— 只有真实键盘输入才会。
     input.dispatchEvent(new Event('input', { bubbles: true }));
     input.dispatchEvent(new Event('change', { bubbles: true }));
+    // 赋值是"看不见的操作"：值变了但用户的眼睛还停在下面那张结果表上。
+    // 给输入框闪一下强调色，让"填进去了"这件事有视觉落点，而不是靠猜。
+    flashFilled(input);
     renderPortChips();
   }
 
+  // 让某个输入框闪一下（500ms 的边框高亮）。只动 class，不改值、不抢焦点。
+  function flashFilled(el) {
+    if (!el || !el.classList) return;
+    el.classList.remove('is-filled-flash');
+    // 强制回流，否则连续两次点击同一个框时动画不会重播
+    void el.offsetWidth;
+    el.classList.add('is-filled-flash');
+    window.setTimeout(function () { el.classList.remove('is-filled-flash'); }, 700);
+  }
+
+  // 扫描结果的候选**不再画成一排 chip**。原先扫描结束会同时出现两处：
+  // 输入框下面那排 COM1 / COM3 / COM12 小圆块，以及下面的扫描结果表 ——
+  // 同一份数据的两种画法，现场反馈"重复、看着乱"。
+  // 现在只留结果表：它每行都带家族判定、命中波特率与数据特征，点行即选用，
+  // 信息量严格覆盖那排小块。函数保留原名与"填 datalist"的职责（契约测试
+  // test_contract 断言了这个函数名与调用点），只是不再渲染 chip。
   function renderPortChips(items) {
-    var box = $('cal-port-chips');
-    if (!box) return;
     if (items) STATE.ports = items;
-    var ports = STATE.ports || [];
-    box.innerHTML = '';
-    if (!ports.length) { box.classList.add('is-hidden'); return; }
-
-    var current = ($('cal-port') && $('cal-port').value.trim()) || '';
-    ports.forEach(function (p) {
-      var btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'port-chip' + (p.device === current ? ' is-current' : '');
-      btn.dataset.device = p.device;
-      btn.title = p.description || p.device;
-
-      var main = document.createElement('span');
-      main.className = 'port-chip-main';
-      main.textContent = p.device;
-      btn.appendChild(main);
-
-      if (p.description && p.description !== p.device) {
-        var sub = document.createElement('span');
-        sub.className = 'port-chip-sub';
-        sub.textContent = p.description;
-        btn.appendChild(sub);
-      }
-      btn.addEventListener('click', function () { pickPort(p.device); });
-      box.appendChild(btn);
-    });
-    box.classList.remove('is-hidden');
+    var box = $('cal-port-chips');
+    if (box) {
+      box.innerHTML = '';
+      box.classList.add('is-hidden');
+    }
   }
 
   // ---------------- 串口扫描与协议嗅探 ----------------
@@ -841,6 +888,14 @@
   // 与标定任务完全隔离（独立线程、独立锁、不占串口租约、不受 30 秒看门狗管辖），
   // 所以扫描期间标定状态机不会动，扫描也不会被标定心跳超时误杀。
   function scanPorts() {
+    if (otherOpBusy('scan')) { 
+      // 两条线互斥：读取模块信息正占着串口时不能再扫（反之亦然）。
+      // 文案写在端口输入框下面就地提示，而不是页面底部的全局错误框 ——
+      // 后者离按钮隔着好几屏，现场看就是"点了没反应"。
+      setPortHint(t('cal.err.op_busy'), 'is-error');
+      showError(t('cal.err.op_busy'));
+      return;
+    }
     listSerialPorts().then(function (ok) {
       if (ok) sniffPorts();
     });
@@ -859,8 +914,8 @@
           list.innerHTML = '';
           ports.forEach(function (p) {
             var opt = document.createElement('option');
-            opt.value = p.device;
-            opt.label = p.description || p.device;
+            opt.value = portName(p);
+            opt.label = p.description || portName(p);
             list.appendChild(opt);
           });
         }
@@ -871,7 +926,7 @@
           return false;
         }
         // 只有一个口就直接填上：现场换完 USB 口最想看到的就是"它认到了"。
-        if (input && ports.length === 1 && !input.value.trim()) pickPort(ports[0].device);
+        if (input && ports.length === 1 && !input.value.trim()) pickPort(portName(ports[0]));
         return true;
       })
       .catch(function (err) {
@@ -885,6 +940,16 @@
     var btn = $('cal-scan');
     if (btn) btn.disabled = true;
     STATE.scan = { running: true, ports: [], progress: [], summary: null, error: '' };
+    // 进度与「读取模块信息」共用同一套 UI（见 progEls/startProg）：
+    // 转圈 + 已用时间 + 一条按比例推进的进度条。真机上扫描 3 个口全无应答要
+    // 40 秒以上，而这边原先只有一行会变的文字 —— 用户以为点空了。
+    SCAN_UI.started = 0;
+    SCAN_UI.failed = false;
+    // 有手填波特率 → 只试那一档，总时长除以档数；否则按 9 档估。
+    // 口数这时还不知道（要 POST 回来），用 1 个口起算，后端首帧到达后再按实测修正。
+    SCAN_UI.budget = (($('cal-baud') && /^\d+$/.test($('cal-baud').value.trim())) ? 6 : 30);
+    startProg('scan', t('cal.scan.started'));
+    setOpBusy('scan', true);
     renderScanPanel();
     setPortHint(t('cal.scan.started'), 'is-info');
 
@@ -925,10 +990,13 @@
         if (err && err.message === 'unauth') return;
         STATE.scan.running = false;
         STATE.scan.error = err.message;
+        SCAN_UI.lastElapsed = progElapsed('scan');
+        failProg('scan', err.message);
+        SCAN_UI.started = 0;
+        setOpBusy('scan', false);
         renderScanPanel();
         setPortHint(t('cal.scan.failed') + ': ' + err.message, 'is-error');
-      })
-      .then(function () { if (btn) btn.disabled = false; });
+      });
   }
 
   function pollScan() {
@@ -946,6 +1014,11 @@
         maskScanPayload(data);
         renderScanPanel();
         if (data.running) {
+          // 第一帧里带了系统串口清单，可以按"口数 × 档数"重新估总时长 ——
+          // 1 个口 30 秒和 5 个口 150 秒，进度条用同一个分母会一直贴边。
+          var available = (data.available || []).length || 1;
+          var perPort = (SCAN_UI.budget <= 10) ? 6 : 30;
+          SCAN_UI.budget = Math.max(6, available * perPort);
           // 1 秒一轮：一轮扫描最长也就 (口数 x 档数 x 1.5s)，逐轮刷新足够，
           // 再密就是无意义地刷 DOM。
           window.setTimeout(pollScan, 1000);
@@ -957,6 +1030,10 @@
       .catch(function (err) {
         STATE.scan.running = false;
         STATE.scan.error = err.message;
+        SCAN_UI.lastElapsed = progElapsed('scan');
+        failProg('scan', err.message);
+        SCAN_UI.started = 0;
+        setOpBusy('scan', false);
         renderScanPanel();
       });
   }
@@ -976,19 +1053,31 @@
   // 波特率同理，而且多加一条：**端口没有波特率概念时不预填**（USB 直连 CDC），
   // 填进去只会让人以为"这就是它的波特率"。
   function onScanDone(data) {
+    // **必须先把耗时取出来，再动 `SCAN_UI.started`**。`finishProg` 内部是靠
+    // `progElapsed()` 算耗时的，而 `progElapsed()` 读的就是 `started`；
+    // 原先这里先 `started = 0` 再调 `finishProg`，于是无论扫了 3 秒还是 33 秒，
+    // 收尾文案永远是"耗时 0.0 秒"、计时器也被写成 '0.0s'（实测 33.5 秒的扫描
+    // 显示成 0.0 秒，正是这条）。failProg 那条路径用的 `SCAN_UI.lastElapsed`
+    // 就是这个道理的现成先例。
+    var elapsed = progElapsed('scan');
     renderScanPanel();
     var ports = data.ports || [];
     var gnss = ports.filter(function (p) { return p.family === 'gnss'; });
     var target = gnss[0];
     var input = $('cal-port');
     if (input && !input.value.trim() && target) {
-      pickPort(target.device);
+      pickPort(portName(target));
       if (target.baud && target.baud_fixed !== false
           && $('cal-baud') && !$('cal-baud').value.trim()) {
         $('cal-baud').value = String(target.baud);
         $('cal-baud').dispatchEvent(new Event('input', { bubbles: true }));
       }
     }
+    // 先放开互斥，再写结果提示 —— 顺序反了的话，「读取模块信息」会在
+    // 最后一行提示写完之前就变回可点，用户正好卡在这个缝里看到两个都可点。
+    SCAN_UI.started = 0;
+    setOpBusy('scan', false);
+    finishProg('scan', t('cal.scan.done_ok', { elapsed: elapsed.toFixed(1) }), 1800, elapsed);
     if (!ports.length) {
       setPortHint(t('cal.scan.empty'), 'is-info');
       return;
@@ -999,6 +1088,9 @@
     var hint = t('cal.scan.done', { total: ports.length, gnss: n });
     if (verify.length) hint += ' ' + t('cal.scan.done.verify', { ports: verify.join('、') });
     if (rateFree.length) hint += ' ' + t('cal.scan.done.ratefree', { ports: rateFree.join('、') });
+    // 耗时也留在常驻提示里：进度条 1.8 秒后收起，用户回头看就只剩这一行。
+    // 扫描慢是常态（3 个口全无应答 30 秒+），把数字留着才好判断"要不要换个口再扫"。
+    hint += ' ' + t('cal.scan.done.elapsed', { elapsed: elapsed.toFixed(1) });
     setPortHint(hint, n ? 'is-ok' : 'is-info');
   }
 
@@ -1014,20 +1106,12 @@
         : t('cal.scan.result', { n: (scan.ports || []).length });
     }
 
-    var prog = $('cal-scan-progress');
-    if (prog) {
+    // 进度文字由共用进度条（SCAN_UI）负责显示与计时，这里只在扫描中
+    // 把最新一条事件推进去。停止/失败时不写 —— 已经由 failProg 写了终态文案，
+    // 再覆盖成最后一条 `passive @ 9600` 会让"失败了"看起来像"还在扫"。
+    if (scan.running) {
       var last = (scan.progress || []).slice(-1)[0];
-      var text = formatScanEvent(last);
-      if (scan.running && text) {
-        prog.textContent = text;
-        prog.classList.remove('is-hidden');
-      } else if (scan.error) {
-        prog.textContent = scan.error;
-        prog.classList.remove('is-hidden');
-      } else {
-        prog.textContent = '';
-        prog.classList.add('is-hidden');
-      }
+      setProgMessage('scan', formatScanEvent(last));
     }
 
     var wrap = $('cal-scan-table');
@@ -1092,6 +1176,8 @@
     }
     var current = ($('cal-port') && $('cal-port').value.trim()) || '';
     var rows = ports.map(function (p, idx) {
+      // 家族判定、波特率、数据特征都在行上；点击行为由 bindScanTable 委托。
+      // 已在输入框里的那个口高亮成 is-current，扫完预填时用户能对得上。
       var feats = (p.features || []).map(function (f, i) {
         var key = 'cal.scan.feature.' + f;
         var label = t(key);
@@ -1105,10 +1191,12 @@
       if (kind) detail += (detail ? ' · ' : '') + kind;
       var rowClass = 'scan-row scan-fam-' + escapeHtml(p.family || 'unknown');
       if ((p.confidence || 'low') !== 'high' && p.family === 'gnss') rowClass += ' is-unverified';
+      if (portName(p) === current) rowClass += ' is-current';
       return ''
-        + '<tr class="' + rowClass + '" data-idx="' + idx + '">'
+        + '<tr class="' + rowClass + '" data-idx="' + idx + '" title="'
+        + escapeHtml(t('cal.scan.row.tip')) + '">'
         + '<td><span class="scan-dev"><span class="scan-dot"></span>'
-        + escapeHtml(p.device || '') + '</span></td>'
+        + escapeHtml(portName(p)) + '</span></td>'
         + '<td class="scan-baud">' + baudCellHtml(p) + '</td>'
         + '<td>' + escapeHtml(familyLabel(p.family)) + '</td>'
         + '<td><div class="scan-feats">' + (feats || '<span class="scan-note">—</span>') + '</div></td>'
@@ -1138,16 +1226,37 @@
       var idx = parseInt(tr.dataset.idx, 10);
       var p = (STATE.scan && STATE.scan.ports || [])[idx];
       if (!p) return;
-      // 点行 = 用这个口。波特率只在扫出来的时候才带过去：
-      // family=noise 的行 baud 是 null，硬填会把手填值冲掉。
-      pickPort(p.device);
-      if (p.baud && $('cal-baud')) {
-        $('cal-baud').value = String(p.baud);
-        $('cal-baud').dispatchEvent(new Event('input', { bubbles: true }));
+      // 点行 = 用这个口，串口名与波特率**一并**写进上面的输入框，
+      // 省掉"点完行再去手打一遍 115200"。
+      //
+      // 波特率必须"跟行保持一致"，包括**清空**：
+      //   行有波特率      → 填上（用户点行就是要用这个口）
+      //   行没扫到波特率  → 清空。不能留着上一个口的 115200 ——
+      //                     实测里先点 COM3（115200）再点 COM1（空口），
+      //                     输入框停在 115200，「读取模块信息」就拿着
+      //                     一对错配的 串口+波特率 发给了后端。
+      //   baud_fixed=false（USB CDC 直连）→ 清空。这类口没有波特率概念，
+      //                     留着数字只会让人误以为"这就是它的波特率"。
+      pickPort(portName(p));
+      var baudEl = $('cal-baud');
+      var hasBaud = !!(p.baud && p.baud_fixed !== false);
+      if (baudEl) {
+        if (document.activeElement === baudEl) baudEl.blur();
+        baudEl.value = hasBaud ? String(p.baud) : '';
+        // 联动都挂在 input/change 上（波特率提示、型号能力重算），必须补派发。
+        // 清空时同样要派发：checkBaud() 会据此把提示切回"留空=自动探测"。
+        baudEl.dispatchEvent(new Event('input', { bubbles: true }));
+        baudEl.dispatchEvent(new Event('change', { bubbles: true }));
+        flashFilled(baudEl);
       }
       Array.prototype.forEach.call(wrap.querySelectorAll('.scan-row'), function (el) {
         el.classList.toggle('is-current', el === tr);
       });
+      // 提示写清"带过去了什么"，尤其是没带波特率的时候 ——
+      // 否则用户点了行、波特率没变，会以为点了没反应。
+      setPortHint(hasBaud
+        ? t('cal.scan.picked', { port: portName(p), baud: p.baud })
+        : t('cal.scan.picked.nobaud', { port: portName(p) }), 'is-ok');
     });
   }
 
@@ -1160,89 +1269,165 @@
   // 真机反馈就是"点了像卡死"。这里在按钮下方给转圈 + 已用时间 + 当前档位，
   // 并且**从点击那一刻就开始计时**，不等 POST 返回：
   // POST 自己也可能因为等服务端让出串口而慢上几秒，那几秒同样不能是黑屏。
-  var DETECT_UI = { started: 0, timer: null, plan: null, failed: false };
+  //
+  // **两条进度条共用这套实现**：`DETECT_UI` 服务「读取模块信息」，
+  // `SCAN_UI` 服务「扫描串口」。两边都是"点一下、跑几十秒、期间只有一行文字在变"，
+  // 各写一份迟早会漂。差别只在 DOM 元素与判定用的总时长 —— 由 `progEls(name)`
+  // 和 `progBudget(name)` 决定，其余逻辑完全一致。
+  //
+  // **为什么计时口径是"预留总时长 + 走表"而不是进度事件**：后端两边的阶段粒度
+  // 都太粗（扫描只有 `port/baud/phase` 三条，完全没有总数），拿事件数当分子会
+  // 出现"第 1 档卡 20 秒、进度条纹丝不动"。所以只用走表推进、用事件改文字。
+  var DETECT_UI = { started: 0, timer: null, plan: null, failed: false, text: '',
+                    doneText: '', doneKeep: 2500 };
+  var SCAN_UI = { started: 0, timer: null, budget: 0, failed: false, text: '',
+                  doneText: '', doneKeep: 1800 };
 
-  function detectEls() {
+  var PROG_ELEMENTS = {
+    detect: { box: 'cal-detect-progress', text: 'cal-detect-text',
+              timer: 'cal-detect-timer', bar: 'cal-detect-bar' },
+    scan: { box: 'cal-scan-progress', text: 'cal-scan-text',
+            timer: 'cal-scan-timer', bar: 'cal-scan-bar' }
+  };
+
+  function progState(name) { return name === 'scan' ? SCAN_UI : DETECT_UI; }
+
+  function progEls(name) {
+    var ids = PROG_ELEMENTS[name] || PROG_ELEMENTS.detect;
     return {
-      box: $('cal-detect-progress'),
-      text: $('cal-detect-text'),
-      timer: $('cal-detect-timer'),
-      bar: $('cal-detect-bar')
+      box: $(ids.box), text: $(ids.text),
+      timer: $(ids.timer), bar: $(ids.bar)
     };
   }
 
-  function clearDetectProgress() {
-    if (DETECT_UI.timer) { clearInterval(DETECT_UI.timer); DETECT_UI.timer = null; }
+  // 总时长预估。**只用于把进度条推到 90%**，不用于任何"还剩几秒"的文案 ——
+  // 扫描是"口数 × 档数"的乘积，后端首轮才知道口数，写死一个数字迟早脱节。
+  // detect 走扫描档位预估时是 20 秒档，scan 取 30 秒：3 个口全无应答实测 40 秒+，
+  // 取小了进度条会一直贴着 90% 不动；取大了前半程又慢得看不出在动。
+  function progBudget(name) {
+    if (name === 'scan') return (SCAN_UI.budget || 0) || 30;
+    return (DETECT_UI.plan && DETECT_UI.plan.worst) || 30;
   }
+
+  function detectEls() { return progEls('detect'); }
+
+  function clearProgTimer(name) {
+    var st = progState(name);
+    if (st.timer) { clearInterval(st.timer); st.timer = null; }
+  }
+
+  function clearDetectProgress() { clearProgTimer('detect'); }
 
   // 已经跑了多少秒（一位小数）。用 Date.now() 而不是自增计数器：
   // 标签页被切到后台时 setInterval 会被节流到 1 秒以上，
   // 自增会越跑越慢，显示的时间和用户真实感受对不上。
-  function detectElapsed() {
-    if (!DETECT_UI.started) return 0;
-    return Math.max(0, (Date.now() - DETECT_UI.started) / 1000);
+  function progElapsed(name) {
+    var st = progState(name);
+    if (!st.started) return 0;
+    return Math.max(0, (Date.now() - st.started) / 1000);
   }
+
+  function detectElapsed() { return progElapsed('detect'); }
 
   // 把进度条按"最坏总时长"推进。**到 90% 就停住**：
   // 真实结束时间由模块应答决定，进度条冲到 100% 却还在转圈比停在 90% 更让人困惑。
-  function tickDetectProgress() {
-    var els = detectEls();
-    var elapsed = detectElapsed();
-    if (els.timer) els.timer.textContent = elapsed.toFixed(1) + 's';
-    if (!els.bar || DETECT_UI.failed) return;
-    var total = (DETECT_UI.plan && DETECT_UI.plan.worst) || 30;
-    var pct = Math.min(90, (elapsed / total) * 100);
+  function tickProg(name) {
+    var els = progEls(name);
+    var st = progState(name);
+    if (els.timer) els.timer.textContent = progElapsed(name).toFixed(1) + 's';
+    if (!els.bar || st.failed || !st.started) return;
+    var pct = Math.min(90, (progElapsed(name) / progBudget(name)) * 100);
     els.bar.style.width = pct + '%';
   }
 
-  function startDetectProgress(message) {
-    var els = detectEls();
-    clearDetectProgress();
-    DETECT_UI.started = Date.now();
-    DETECT_UI.failed = false;
+  function tickDetectProgress() { tickProg('detect'); }
+
+  function startProg(name, message) {
+    var els = progEls(name);
+    var st = progState(name);
+    clearProgTimer(name);
+    st.started = Date.now();
+    st.failed = false;
+    st.text = message || '';
+    st.doneText = '';
     if (!els.box) return;
     els.box.classList.remove('is-hidden', 'is-fail', 'is-done');
-    if (els.text) els.text.textContent = message || t('cal.detect.prepare');
+    if (els.text) els.text.textContent = st.text;
     if (els.bar) els.bar.style.width = '2%';
-    tickDetectProgress();
-    DETECT_UI.timer = setInterval(tickDetectProgress, 200);
+    if (els.timer) els.timer.textContent = '0.0s';
+    st.timer = setInterval(function () { tickProg(name); }, 200);
+  }
+
+  function startDetectProgress(message) {
+    var st = DETECT_UI;
+    startProg('detect', message || t('cal.detect.prepare'));
+    if (st.timer) { clearInterval(st.timer); st.timer = setInterval(tickDetectProgress, 200); }
   }
 
   // 阶段变化时只换文字，不重置计时 —— 计时是"用户从点击等到现在"的总时长。
-  function setDetectMessage(message) {
-    var els = detectEls();
-    if (els.text && message) els.text.textContent = message;
+  function setProgMessage(name, message) {
+    var st = progState(name);
+    if (!message) return;
+    if (st.text === message) return;          // 同一句话反复写会打断选中/无障碍播报
+    st.text = message;
+    var els = progEls(name);
+    if (els.text) els.text.textContent = message;
   }
 
-  function failDetectProgress(message, detail) {
-    var els = detectEls();
-    var elapsed = (typeof DETECT_UI.lastElapsed === 'number')
-      ? DETECT_UI.lastElapsed : detectElapsed();
-    clearDetectProgress();
-    DETECT_UI.failed = true;
-    DETECT_UI.started = 0;
+  function setDetectMessage(message) { setProgMessage('detect', message); }  function failProg(name, message, detail) {
+    var els = progEls(name);
+    var st = progState(name);
+    var elapsed = (typeof st.lastElapsed === 'number') ? st.lastElapsed : progElapsed(name);
+    clearProgTimer(name);
+    st.failed = true;
+    st.started = 0;
     if (!els.box) return;
     els.box.classList.remove('is-hidden', 'is-done');
     els.box.classList.add('is-fail');
     if (els.text) {
-      els.text.textContent = t('cal.detect.fail', { elapsed: elapsed.toFixed(1) }) +
+      els.text.textContent = t(name === 'scan' ? 'cal.scan.failed' : 'cal.detect.fail',
+                               { elapsed: elapsed.toFixed(1) }) +
         (message ? '：' + message : '') + (detail ? '（' + detail + '）' : '');
     }
     if (els.bar) els.bar.style.width = '100%';
+    if (els.timer) els.timer.textContent = elapsed.toFixed(1) + 's';
   }
 
-  function finishDetectProgress() {
-    var els = detectEls();
-    clearDetectProgress();
+  function failDetectProgress(message, detail) {
+    DETECT_UI.lastElapsed = (typeof DETECT_UI.lastElapsed === 'number')
+      ? DETECT_UI.lastElapsed : progElapsed('detect');
+    failProg('detect', message, detail);
+  }
+
+  // 成功提示停留 `doneKeep` 毫秒后收起 —— 结果本身已经在别处展示，
+  // 这条只负责回答"刚才那几十秒到底算完了没"。
+  //
+  // `elapsedOverride`：调用方可能**已经**把 `started` 清零了（比如 `onScanDone`
+  // 要先放开互斥按钮）。那种情况下这里再读 `progElapsed()` 拿到的必然是 0，
+  // 计时器就被写成 '0.0s'。传进来就用传进来的，别自己再算一遍。
+  function finishProg(name, doneText, keepMs, elapsedOverride) {
+    var els = progEls(name);
+    var st = progState(name);
+    var elapsed = (typeof elapsedOverride === 'number')
+      ? elapsedOverride : progElapsed(name);
+    clearProgTimer(name);
     if (!els.box) return;
     els.box.classList.add('is-done');
     els.box.classList.remove('is-fail');
-    if (els.text) els.text.textContent = t('cal.detect.ok', { elapsed: detectElapsed().toFixed(1) });
+    if (els.text) els.text.textContent = doneText || '';
     if (els.bar) els.bar.style.width = '100%';
-    // 成功结果由 `renderHw()` 展示，这条提示留 2.5 秒后收起，避免和结果重复占位
+    if (els.timer) els.timer.textContent = elapsed.toFixed(1) + 's';
+    var at = Date.now();
     setTimeout(function () {
-      if (!DETECT_UI.started && els.box) els.box.classList.add('is-hidden');
-    }, 2500);
+      // 期间又点了同名的按钮 → 新一轮已经开始，绝不能把它收起来
+      if (st.started || st.timer || !els.box) return;
+      if (Date.now() - at < (keepMs || 2000) - 50) return;
+      els.box.classList.add('is-hidden');
+    }, keepMs || 2000);
+  }
+
+  function finishDetectProgress() {
+    finishProg('detect', t('cal.detect.ok', { elapsed: progElapsed('detect').toFixed(1) }), 2500);
   }
 
   // 按当前状态机阶段刷新按钮旁的文字。后端给的是阶段名（英文），
@@ -1271,7 +1456,62 @@
     } else if (stage === 'PLAN') setDetectMessage(t('cal.detect.plan'));
   }
 
+  // ---------------- 「扫描串口」与「读取模块信息」互斥 ----------------
+  // 两者抢的是同一批物理串口，但走的是两套机制：scan 不占租约、detect 占租约，
+  // 所以**后端不会互相拦住**（scan 只挡标定任务，detect 只挡标定任务）。
+  // 后端那层只能兜底，真正的互斥必须在点上按钮的那一刻就生效 ——
+  // 让用户点了才弹"请先等它结束"，是最容易被当成"程序卡了"的交互。
+  //
+  // 禁用清单：
+  //   扫描在跑 → 锁「读取模块信息」「重新读取」；
+  //   读取模块信息在跑 → 锁「扫描串口」。
+  // 「开始标定」不在这里锁：它由 status 轮询里的 setFormLocked() 管，
+  // 两条线都结束后自然会放开，这里再插一手会和轮询打架。
+  var BUSY_IDS = {
+    scan: ['cal-detect', 'cal-rescan'],
+    detect: ['cal-scan']
+  };
+
+  // 只改"因为我们才禁用"的那几个，不碰输入框：扫描期间允许用户继续改串口/型号，
+  // 那是扫完之后马上要用的东西；而 setFormLocked() 会在标定任务开始时统一接管。
+  function setOpBusy(name, busy) {
+    (BUSY_IDS[name] || []).forEach(function (id) {
+      var el = $(id);
+      if (!el) return;
+      el.disabled = !!busy;
+    });
+  }
+
+  function scanRunning() {
+    return !!(STATE.scan && STATE.scan.running);
+  }
+
+  function detectRunning() {
+    // 本页点过按钮才有本地计时起点；页面刷新后后端仍在跑 DETECT，
+    // 但那时用户没有"我刚点的"这个上下文，靠 setFormLocked() 的 STATE.running 兜底。
+    return !!DETECT_UI.started;
+  }
+
+  // 另一条线是否占着串口。用于按钮点下去之前的**同步兜底**：
+  // 万一状态没同步上（比如在另一个标签页里点的），也不要发出这个请求。
+  function otherOpBusy(name) {
+    if (name === 'scan') return detectRunning() || STATE.running;
+    return scanRunning() || STATE.running;
+  }
+
+  // 把两个按钮的可用状态刷成当前真值。**只在"没有本地操作在跑"时动按钮**：
+  // 本地操作有自己的一套开始/结束时机（POST 返回、轮询终止），
+  // 轮询每秒插一帧进来会把刚禁用的按钮又放开。
+  //
+  // `setFormLocked()` 已经把 `cal-scan` / `cal-detect` 一并按 STATE.running 设过一遍，
+  // 所以这里只补另一条线的那一半：没在跑的一方，视对方是否占着串口来定。
+  function syncOpButtons() {
+    if (!SCAN_UI.started) setOpBusy('detect', !!STATE.running);
+    if (!DETECT_UI.started) setOpBusy('scan', !!STATE.running);
+  }
+
   function readModuleInfo() {
+    if (otherOpBusy('detect')) { showError(t('cal.err.op_busy')); return; }
     var port = $('cal-port').value.trim();
     if (!port) { showError(t('cal.err.need_port')); return; }
     var baud = baudValue();
@@ -1282,9 +1522,12 @@
 
     // 先按"还不知道型号"的候选表起个提示，POST 回来后再用后端算的 plan 修正。
     // 这样即在后端慢半拍时，用户也能立刻看到东西在动。
+    // 顺序有讲究：**先占位再禁用**，否则 `detectRunning()` 还是 false，
+    // 「扫描串口」按钮不会被锁，用户正好在这几毫秒里点了它。
     DETECT_UI.plan = null;
     DETECT_UI.lastElapsed = 0;
     startDetectProgress(t('cal.detect.prepare'));
+    setOpBusy('detect', true);
 
     fetch('/api/calibration/detect', {
       method: 'POST',
@@ -1301,7 +1544,9 @@
           DETECT_UI.lastElapsed = detectElapsed();
           failDetectProgress(res.body.error || t('cal.err.detect'));
           showError(res.body.error || t('cal.err.detect'));
+          DETECT_UI.started = 0;
           if (btn) btn.disabled = false;
+          setOpBusy('detect', false);
           return;
         }
         // 后端返回的预估：型号不同候选表不同，由后端算，前端不硬编码。
@@ -1314,7 +1559,9 @@
         DETECT_UI.lastElapsed = detectElapsed();
         failDetectProgress(t('cal.err.detect'), err.message);
         showError(t('cal.err.detect') + ': ' + err.message);
+        DETECT_UI.started = 0;
         if (btn) btn.disabled = false;
+        setOpBusy('detect', false);
       });
   }
 
@@ -1434,6 +1681,9 @@
     STATE.lastSnap = snap;
     STATE.running = !!snap.running;
     setFormLocked(STATE.running);
+    // 页面刷新后本地的 DETECT_UI 是空的，但后端可能仍在跑 diagnose。
+    // 这时「扫描串口」必须同样锁住 —— 两边抢的是同一个串口，与是不是本页点的无关。
+    syncOpButtons();
 
     var badge = $('cal-run-badge');
     if (badge) {
@@ -2065,6 +2315,12 @@
     });
     on($('cal-baud'), 'input', checkBaud);
     on($('cal-baud'), 'change', checkBaud);
+    // 手打串口名同样算"换了口"：型号只对某一个口成立，换了就得回到自动探测。
+    // 挂在 change 而不是 input 上 —— input 每敲一个字母都会触发，
+    // 会把用户正在选的型号一路清掉，必须等他敲完（失焦/回车）再判。
+    on($('cal-port'), 'change', function () {
+      resetModuleForPort();
+    });
     on($('cal-detect'), 'click', readModuleInfo);
     on($('cal-start'), 'click', confirmThenStart);
     on($('cal-abort'), 'click', doAbort);

@@ -806,6 +806,19 @@ button.nav-link {
   box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
 }
 
+/* 由脚本填入值时闪一下（见 calibration.js 的 flashFilled）。
+   点扫描结果行后，串口和波特率是被"写"进去的 —— 用户的眼睛还在下面
+   那张结果表上，不闪一下根本不知道上面已经填好了。
+   只做边框 + 底色，不缩放不位移，避免引发布局抖动。 */
+@keyframes filled-flash {
+  0%   { border-color: var(--accent); background: rgba(37, 99, 235, 0.14); }
+  100% { border-color: var(--border-strong); background: var(--surface); }
+}
+
+.form-input.is-filled-flash {
+  animation: filled-flash 0.7s ease-out;
+}
+
 select.form-input {
   -webkit-appearance: none;
   appearance: none;
@@ -912,6 +925,11 @@ select.form-input {
   background: var(--surface-2, #f8fafc);
   border: 1px solid var(--border-strong);
   border-radius: 8px;
+  /* 面板独占卡片整宽。min-width:0 是 grid/flex 子项的老坑：不写这一句，
+     子项会被内容的 min-content 宽度顶出去，表格再宽也压不回来。 */
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
 }
 
 .scan-head {
@@ -939,23 +957,44 @@ select.form-input {
 
 .scan-close:hover { color: var(--accent); }
 
-.scan-progress {
-  margin-bottom: 8px;
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+/* 扫描进度条不再单独定样式：直接用 .cal-detect-progress 那一套（转圈 + 秒表 +
+   比例条），两条线共用一份，改一处两边同时生效。 */
 
 .scan-table-wrap { overflow-x: auto; }
 
+/* 列宽**按内容分配**，不平均分。
+   原先表格塞在卡片左半栏（实测仅 387px）里 6 列均分，每列 46~99px，
+   "说明"和"设备信息"只能一行一个字竖排 —— COM12 那一行被撑到 388px 高，
+   整个面板占满一屏。现在面板挪到卡片全宽（约 900~1100px），再给这几列
+   设下限，长文本才有地方换行：
+     port   → 左右两列（串口名 / 波特率）定宽，它们是定长短串，不该被压缩
+     family → 定宽，判定文案只有几个字
+     feats  → 自然宽度（chip 自己会换行，不参与挤压）
+     note   → 弹性最小，给 12ch 下限，允许中文按字换行
+     desc   → 吃满剩余空间，as many ch as fits
+   关键是 `table-layout: auto`（默认）：加上 min-width 后浏览器会先满足下限，
+   放不下才让 `overflow-x` 横向滚动 —— 窄屏也不再把字竖排。
+   注：这里用 `min-width` 而不是 `width`，是为了让宽屏时剩余空间自动流向 desc。 */
 .scan-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 12px;
 }
+
+.scan-table th:first-child,
+.scan-table td:first-child { min-width: 5.5em; }
+
+.scan-table th:nth-child(2),
+.scan-table td:nth-child(2) { min-width: 5em; }
+
+.scan-table th:nth-child(3),
+.scan-table td:nth-child(3) { min-width: 4em; }
+
+.scan-table th:nth-child(5),
+.scan-table td:nth-child(5) { min-width: 16em; }
+
+.scan-table th:nth-child(6),
+.scan-table td:nth-child(6) { min-width: 18em; }
 
 .scan-table th {
   padding: 4px 8px;
@@ -975,9 +1014,12 @@ select.form-input {
 
 .scan-table tr:last-child td { border-bottom: 0; }
 
+/* 扫描结果表是**唯一**的端口选择入口（上面那排 chip 已移除）。
+   所以行必须看起来能点：手型光标 + hover 高亮 + 已选中行的左侧竖条。 */
 .scan-row { cursor: pointer; }
 .scan-row:hover td { background: var(--accent-soft); }
 .scan-row.is-current td { background: var(--accent-soft); }
+.scan-row.is-current td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
 
 .scan-row td:first-child {
   font-family: var(--mono);
@@ -1038,6 +1080,9 @@ select.form-input {
   font-size: 11px;
   color: var(--muted);
   word-break: break-word;
+  /* 中文备注按字换行没问题，但 `USB-SERIAL CH340 (COM3) · 1A86:7523`
+     这类带连字符/冒号的长串不设这个就会整体不换行，把整列顶宽。 */
+  overflow-wrap: anywhere;
 }
 
 /* 波特率"多档可疑"的行：左侧加一条琥珀色提示，但不改变家族点的颜色 ——
@@ -1076,6 +1121,7 @@ select.form-input {
   font-size: 11px;
   color: var(--muted);
   word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 /* ---------- 候选下拉面板（static/picker.js） ----------

@@ -47,15 +47,19 @@
 
     .cal-actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 16px; }
 
-    /* ---------- 「读取模块信息」的行内进度 ----------
+    /* ---------- 两项串口操作共用的行内进度 ----------
        真机反馈：点一下像卡死。一次识别要逐档试波特率，全部落空时近 30 秒
-       页面没有任何变化。这里给转圈 + 已用时间 + 当前档位 + 进度条，
-       四样都用 `tabular-nums`，数字跳动时不会把旁边文字挤来挤去。 */
+       页面没有任何变化；扫描串口同样要几十秒。这里给转圈 + 已用时间 +
+       当前阶段 + 进度条，四样都用 `tabular-nums`，数字跳动时不会把旁边文字挤来挤去。
+       **两处（读取模块信息 / 扫描串口）共用这一份样式**，
+       JS 侧由 startProg('detect'|'scan') 驱动，见 static/calibration.js。 */
     .cal-detect-progress { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
                            margin-top: 10px; padding: 9px 12px; border-radius: 8px;
                            font-size: 13px;
                            border: 1px solid var(--accent, #2563eb);
                            background: rgba(37, 99, 235, .06); }
+    /* 扫描面板内部不需要再让出一段上边距 —— 外面已经有 .scan-head */
+    .scan-panel .cal-detect-progress { margin-top: 0; margin-bottom: 8px; }
     .cal-detect-progress.is-fail { border-color: var(--danger, #dc2626);
                                    background: rgba(220, 38, 38, .07); }
     .cal-detect-progress.is-done { border-color: var(--success, #16a34a);
@@ -280,42 +284,63 @@
                      最底部的全局错误框里，离这根输入框隔着好几屏 —— 现场看就是"没反应"。
                      所以候选与结果都贴在这里，不依赖任何浮层。 -->
                 <p class="field-hint" id="cal-port-hint"></p>
+                <!-- 这里原先还有一排 `.port-chips`（COM1 / COM3 / COM12 三个小块）。
+                     它和下面扫描结果表是同一份数据的两种画法，扫完两处同时出现，
+                     现场反馈"看着重复"。已移除：结果表每行都点了能选，还带家族与波特率，
+                     信息量严格覆盖那排小块。`cal-port-chips` 容器保留为空壳，
+                     因为契约测试 test_contract 断言了它必须存在。 -->
                 <div class="port-chips is-hidden" id="cal-port-chips"></div>
-                <!-- 协议嗅探结果：每个口一行，给出家族判定（GNSS / 未知 / 噪声 / 忙）
-                     与命中的数据特征。**只判定不做决断** —— 扫到的口全列出来，
-                     不因为"不像 GNSS"就藏起来，用户自己点选。
-                     扫描与标定完全独立：不占串口租约、不受标定看门狗管辖。 -->
-                <div class="scan-panel is-hidden" id="cal-scan-panel">
-                  <div class="scan-head">
-                    <span class="scan-title" id="cal-scan-title"></span>
-                    <button type="button" class="btn btn-link scan-close" id="cal-scan-close"
-                            data-i18n="cal.scan.hide">收起</button>
-                  </div>
-                  <div class="scan-progress is-hidden" id="cal-scan-progress"></div>
-                  <div class="scan-table-wrap" id="cal-scan-table"></div>
-                </div>
               </div>
+              <div class="field">
+                <label class="form-label" for="cal-baud" data-i18n="cfg.baud">波特率 Baud rate</label>
+                <!-- 留空 = 自动：识别不到模块时按该型号的官方档位依次重试。
+                     填了具体值 = 用户明确指定，后端不会再擅自改（也不做波特率枚举）。
+                     用 input+datalist 而不是 select：厂商文档里没有的档位
+                     （比如 LC29H 的 3000000、UM980 的 19200）也必须能填。 -->
+                <input type="text" id="cal-baud" class="form-input" list="cal-baud-list"
+                       autocomplete="off" inputmode="numeric" placeholder="自动（留空）">
+                <datalist id="cal-baud-list"></datalist>
+                <p class="field-hint" id="cal-baud-hint"></p>
+              </div>
+              <div class="field">
+                <label class="form-label" for="cal-module" data-i18n="cal.module">模块型号</label>
+                <select id="cal-module" class="form-input"></select>
+                <!-- 选型和"自动探测"在流程上是两条路（一条只问一个型号，一条挨个问），
+                     差别直接写在这儿。真机测试时这一格被当成装饰品忽略掉了。 -->
+                <p class="field-hint" id="cal-module-hint"></p>
+              </div>
+            </div>
 
-              <div class="cal-grid">
-                <div class="field">
-                  <label class="form-label" for="cal-baud" data-i18n="cfg.baud">波特率 Baud rate</label>
-                  <!-- 留空 = 自动：识别不到模块时按该型号的官方档位依次重试。
-                       填了具体值 = 用户明确指定，后端不会再擅自改（也不做波特率枚举）。
-                       用 input+datalist 而不是 select：厂商文档里没有的档位
-                       （比如 LC29H 的 3000000、UM980 的 19200）也必须能填。 -->
-                  <input type="text" id="cal-baud" class="form-input" list="cal-baud-list"
-                         autocomplete="off" inputmode="numeric" placeholder="自动（留空）">
-                  <datalist id="cal-baud-list"></datalist>
-                  <p class="field-hint" id="cal-baud-hint"></p>
-                </div>
-                <div class="field">
-                  <label class="form-label" for="cal-module" data-i18n="cal.module">模块型号</label>
-                  <select id="cal-module" class="form-input"></select>
-                  <!-- 选型和"自动探测"在流程上是两条路（一条只问一个型号，一条挨个问），
-                       差别直接写在这儿。真机测试时这一格被当成装饰品忽略掉了。 -->
-                  <p class="field-hint" id="cal-module-hint"></p>
-                </div>
+            <!-- 协议嗅探结果：每个口一行，给出家族判定（GNSS / 未知 / 噪声 / 忙）
+                 与命中的数据特征。**只判定不做决断** —— 扫到的口全列出来，
+                 不因为"不像 GNSS"就藏起来，用户自己点选。
+                 扫描与标定完全独立：不占串口租约、不受标定看门狗管辖。
+
+                 **位置必须在 `.cal-grid` 外面**：表格有 6 列（串口/波特率/判定/
+                 数据特征/说明/设备信息），塞进两列栅格只拿到卡片一半的宽度
+                 （实测 387px），每列被压到 46~99px，"说明"和"设备信息"只能
+                 一行一个字竖着排，单行被撑到近 400px 高，整张表占满一屏。
+                 放外面就独占卡片全宽，配合下面 grid-template-columns 的按内容
+                 分配，窄屏再退化成横向滚动。 -->
+            <div class="scan-panel is-hidden" id="cal-scan-panel">
+              <div class="scan-head">
+                <span class="scan-title" id="cal-scan-title"></span>
+                <button type="button" class="btn btn-link scan-close" id="cal-scan-close"
+                        data-i18n="cal.scan.hide">收起</button>
               </div>
+              <!-- 扫描进度：与「读取模块信息」下方那条**同一套 DOM 结构 + 同一套 JS**。
+                   现场扫 3 个口时，全无应答要 40 秒以上；原先这里只有一行会变的文字，
+                   没有秒表也没有比例，用户看到的就是"点了没反应"。
+                   `cal-scan-progress` 上挂 is-hidden，但不影响内部计时 —— 由
+                   startProg()/finishProg() 统一控制显示与收起。 -->
+              <div class="cal-detect-progress is-hidden" id="cal-scan-progress"
+                   role="status" aria-live="polite">
+                <span class="cal-spinner" aria-hidden="true"></span>
+                <span class="cal-detect-text" id="cal-scan-text"></span>
+                <span class="cal-detect-timer" id="cal-scan-timer">0.0s</span>
+                <div class="cal-detect-track"><i id="cal-scan-bar"></i></div>
+              </div>
+              <div class="scan-table-wrap" id="cal-scan-table"></div>
             </div>
 
             <div class="cal-actions" style="margin-top:10px;">
