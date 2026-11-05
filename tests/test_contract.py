@@ -3808,13 +3808,16 @@ class TestBaudRecall(unittest.TestCase):
         order = LG290PDriver(None).bauds()
         self.assertEqual(order[0], LG290PDriver.DEFAULT_BAUD,
                          'DEFAULT_BAUD 必须排第一，否则首轮就在白等超时')
-        self.assertEqual(set(order), set(LG290PDriver.BAUDS),
-                         '重排不能丢掉任何厂商档位')
+        # 探测序列是 PROBE_BAUDS（可能比 BAUDS 窄，也可能含 BAUDS 之外的现场档）
+        self.assertEqual(set(order), set(LG290PDriver.PROBE_BAUDS),
+                         '重排不能丢掉任何要试的档位')
         self.assertEqual(len(order), len(set(order)), '不能有重复档位')
 
-        # 其余部分仍是降序：押注落空之后，先试高档位（线材好的可能性更大）
-        rest = list(order[1:])
-        self.assertEqual(rest, sorted(rest, reverse=True))
+        # 其余部分**保持驱动声明顺序**，不再重新排序：
+        # 探测顺序本身就是"用户要等多久"的答案，必须由驱动决定。
+        self.assertEqual(list(order[1:]), list(LG290PDriver.PROBE_BAUDS[1:]))
+        # 全部厂商档位仍要能设置（PROBE_BAUDS 收窄不许影响 BAUDS 全集）
+        self.assertTrue(set(LG290PDriver.PROBE_BAUDS) <= set(LG290PDriver.BAUDS))
 
     def test_detect_bauds_entry_uses_default_first(self):
         """`detect_bauds()` 是采集/识别真正走的入口，也得是同一套顺序。"""
@@ -3890,10 +3893,11 @@ class TestBaudRecall(unittest.TestCase):
         self.assertEqual(got[:2], [460800, 115200],
                          f'手填值必须最优先，记忆值紧跟其后：{got}')
 
-        # 没记忆时：该型号的 DEFAULT_BAUD 打头，其余降序
-        # （LG290P 的默认档是 460800，不是 115200 —— 见驱动里那段注释）
+        # 没记忆时：该型号的 DEFAULT_BAUD 打头，其余按驱动声明顺序
+        # （LG290P 的默认档已按真机实测改成 115200，见 TestCrossModelIsolation）
         plain = CalibrationService._baud_candidates(['lg290p'])
-        self.assertEqual(plain, [460800, 921600, 230400, 115200, 9600], plain)
+        self.assertEqual(plain, [115200, 921600, 460800, 230400, 57600,
+                                 38400, 19200, 9600, 4800], plain)
 
         # 记忆值本来就在厂商档位里时不能出现两次
         got = CalibrationService._baud_candidates(['lg290p'], remembered=921600)
@@ -4505,17 +4509,52 @@ class TestCrossModelIsolation(unittest.TestCase):
 
     # ---------- ① 波特率：每个型号一份，不许互相抄 ----------
     def test_default_baud_is_per_model(self):
-        """LG290P=460800、LC29H(BS)=115200 —— 抄对方的值就白错一轮。"""
+        """LG290P=115200、LC29H(BS)=115200、F9P=38400 —— 各写各的，不许抄。
+
+        LG290P 已于 2026-11-06 按真机实测改成 115200（见下一个测试），
+        与 LC29H(BS) 同值。所以隔离判据不能再是"值互不相同"，而要看
+        **每个型号自己声明了常量**：F9P 的 38400 仍是硬证据（它与两家
+        Quectel 都不同，UBX 指令集跟 $PQTM 毫无关系）。
+        """
         from rtkserver.calibration.drivers.quectel_lc29hbs import LC29HBSDriver
         from rtkserver.calibration.drivers.quectel_lg290p import LG290PDriver
+        from rtkserver.calibration.drivers.ublox_zed_f9p import ZEDF9PDriver
 
-        self.assertEqual(LG290PDriver.DEFAULT_BAUD, 460800,
-                         'LG290P 出厂配在 460800，写成 115200 会让新模块先错一轮')
         self.assertEqual(LC29HBSDriver.DEFAULT_BAUD, 115200,
                          'LC29H(BS) 文档 §2.3.8 明写「默认波特率为 115200 bps」')
+        self.assertEqual(LG290PDriver.DEFAULT_BAUD, 115200,
+                         'LG290P 出货档实测就是 115200，不是文档最早写的 460800')
+        self.assertEqual(ZEDF9PDriver.DEFAULT_BAUD, 38400,
+                         'F9P §3.8.1 明文默认 38400，与 Quectel 两派都不同')
+        # 每家都在自己类上声明，不是继承来的一个共用值
+        for cls in (LC29HBSDriver, LG290PDriver, ZEDF9PDriver):
+            self.assertIn('DEFAULT_BAUD', vars(cls),
+                          f'{cls.__name__} 必须自己声明 DEFAULT_BAUD')
         # 真正被探测用的是 bauds()，不是常量本身，这里一并锁死
-        self.assertEqual(LG290PDriver(None).bauds()[0], 460800)
+        self.assertEqual(ZEDF9PDriver(None).bauds()[0], 38400)
         self.assertEqual(LC29HBSDriver(None).bauds()[0], 115200)
+
+    def test_lg290p_prefers_115200_then_full_probe_order(self):
+        """LG290P 的探测顺序：115200 打头，之后按驱动声明，**不许被重新排序**。
+
+        2026-11-06 真机复测：出货模块停在 115200 的远比 460800 多。
+        早先押 460800，一块 115200 的模块要先错一轮、再错 921600 才命中，
+        用户看到的就是"点一下像卡死"。现在 115200 第一、460800 第三。
+
+        同时锁住"顺序由驱动决定"这件事：`BaseDriver.bauds()` 早先对剩余档位
+        做 `sorted(reverse=True)`，等于把探测顺序从驱动手里抢走，
+        驱动写什么顺序都会被改成降序 —— 那样 4800 / 19200 永远排在最后。
+        """
+        from rtkserver.calibration.drivers import driver_manager
+        from rtkserver.calibration.drivers.quectel_lg290p import LG290PDriver
+
+        expected = [115200, 921600, 460800, 230400, 57600, 38400, 19200, 9600, 4800]
+        self.assertEqual(list(LG290PDriver.PROBE_BAUDS), expected,
+                         '探测顺序就是用户的等待时间，必须按驱动声明原样保留')
+        self.assertEqual(list(LG290PDriver(None).bauds()), expected)
+        self.assertEqual(driver_manager.detect_bauds('lg290p'), expected)
+        # 460800 仍在序列里：现场改过速的模块要能命中
+        self.assertIn(460800, expected)
 
     def test_baud_tables_do_not_borrow_each_other(self):
         """各自的厂商档位表；兜底表必须同时覆盖两个派系。"""
@@ -4523,10 +4562,16 @@ class TestCrossModelIsolation(unittest.TestCase):
         from rtkserver.calibration.drivers.quectel_lg290p import LG290PDriver
         from rtkserver.calibration.service import DETECT_BAUD_CANDIDATES
 
-        # 4800 / 3000000 是 LC29H(BS) 的档，LG290P 探它们纯属白等
-        self.assertNotIn(4800, LG290PDriver.BAUDS)
+        # 3000000 是 LC29H(BS) UART2 的档，LG290P 探它纯属白等
         self.assertNotIn(3000000, LG290PDriver.BAUDS)
         self.assertIn(3000000, LC29HBSDriver.BAUDS)
+        # 4800 现在**在** LG290P 表里：用户 2026-11-06 明确要求探测序列
+        # 收尾带上 4800（现场被人改到最低档的模块要能被找回来）。
+        # 但它只是"能设置 + 末位探测"，不许因此挤到前面去抢时间。
+        self.assertIn(4800, LG290PDriver.BAUDS,
+                      '4800 是用户的合法设置值，必须留在 BAUDS 里')
+        self.assertEqual(LG290PDriver.PROBE_BAUDS[-1], 4800,
+                         '4800 只能排在探测序列最后，谁排在它后面就是白等')
 
         # 兜底表（完全不知道型号时用）：少一个派系就等于整条派系探不到
         self.assertIn(115200, DETECT_BAUD_CANDIDATES)
@@ -4545,26 +4590,31 @@ class TestCrossModelIsolation(unittest.TestCase):
                          '探测顺序收窄不许影响"能不能设置"')
 
     def test_auto_detect_keeps_both_camps_at_the_front(self):
-        """不知道型号时，两派的默认档必须都在队首两位。
+        """不知道型号时，各派系的默认档必须聚在队首几位。
 
-        整段拼接会让注册得早的型号独占队首：LG290P 的 460800 会被
-        LC29H(BS) 的 3000000 / 921600 压在后面，插一块 LG290P 仍要错三轮。
+        整段拼接会让注册得早的型号独占队首：某个型号的次要档位会被压在
+        别人默认档前面，插一块新模块仍要错好几轮。
+        交错之后各型号的默认档先聚在队首，谁都不会被别的型号拖慢。
         """
         from rtkserver.calibration.service import CalibrationService
 
         order = CalibrationService._baud_candidates(None)
-        self.assertEqual(set(order[:2]), {115200, 460800}, order[:4])
+        # LG290P / LC29H(BS) / N4 系都是 115200，所以第一档必然是它；
+        # 第二个位置属于另一派的默认档（F9P 的 38400）。
+        self.assertEqual(order[0], 115200, order[:4])
+        self.assertIn(38400, order[:3], f'F9P 的默认档必须排在队首附近：{order[:4]}')
+        self.assertIn(460800, order[:6], f'改过速的 LG290P 档位不能被挤到末尾：{order[:6]}')
 
     def test_blank_baud_follows_selected_module(self):
         """留空 + 选了型号 → 从**该型号的**默认档开始，而不是全局 115200。
 
         这是"默认档排第一"真正落地的地方：识别时首试档由 `_resolve_baud` 决定，
-        它不看型号的话，选了 LG290P 仍会先白等一轮 115200 超时才轮到 460800。
+        它不看型号的话，选了 F9P 仍会先白等一轮 115200 超时才轮到 38400。
         """
         from rtkserver.calibration.service import DEFAULT_BAUD, CalibrationService
 
-        self.assertEqual(CalibrationService._resolve_baud(None, 'lg290p'),
-                         (460800, False, ''))
+        self.assertEqual(CalibrationService._resolve_baud(None, 'zed_f9p'),
+                         (38400, False, ''))
         self.assertEqual(CalibrationService._resolve_baud('', 'lc29hbs'),
                          (115200, False, ''))
         # 没选型号 = 不押注，仍用全局兜底

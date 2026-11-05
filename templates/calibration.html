@@ -47,6 +47,38 @@
 
     .cal-actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 16px; }
 
+    /* ---------- 「读取模块信息」的行内进度 ----------
+       真机反馈：点一下像卡死。一次识别要逐档试波特率，全部落空时近 30 秒
+       页面没有任何变化。这里给转圈 + 已用时间 + 当前档位 + 进度条，
+       四样都用 `tabular-nums`，数字跳动时不会把旁边文字挤来挤去。 */
+    .cal-detect-progress { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+                           margin-top: 10px; padding: 9px 12px; border-radius: 8px;
+                           font-size: 13px;
+                           border: 1px solid var(--accent, #2563eb);
+                           background: rgba(37, 99, 235, .06); }
+    .cal-detect-progress.is-fail { border-color: var(--danger, #dc2626);
+                                   background: rgba(220, 38, 38, .07); }
+    .cal-detect-progress.is-done { border-color: var(--success, #16a34a);
+                                   background: rgba(22, 163, 74, .07); }
+    .cal-detect-text { flex: 1 1 240px; min-width: 0; }
+    .cal-detect-timer { font-variant-numeric: tabular-nums; opacity: .8; }
+    /* 轨道只在"按档位推进"时有意义；观测阶段是固定时长，改用时间占比驱动 */
+    .cal-detect-track { flex: 0 0 120px; height: 4px; border-radius: 999px;
+                        background: var(--border, #e2e8f0); overflow: hidden; }
+    .cal-detect-track > i { display: block; height: 100%; width: 0;
+                            background: var(--accent, #2563eb); transition: width .4s ease; }
+    .cal-spinner { flex: 0 0 auto; width: 14px; height: 14px; border-radius: 50%;
+                   border: 2px solid rgba(37, 99, 235, .25);
+                   border-top-color: var(--accent, #2563eb);
+                   animation: cal-spin .8s linear infinite; }
+    @keyframes cal-spin { to { transform: rotate(360deg); } }
+    /* 系统开了"减少动态效果"就停掉旋转，只留文字与数字——
+       动画不是信息，信息必须在任何设置下都读得到 */
+    @media (prefers-reduced-motion: reduce) {
+      .cal-spinner { animation: none; }
+      .cal-detect-track > i { transition: none; }
+    }
+
     .cal-modal-mask { position: fixed; inset: 0; background: rgba(15, 23, 42, .45); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 50; }
     .cal-modal-mask.is-open { display: flex; }
     .cal-modal { background: var(--card-bg, #fff); color: inherit; border-radius: 14px; max-width: 560px; width: 100%; padding: 20px 22px; box-shadow: 0 20px 60px rgba(15, 23, 42, .3); max-height: 86vh; overflow: auto; }
@@ -291,6 +323,19 @@
                 <i class="fa fa-microchip" aria-hidden="true"></i><span data-i18n="cal.detect">读取模块信息</span>
               </button>
               <span class="cal-muted" data-i18n="cal.detect_hint">读固件版本、硬件编号与当前工作模式，不改动任何配置。</span>
+            </div>
+
+            <!-- 探测进度：点「读取模块信息」后**按钮旁边**必须立刻有动静。
+                 真机反馈是"点了像卡死"—— 一次识别最长要逐档试 5~9 个波特率，
+                 每档 2~3 秒，全部落空时近 30 秒页面毫无变化。
+                 所以这里给三样东西：转圈图标、已用时间、当前在试哪一档。
+                 文案里的预计耗时**由后端算**（`detect_plan`），前端不硬编码：
+                 型号不同候选表不同，写死一个数字迟早和真实行为脱节。 -->
+            <div class="cal-detect-progress is-hidden" id="cal-detect-progress" role="status" aria-live="polite">
+              <span class="cal-spinner" aria-hidden="true"></span>
+              <span class="cal-detect-text" id="cal-detect-text"></span>
+              <span class="cal-detect-timer" id="cal-detect-timer">0.0s</span>
+              <div class="cal-detect-track"><i id="cal-detect-bar"></i></div>
             </div>
 
             <div class="cal-hw is-hidden" id="cal-hw"></div>

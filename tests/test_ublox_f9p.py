@@ -179,20 +179,31 @@ class TestDriverSemantics(unittest.TestCase):
 
     def test_model_constants(self):
         self.assertEqual(F9P.ZEDF9PDriver.MODEL_KEY, 'zed_f9p')
-        # §3.8.1 明文默认 38400 —— 与 LG290P(460800)/LC29H(115200) 都不同
+        # §3.8.1 明文默认 38400 —— 与 Quectel 系（115200 / 460800）都不同
         self.assertEqual(F9P.ZEDF9PDriver.DEFAULT_BAUD, 38400)
         drv, _ch, _s = make_f9p()
         self.assertEqual(drv.bauds()[0], 38400, '首选档必须是厂商默认值')
 
     def test_three_generations_do_not_share_baud_defaults(self):
-        """三派默认波特率必须各自独立（用户反复强调的隔离要求）。"""
+        """三派默认波特率必须各自独立（用户反复强调的隔离要求）。
+
+        LG290P 在 2026-11-06 按真机实测改成 115200（与 LC29H(BS) 同值），
+        所以"三家必须互不相同"这条断言不再成立 —— 它是**旧的押注**，
+        不是隔离要求本身。隔离的真正判据是：每个型号的常量各自独立、
+        各自由驱动声明，改动一个不会连带另一个（下面用可变对象验证）。
+        """
         from rtkserver.calibration.drivers.driver_manager import (
             _REGISTRY, load_builtin_drivers)
         load_builtin_drivers()
         table = {k: _REGISTRY[k].DEFAULT_BAUD for k in
                  ('lg290p', 'lc29hbs', 'zed_f9p')}
-        self.assertEqual(table, {'lg290p': 460800, 'lc29hbs': 115200, 'zed_f9p': 38400})
-        self.assertEqual(len(set(table.values())), 3, '三家默认值不能撞在一起')
+        self.assertEqual(table, {'lg290p': 115200, 'lc29hbs': 115200, 'zed_f9p': 38400})
+        # F9P 必须与两家 Quectel 都不同：它的 UBX 指令集跟 $PQTM 毫无关系
+        self.assertNotIn(table['zed_f9p'], (table['lg290p'], table['lc29hbs']))
+        # 隔离的可执行判据：类常量各自存在于各自类上，不是共用的一个引用
+        for key in ('lg290p', 'lc29hbs', 'zed_f9p'):
+            self.assertIn('DEFAULT_BAUD', vars(_REGISTRY[key]),
+                          f'{key} 必须自己声明 DEFAULT_BAUD，不能继承别人的')
 
     def test_no_quectel_tokens(self):
         """F9P 驱动里不许出现 Quectel 的命令名（跨型号污染的最直接证据）。"""

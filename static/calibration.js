@@ -1154,32 +1154,165 @@
   // ---------------- 读取模块信息（只读诊断，不写任何配置） ----------------
   // 后端是异步任务：POST 返回 202 后由轮询推进；任务 DONE 时再拉一次 full
   // 取回 report.module / report.mode。不能在这里等同步返回。
+  //
+  // **为什么按钮旁边要挂一条进度**：一次识别要逐档试波特率（自动探测时最多
+  // 9 档 × 2~3 秒），全部落空接近 30 秒，期间页面除了按钮变灰什么都没变 ——
+  // 真机反馈就是"点了像卡死"。这里在按钮下方给转圈 + 已用时间 + 当前档位，
+  // 并且**从点击那一刻就开始计时**，不等 POST 返回：
+  // POST 自己也可能因为等服务端让出串口而慢上几秒，那几秒同样不能是黑屏。
+  var DETECT_UI = { started: 0, timer: null, plan: null, failed: false };
+
+  function detectEls() {
+    return {
+      box: $('cal-detect-progress'),
+      text: $('cal-detect-text'),
+      timer: $('cal-detect-timer'),
+      bar: $('cal-detect-bar')
+    };
+  }
+
+  function clearDetectProgress() {
+    if (DETECT_UI.timer) { clearInterval(DETECT_UI.timer); DETECT_UI.timer = null; }
+  }
+
+  // 已经跑了多少秒（一位小数）。用 Date.now() 而不是自增计数器：
+  // 标签页被切到后台时 setInterval 会被节流到 1 秒以上，
+  // 自增会越跑越慢，显示的时间和用户真实感受对不上。
+  function detectElapsed() {
+    if (!DETECT_UI.started) return 0;
+    return Math.max(0, (Date.now() - DETECT_UI.started) / 1000);
+  }
+
+  // 把进度条按"最坏总时长"推进。**到 90% 就停住**：
+  // 真实结束时间由模块应答决定，进度条冲到 100% 却还在转圈比停在 90% 更让人困惑。
+  function tickDetectProgress() {
+    var els = detectEls();
+    var elapsed = detectElapsed();
+    if (els.timer) els.timer.textContent = elapsed.toFixed(1) + 's';
+    if (!els.bar || DETECT_UI.failed) return;
+    var total = (DETECT_UI.plan && DETECT_UI.plan.worst) || 30;
+    var pct = Math.min(90, (elapsed / total) * 100);
+    els.bar.style.width = pct + '%';
+  }
+
+  function startDetectProgress(message) {
+    var els = detectEls();
+    clearDetectProgress();
+    DETECT_UI.started = Date.now();
+    DETECT_UI.failed = false;
+    if (!els.box) return;
+    els.box.classList.remove('is-hidden', 'is-fail', 'is-done');
+    if (els.text) els.text.textContent = message || t('cal.detect.prepare');
+    if (els.bar) els.bar.style.width = '2%';
+    tickDetectProgress();
+    DETECT_UI.timer = setInterval(tickDetectProgress, 200);
+  }
+
+  // 阶段变化时只换文字，不重置计时 —— 计时是"用户从点击等到现在"的总时长。
+  function setDetectMessage(message) {
+    var els = detectEls();
+    if (els.text && message) els.text.textContent = message;
+  }
+
+  function failDetectProgress(message, detail) {
+    var els = detectEls();
+    var elapsed = (typeof DETECT_UI.lastElapsed === 'number')
+      ? DETECT_UI.lastElapsed : detectElapsed();
+    clearDetectProgress();
+    DETECT_UI.failed = true;
+    DETECT_UI.started = 0;
+    if (!els.box) return;
+    els.box.classList.remove('is-hidden', 'is-done');
+    els.box.classList.add('is-fail');
+    if (els.text) {
+      els.text.textContent = t('cal.detect.fail', { elapsed: elapsed.toFixed(1) }) +
+        (message ? '：' + message : '') + (detail ? '（' + detail + '）' : '');
+    }
+    if (els.bar) els.bar.style.width = '100%';
+  }
+
+  function finishDetectProgress() {
+    var els = detectEls();
+    clearDetectProgress();
+    if (!els.box) return;
+    els.box.classList.add('is-done');
+    els.box.classList.remove('is-fail');
+    if (els.text) els.text.textContent = t('cal.detect.ok', { elapsed: detectElapsed().toFixed(1) });
+    if (els.bar) els.bar.style.width = '100%';
+    // 成功结果由 `renderHw()` 展示，这条提示留 2.5 秒后收起，避免和结果重复占位
+    setTimeout(function () {
+      if (!DETECT_UI.started && els.box) els.box.classList.add('is-hidden');
+    }, 2500);
+  }
+
+  // 按当前状态机阶段刷新按钮旁的文字。后端给的是阶段名（英文），
+  // 这里翻成人话 —— 直接显示 `DETECT` 等于没告诉用户任何事。
+  function syncDetectStage(snap) {
+    var stage = (snap && snap.stage) || '';
+    var plan = snap && snap.detect_plan;
+    if (plan) DETECT_UI.plan = plan;
+    var baud = snap && snap.baud;
+    var seconds = (snap && snap.result && snap.result.observations
+      && snap.result.observations.seconds) || '';
+    if (stage === 'PREPARE') setDetectMessage(t('cal.detect.prepare'));
+    else if (stage === 'HOLD') setDetectMessage(t('cal.detect.hold'));
+    else if (stage === 'OPEN') setDetectMessage(t('cal.detect.open', { port: (snap && snap.port) || '' }));
+    else if (stage === 'DETECT') {
+      // 自动探测（非显式波特率）才提示"最多试 N 档"：手填了档位就只试那一档，
+      // 说"最多试 9 档"会让用户以为程序要把他填的值改掉。
+      setDetectMessage(snap && snap.baud_explicit
+        ? t('cal.detect.detect', { baud: baud || '?' })
+        : t('cal.detect.detect_auto', {
+          baud: baud || '?',
+          steps: (DETECT_UI.plan && DETECT_UI.plan.steps) || 1
+        }));
+    } else if (stage === 'OBSERVE') {
+      setDetectMessage(t('cal.detect.observe', { seconds: seconds || '…' }));
+    } else if (stage === 'PLAN') setDetectMessage(t('cal.detect.plan'));
+  }
+
   function readModuleInfo() {
     var port = $('cal-port').value.trim();
     if (!port) { showError(t('cal.err.need_port')); return; }
     var baud = baudValue();
+    var module = selectedModule();
     var btn = $('cal-detect');
     if (btn) btn.disabled = true;
     showError('');
+
+    // 先按"还不知道型号"的候选表起个提示，POST 回来后再用后端算的 plan 修正。
+    // 这样即在后端慢半拍时，用户也能立刻看到东西在动。
+    DETECT_UI.plan = null;
+    DETECT_UI.lastElapsed = 0;
+    startDetectProgress(t('cal.detect.prepare'));
+
     fetch('/api/calibration/detect', {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         port: port, baud: baud,
-        module: (selectedModule() || {}).id || null
+        module: (module || {}).id || null
       })
     })
       .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
       .then(function (res) {
         if (!res.ok || !res.body.ok) {
+          DETECT_UI.lastElapsed = detectElapsed();
+          failDetectProgress(res.body.error || t('cal.err.detect'));
           showError(res.body.error || t('cal.err.detect'));
           if (btn) btn.disabled = false;
           return;
         }
+        // 后端返回的预估：型号不同候选表不同，由后端算，前端不硬编码。
+        var snap = res.body.status || res.body;
+        if (snap && snap.detect_plan) DETECT_UI.plan = snap.detect_plan;
+        syncDetectStage(snap);
         startPolling();
       })
       .catch(function (err) {
+        DETECT_UI.lastElapsed = detectElapsed();
+        failDetectProgress(t('cal.err.detect'), err.message);
         showError(t('cal.err.detect') + ': ' + err.message);
         if (btn) btn.disabled = false;
       });
@@ -1324,6 +1457,21 @@
     renderBanner(snap);
     appendTimeline(snap);
     renderLogs(snap.logs);
+
+    // 「读取模块信息」的行内进度：只在任务在跑、且这条提示还开着时更新。
+    // 判据用 `DETECT_UI.started`（本页点过按钮才为真），不要用 stage ——
+    // 页面刷新后 status 里同样有 DETECT 阶段，但用户没有本轮的计时起点。
+    if (DETECT_UI.started) {
+      if (snap.running) {
+        syncDetectStage(snap);
+      } else if (snap.stage === 'DONE' || snap.stage === 'FAILED'
+                 || snap.stage === 'CANCELLED') {
+        DETECT_UI.lastElapsed = detectElapsed();
+        if (snap.stage === 'DONE') finishDetectProgress();
+        else failDetectProgress(snap.error || '');
+        DETECT_UI.started = 0;
+      }
+    }
 
     if (STATE.running) {
       $('cal-abort').disabled = false;

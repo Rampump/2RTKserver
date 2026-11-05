@@ -1060,7 +1060,7 @@ class BaseDriver:
 
     # ---------- 波特率 ----------
     def bauds(self):
-        """该型号该先试哪些波特率（`DEFAULT_BAUD` 打头，其余降序）。
+        """该型号该先试哪些波特率（`DEFAULT_BAUD` 打头，其余按声明顺序）。
 
         为什么 `DEFAULT_BAUD` 必须排第一 —— 曾经这里是纯降序，注释的理由是
         "先用高的试，高的能通说明线材好"。听起来合理，但把顺序搞反了：
@@ -1069,14 +1069,20 @@ class BaseDriver:
         才命中，正好是用户抱怨的"一档档试"——只是从低往高试换成了从高往低试。
 
         **`DEFAULT_BAUD` 是每个型号自己的常量，不是一个通用答案**：
-        LG290P 是 460800、LC29H(BS) 是 115200、N4 系列是 115200。
+        LG290P 是 115200、LC29H(BS) 是 115200、ZED-F9P 是 38400。
         它的语义是"这块模块出厂大概率跑在哪一档"，依据是厂商默认配置与现场
         实测（多数规范并不在正文写默认值，见 LG290P 驱动注释）。
         押错照旧往下走，代价只是一轮超时。
 
-        **不要把某个型号的首选值抄给另一个型号**：抄 LG290P 的 460800 到
-        LC29H(BS)，一块 115200 的新模块就要先错一轮；反过来抄 115200 给
-        LG290P，460800 的模块也要先错一轮。这条规则由契约测试守着。
+        **不要把某个型号的首选值抄给另一个型号**：抄 LG290P 的值到
+        LC29H(BS)，一块 115200 的新模块就要先错一轮。这条规则由契约测试守着。
+
+        **`DEFAULT_BAUD` 之后保持驱动声明的顺序，不再重新排序**。
+        早先这里是 `sorted(rest, reverse=True)`，等于把"探测顺序"这个决策
+        从驱动手里抢走了：驱动写了 `PROBE_BAUDS = (115200, 921600, 460800, ...)`
+        也会被改成降序，19200 / 4800 这些低档永远排在最后。
+        顺序就是用户的等待时间（每错一档约 2 秒），必须由最懂这款模块的人决定，
+        而那个人是写驱动的人，不是这里的排序函数。
 
         驱动没声明 BAUDS 时返回空元组，由调用方决定退回全局兜底表。
 
@@ -1094,7 +1100,7 @@ class BaseDriver:
         if not seen:
             return ()
 
-        # 最可能的那一档提到最前，其余保持降序（高档位通常意味着更好的线材与更小的采样延迟）
+        # 最可能的那一档提到最前，其余**保持声明顺序**（见上面那段说明）
         likely = []
         try:
             default = int(self.DEFAULT_BAUD or 0)
@@ -1102,7 +1108,7 @@ class BaseDriver:
             default = 0
         if default > 0:
             likely = [default]
-        return tuple(likely + [n for n in sorted(seen, reverse=True) if n not in likely])
+        return tuple(likely + [n for n in seen if n not in likely])
 
     def supports_baud(self, baud):
         """该型号是否声明支持这个波特率（未声明 BAUDS 时一律返回 True，不做限制）。"""

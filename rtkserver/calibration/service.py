@@ -127,6 +127,13 @@ DEFAULT_BAUD = 115200
 DEFAULT_OBSERVE_SECONDS = 20
 MIN_OBSERVE_SECONDS = 3
 MAX_OBSERVE_SECONDS = 300
+# 单档波特率识别最坏耗时（秒）。给前端算"最坏要等多久"用，**只用于提示文案**，
+# 不参与任何超时判定 —— 真正的超时在驱动层 `ACK_TIMEOUT`（1.5s）与
+# `match_driver` 的每驱动尝试次数上。
+# 取值依据：6 个驱动 × 1.5s ≈ 9s 是最坏一轮（只在自动探测、且全部型号都比对
+# 一遍时才会走满）；押中档位通常 0.2~0.5s 就认出。这里取 3 秒作为"一档"的
+# 保守估计，宁可把预估说长一点，也不要让用户以为马上就出结果。
+DETECT_STEP_SECONDS = 3
 
 # 识别失败后的波特率枚举（方案 §14 #3 / #25）。
 #
@@ -140,9 +147,11 @@ MAX_OBSERVE_SECONDS = 300
 # 悄悄改成 115200 去试，等于把用户的判断覆盖掉，而且改完还不告诉他。
 #
 # 这份只是**兜底**：真正该用哪些档位、哪一档排第一，由各驱动类的
-# `BAUDS` / `DEFAULT_BAUD`（厂商文档口径）决定，见 `_baud_candidates()`。
-# 驱动没声明 BAUDS 的型号才回落到这里。
-DETECT_BAUD_CANDIDATES = (115200, 460800, 230400, 921600, 38400, 9600)
+# `BAUDS` / `PROBE_BAUDS` / `DEFAULT_BAUD`（厂商文档口径）决定，见
+# `_baud_candidates()`。驱动没声明 BAUDS 的型号才回落到这里。
+# 顺序 = 等待时间（每错一档约 2 秒），命中率高的排前面，与
+# `driver_manager.DEFAULT_BAUDS` 保持一致。
+DETECT_BAUD_CANDIDATES = (115200, 921600, 460800, 230400, 57600, 38400, 19200, 9600)
 
 
 class TaskAborted(Exception):
@@ -350,6 +359,11 @@ class CalibrationService:
             'started_at': self._started_at,
             'stage_at': self._stage_at,
             'finished_at': self._finished_at,
+            # 这一轮"最坏还要试几档、可能等多久"。前端用它在按钮旁边显示
+            # 「识别中…（第 1/4 档 · 最多约 12s）」，避免用户以为页面卡死。
+            # 只在 DETECT 之前的阶段有意义：一旦进了 OBSERVE，就是固定观测时长，
+            # 由 `seconds` 决定，不再按波特率估算。
+            'detect_plan': self._detect_plan_now(),
             'lease': lease.snapshot() if lease is not None else None,
             # 上次被硬中断的详情（只有启动钩子置过 INTERRUPTED 才有值）。
             # 单独给一份是因为 `result` 会在下次任务开始时被清空，
@@ -360,6 +374,28 @@ class CalibrationService:
             # 任务结束后 _result 才有值，以它为准。
             'result': self._result or (getattr(self._writer, 'result', None) or {}),
         }
+
+    def _detect_plan_now(self):
+        """当前任务的波特率预估；不在任务中 / 已过 DETECT 阶段返回 None。
+
+        刻意返回 None 而不是 0：前端据此决定"是否显示进度条"，0 会被当成
+        "总工作量为零"从而画出空条，看起来又像卡住了。
+        """
+        task = self._task or {}
+        if not task:
+            return None
+        stage = self._stage
+        if stage in ('', 'IDLE', 'DONE', 'FAILED', 'CANCELLED', 'INTERRUPTED'):
+            return None
+        # DETECT 之后档位已经确定，波特率预估不再适用
+        order = ('PREPARE', 'HOLD', 'OPEN', 'DETECT', 'OBSERVE', 'PLAN')
+        if stage in order and order.index(stage) > order.index('DETECT'):
+            return None
+        try:
+            return _detect_plan(task.get('module'), task.get('baud'))
+        except Exception as e:                       # noqa: BLE001 - 预估失败不该影响状态查询
+            logging.debug(f'计算波特率预估失败：{e}')
+            return None
 
     # ---------- 启动（公共骨架） ----------
     def _start_task(self, action, task, task_id=None, log_text=''):
@@ -872,8 +908,8 @@ class CalibrationService:
         """采集/识别该试哪些波特率（按优先级，已去重）。
 
         - 指定了型号 → 该型号厂商文档写的档位，`DEFAULT_BAUD`（该型号的
-          出厂默认档）打头，其余降序。首轮就押中这块模块的默认档，
-          不像纯降序那样先拿 921600 白等两轮超时。
+          出厂默认档）打头，其余按驱动声明顺序（`PROBE_BAUDS`）。
+          首轮就押中这块模块的默认档，不像纯降序那样先拿 921600 白等两轮超时。
         - 自动探测   → 所有已注册型号的档位按**轮次交错**（不是整段拼接），
           再加全局兜底表。交错是为了不让"注册得早的型号"独占队首：
           拼接的话 LG290P 的 460800 会被前面型号的七八个档位压在后面，
@@ -1833,10 +1869,11 @@ def _clean_module(module):
 def _default_baud_for(module=None):
     """用户没填波特率时，第一档该从哪开始试。
 
-    **指定了型号 → 该型号自己的默认档**：LG290P 460800、LC29H(BS) 115200。
+    **指定了型号 → 该型号自己的默认档**：LG290P 115200、LC29H(BS) 115200、
+    ZED-F9P 38400。
     这就是驱动里 `DEFAULT_BAUD` 的意义 —— 它不是"整个程序统一的默认值"，
-    而是"这块模块出厂大概率停在哪一档"。留空时一律落 115200 的话，
-    选了 LG290P 的人点"识别"还是要先白等一轮 2 秒超时才轮到 460800。
+    而是"这块模块出厂大概率停在哪一档"。留空时一律落全局 115200 的话，
+    选了 F9P 的人点"识别"还是要先白等一轮超时才轮到 38400。
 
     没指定型号 → 全局兜底 115200（不猜型号时不押注，用最常见的一档）。
 
@@ -1849,6 +1886,49 @@ def _default_baud_for(module=None):
         if table:
             return int(table[0])
     return int(DEFAULT_BAUD)
+
+
+def _detect_plan(module=None, baud=None):
+    """给前端算一份"这一轮大概要等多久"的预估，返回 dict。
+
+    为什么要在后端算：候选表由驱动声明（型号不同、档数不同），前端拿不到；
+    而在前端硬编码一份就等于两处各说各话 —— 驱动改了档位，页面还在报旧数字。
+
+    返回字段：
+        `steps`      这一轮最坏要试几档
+        `per_step`   单档最坏秒数
+        `worst`      最坏总秒数
+        `typical`    命中默认档时的秒数（用户最可能遇到的实际情况）
+        `bauds`      候选顺序（前端拿来显示"正在试 115200…"）
+    """
+    module = _clean_module(module)
+    # 手填了波特率 = 用户已指明档位，不换档（`baud_explicit`），只有 1 轮
+    _, explicit, _error = CalibrationService._resolve_baud(baud, module)
+    if explicit:
+        steps = 1
+    else:
+        # 非显式 → 首档 + `_scan_bauds` 会试的其余档位（`_baud_candidates` 已去重）
+        steps = max(1, len(CalibrationService._baud_candidates(
+            [module] if module else None, current=baud)))
+    per_step = int(DETECT_STEP_SECONDS)
+
+    bauds = []
+    try:
+        if explicit:
+            bauds = [int(baud)]
+    except (TypeError, ValueError):
+        bauds = []
+    if not bauds:
+        table = (driver_manager.detect_bauds(module) if module
+                 else list(DETECT_BAUD_CANDIDATES))
+        bauds = [int(v) for v in (table or [])]
+    return {
+        'steps': steps,
+        'per_step': per_step,
+        'worst': steps * per_step,
+        'typical': per_step,
+        'bauds': bauds,
+    }
 
 
 def _module_caps(module):
