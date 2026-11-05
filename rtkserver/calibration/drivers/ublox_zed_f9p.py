@@ -702,42 +702,6 @@ class ZEDF9PDriver(BaseDriver):
             values[name] = raw_value * scale if scale != 1.0 else raw_value
         return values, got_layer
 
-    def _valdel(self, key_names, layers=None):
-        """删掉一组配置键（UBX-CFG-VALDEL，0x06/0x8C）。
-
-        载荷与 VALSET **同构，但只有 key 没有 value**：
-            `version(1) | layer(1) | transaction(1) | reserved0(1) | key(4) ...`
-
-        用途：把某个键从 Flash/BBR 里删掉，让它回落到默认值或上一层的值。
-        **不能作用于 RAM 层** —— 删 RAM 没有语义（RAM 本来就是易失的），
-        模块对 `layer=RAM` 的 VALDEL 直接 NAK。所以这里默认
-        `BBR|Flash`，并且显式拒绝只带 RAM 的调用。
-        """
-        if layers is None:
-            layers = K.LAYER_BBR | K.LAYER_FLASH
-        if layers & K.LAYER_RAM and not (layers & ~K.LAYER_RAM):
-            raise DriverBug('CFG-VALDEL 不能只作用于 RAM 层（模块会 NAK）；'
-                            '请改用 LAYER_BBR | LAYER_FLASH')
-        names = [n for n in key_names if K.lookup(n) is not None]
-        if not names:
-            return True, '无需删除', {'keys': 0}
-        if len(names) > K.MAX_KEYS_PER_VALSET:
-            raise DriverBug(
-                f'一条 VALDEL 最多 {K.MAX_KEYS_PER_VALSET} 个键，收到 {len(names)} 个')
-
-        payload = bytearray([0x00, layers & 0xFF, 0x00, 0x00])
-        deleted = []
-        for name in names:
-            key_id = K.lookup(name)[0]
-            payload += struct.pack('<I', key_id)
-            deleted.append((name, key_id))
-        ok, message = self._send_ubx(*K.MSG_CFG_VALDEL, bytes(payload))
-        data = {'keys': len(deleted), 'layers': layers,
-                'items': [{'key': n, 'key_id': f'0x{i:08X}'} for n, i in deleted]}
-        if not ok:
-            data['error'] = 'nak' if message == 'NAK' else 'timeout'
-        return ok, message, data
-
     # ==================== 识别 ====================
     def detect(self):
         """发 UBX-MON-VER 认型。
@@ -1504,13 +1468,6 @@ class ZEDF9PDriver(BaseDriver):
         if name.startswith('COM') or 'TTYACM' in name:
             return 'USB'
         return None
-
-    def _candidate_ports(self):
-        """要探测的端口，按可能性从高到低。"""
-        # 按链路名猜出来的排前面（省一次没必要的探测）
-        guessed = self._port_from_name()
-        order = ['USB', 'UART1'] if guessed == 'USB' else ['UART1', 'USB']
-        return order
 
     def detect_port(self, force=False):
         """探出**当前这条链路**实际走的是 USB 还是 UART1，返回端口名。
