@@ -1421,43 +1421,50 @@ class CalibrationService:
                                 'model_key': driver.MODEL_KEY}
         self._checkpoint()
 
+        # 模块完全不应答（MON-VER 都没回）时，后面所有查询必然全部超时，
+        # 白等十几秒还让用户盯着转圈。直接跳过查询类步骤，只做被动观测。
+        module_dead = not ok and isinstance(info, dict) and info.get('error') == 'no_reply'
+
         # ---- 2. 工作模式 ----
-        ok, message, mode = driver.get_mode()
-        if ok:
-            # `source` 是语义来源（配置回读），不是命令名 —— 命令名由各厂商驱动自己管，
-            # 这里写死一个 `PQTM...` 的话，换成和芯星通/以后别的型号就对不上了。
-            report['mode'] = {'text': mode.get('mode'), 'code': mode.get('mode_code'),
-                              'source': 'config_readback'}
+        if not module_dead:
+            ok, message, mode = driver.get_mode()
+            if ok:
+                report['mode'] = {'text': mode.get('mode'), 'code': mode.get('mode_code'),
+                                  'source': 'config_readback'}
+            else:
+                warn(f'读取工作模式失败：{message}')
+                report['mode'] = {'text': 'unknown', 'code': None}
         else:
-            warn(f'读取工作模式失败：{message}')
             report['mode'] = {'text': 'unknown', 'code': None}
         self._checkpoint()
 
         # ---- 3. 当前坐标配置（Survey-in 模式下 ECEF 恒为 0，不是收敛结果）----
-        ok, message, svin = driver.get_svin_config()
-        if ok:
-            report['svin'] = svin
-            if svin.get('mode') == 'survey_in':
-                warn('模块处于 Survey-in 模式：CFGSVIN 里的 ECEF 是配置值（恒为 0），'
-                     '收敛结果只能从 1005 或 SVINSTATUS 里读')
-        else:
-            warn(f'读取坐标配置失败：{message}')
+        if not module_dead:
+            ok, message, svin = driver.get_svin_config()
+            if ok:
+                report['svin'] = svin
+                if svin.get('mode') == 'survey_in':
+                    warn('模块处于 Survey-in 模式：CFGSVIN 里的 ECEF 是配置值（恒为 0），'
+                         '收敛结果只能从 1005 或 SVINSTATUS 里读')
+            else:
+                warn(f'读取坐标配置失败：{message}')
         self._checkpoint()
 
         # ---- 4. RTCM 配置回读（看 MSM 类型，不解释每一个保留字段）----
-        ok, message, rtcm = driver.read_rtcm_config()
-        if ok:
-            fields = rtcm.get('fields') or []
-            report['rtcm'] = {
-                'msm_type': _safe_int(fields[0]) if fields else None,
-                'fields': fields,
-                'raw': rtcm.get('raw', ''),
-            }
-        else:
-            # rover 模式下某些固件会回 ERROR,1（"没配过"），不是故障
-            report['rtcm'] = {'msm_type': None, 'fields': [], 'raw': '',
-                              'error': message}
-            logging.debug(f'RTCM 配置回读失败（在移动站模式下属正常）：{message}')
+        if not module_dead:
+            ok, message, rtcm = driver.read_rtcm_config()
+            if ok:
+                fields = rtcm.get('fields') or []
+                report['rtcm'] = {
+                    'msm_type': _safe_int(fields[0]) if fields else None,
+                    'fields': fields,
+                    'raw': rtcm.get('raw', ''),
+                }
+            else:
+                # rover 模式下某些固件会回 ERROR,1（"没配过"），不是故障
+                report['rtcm'] = {'msm_type': None, 'fields': [], 'raw': '',
+                                  'error': message}
+                logging.debug(f'RTCM 配置回读失败（在移动站模式下属正常）：{message}')
         self._checkpoint()
 
         # ---- 5. 观测：抓 1005（基准站坐标）与 GGA（质量旁证）----

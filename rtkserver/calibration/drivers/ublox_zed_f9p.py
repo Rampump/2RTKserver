@@ -182,18 +182,55 @@ REQUIRED_RTCM = (1005, 1230)
 OBSERVATION_RTCM = (1074, 1077, 1084, 1087, 1094, 1097, 1124, 1127)
 MSM_TIER = {4: (1074, 1084, 1094, 1124), 7: (1077, 1087, 1097, 1127)}
 
-# 持久化自检的默认键集（`verify_persisted()` 不传参时用它）。
-# 只挑"标定流程每次都会写、且值可预期"的键：
-#   · TMODE_MODE    —— 模式，写错的后果最严重（基站当流动站、反之亦然）
-#   · RTCM_1005     —— 基准站必开（坐标系基准）
-#   · RTCM_1230     —— 基准站必开（GLONASS 偏差，不开只能浮点）
-# 注意用 `RTCM_1005` 这种**键表里的名字**，不是 `MSGOUT_RTCM_3X_TYPE1005_UART1`
-# （那是 pyubx2 的叫法，本项目的 `ubx_keys.ALL_KEYS` 里只有前者）。
-# 不选 MSM 观测报文：档位（MSM4/7）会随方案变，写死会让自检假报不符。
+# ==================== 持久层自检键集 ====================
+# 分两档：`verify_persisted()` 不带 `expected` 时读 **CORE** 那档（"能读到就算过"），
+# 带上 `expected`（= 本次流程真写过的键）时读**两档并集** —— 写过的键都必须查。
+#
+# 早期这里只有 TMODE_MODE / RTCM_1005 / RTCM_1230 三个键，问题很实在：
+# **坐标没落盘这件事查不出来**。标定场景里坐标（TMODE_LAT/LON/HEIGHT）
+# 才是核心产物，Flash 写失败时模式对不对、1005 开没开全都没意义。
+#
+# 键名一律用 `ubx_keys.ALL_KEYS` 里的写法（`RTCM_1005` 而不是
+# `MSGOUT_RTCM_3X_TYPE1005_UART1`，后者是 pyubx2 的叫法）。
+#
+# **不选 RTCM 观测报文（1074/1084/…）**：档位（MSM4/MSM7）随方案变，
+# 写死任何一档都会让另一档的正常配置被自检判成"不符"。
+# MSM 档位的正确性由 `read_rtcm_config()` 的 `msm_type` + `validate_rtcm_plan()` 兜。
+
+# 核心档：标定流程"每次都会写、且值可预期"的键。
 PERSIST_CHECK_KEYS = (
-    'TMODE_MODE',
-    'RTCM_1005',
-    'RTCM_1230',
+    'TMODE_MODE',           # 模式。写错的后果最严重（基站当流动站、反之亦然）
+    'TMODE_SVIN_MIN_DUR',   # Survey-in 最短时长
+    'TMODE_SVIN_ACC_LIMIT', # Survey-in 精度门限
+    'TMODE_LAT',            # 坐标（LLH 口径）——标定的核心产物，没落盘等于白标
+    'TMODE_LON',
+    'TMODE_HEIGHT',
+    'TMODE_ECEF_X',         # 坐标（ECEF 口径）。F9P 两种口径的键**都存**，
+    'TMODE_ECEF_Y',         # 只查 LLH 会漏掉"ECEF 那段没写进去"的情形
+    'TMODE_ECEF_Z',
+    'RTCM_1005',            # 基准站必开（坐标系基准）
+    'RTCM_1230',            # 基准站必开（GLONASS 偏差，不开只能浮点）
+)
+
+# 扩展档：只在调用方显式要求时才查。这些键**不是每次标定都会写**，
+# 无条件塞进默认集会让"流动站没配波特率"这种正常情形被误判成落盘失败。
+PERSIST_CHECK_KEYS_EXT = (
+    'UART1_BAUDRATE',
+    'UART1INPROT_RTCM3X',
+    'USBINPROT_RTCM3X',
+    'TMODE_FIXED_POS_ACC',
+)
+
+# 端口协议开关的完整清单：`read_persisted()` 从不带 expected 时会顺手读一遍，
+# 用于报告里展示"这个口收不收 RTCM3"，但**不参与**"落盘成功与否"的判定。
+PERSIST_CHECK_KEYS_ALL = PERSIST_CHECK_KEYS + PERSIST_CHECK_KEYS_EXT
+
+# `ROVER_RAM_CHECK_KEYS` —— 流动站重启后要核对 RAM 层的键。
+# `TMODE_MODE` 由流程层的 `_step_verify_mode()` 单独核（它同时管 rover/base
+# 两种角色），这里只补它没覆盖的那部分：差分输入协议到底开没开。
+ROVER_RAM_CHECK_KEYS = (
+    'UART1INPROT_RTCM3X',
+    'USBINPROT_RTCM3X',
 )
 
 # ==================== 端口维度（MSGOUT 键按口拆分） ====================
@@ -415,6 +452,25 @@ class ZEDF9PDriver(BaseDriver):
     # `persist_check=True` 会让流程层在每次标定收尾时调用它，
     # 真机表现就是"配置都写成功了，最后一步自检崩掉，整单标定判失败"。
     PERSIST_CHECK_KEYS = PERSIST_CHECK_KEYS
+    PERSIST_CHECK_KEYS_EXT = PERSIST_CHECK_KEYS_EXT
+    # 移动站运行态自检键（重启后读 RAM 层用），同样必须挂到类上。
+    ROVER_RAM_CHECK_KEYS = ROVER_RAM_CHECK_KEYS
+    # UBX-CFG-RST 的 `resetMode` 枚举（UBX-18010802 表 "Available reset types"）：
+    #   0x00 硬件复位（看门狗立即）      —— 清 RAM+BBR，**重载配置**，USB 会重新枚举
+    #   0x01 受控软件复位                —— 清 RAM，有序关停后重启、**重载配置**
+    #   0x02 受控软件复位（仅 GNSS）     —— 只重启 GNSS 任务，**不重载配置**
+    #   0x04 关停后硬件复位              —— 同 0x00 但先有序关停
+    #   0x08 受控 GNSS 停止 / 0x09 启动  —— 不动系统
+    #
+    # **本驱动必须用 0x01**：标定流程的重启步骤是为了验证"配置真的落盘了"，
+    # 而 0x02 明确不重载配置（RAM 里的值原地不动），用它重启等于什么都没验证 ——
+    # 哪怕 Flash 一个字节没写进去，重启后读 RAM 也照样全对。
+    # 早期代码写的 0x02 并注释成"controlled software reset"，注释与枚举不一致。
+    #
+    # 不用 0x00/0x04 的原因：硬件复位会清 BBR，且 USB CDC 模块会重新枚举、
+    # 串口节点短暂消失，恢复时间不可控（`channel.reopen` 的重试窗口未必够）。
+    # 0x01 只清 RAM，有序重启、重载配置，正是"验证持久化"要的那个语义。
+    RESET_MODE_CONTROLLED_SOFTWARE = 0x01
 
     # 官方波特率（§3.8.1 UART 表 28，文档原样八档）
     BAUDS = (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600)
@@ -616,6 +672,12 @@ class ZEDF9PDriver(BaseDriver):
             line = self.channel.read_line(min(0.3, max(0.05, deadline - time.time())))
             if line is not None:
                 self.channel.absorb(line)
+            # 同 _poll_ubx：模块不应答时这里干等 2 秒，必须喂心跳。
+            if self.channel.on_beat is not None:
+                try:
+                    self.channel.on_beat()
+                except Exception:
+                    pass
             raw = self.channel.ubx_last(*K.MSG_CFG_VALGET)
             if raw is not None:
                 break
@@ -763,6 +825,7 @@ class ZEDF9PDriver(BaseDriver):
 
         data.update({
             'model': self.DISPLAY_NAME,
+            'display_name': self.DISPLAY_NAME,
             'model_key': self.MODEL_KEY,
             'firmware': data.get('sw_version', ''),
             'hw_version': data.get('hw_version', ''),
@@ -770,6 +833,8 @@ class ZEDF9PDriver(BaseDriver):
             # 唯一 ID 代替并**明确标注来源**，不冒充"序列号"
             'sn': hw_info.get('unique_id', ''),
             'sn_source': 'MON-HW uniqueId',
+            'uniq_id': hw_info.get('unique_id', ''),
+            'caps': dict(self.runtime_caps),
             'msg': message,
         })
         return True, message, data
@@ -839,34 +904,79 @@ class ZEDF9PDriver(BaseDriver):
         `verify=False` 跳过回读校验（真机上模块忙、VALGET 超时时可以关掉）。
         保留这些参数是为了**签名兼容** —— 流程层会带 `persist`/`restart`/`verify`
         一起调用，少一个就是 `TypeError`（LC29H(BS) 已经踩过一次）。
+
+        **流动站模式会同时打开本链路的 RTCM3 输入协议**
+        （`<PORT>INPROT_RTCM3X = 1`）。F9P 出厂的 UART1/USB 输入协议里
+        RTCM3 是**关**的；光把 `TMODE_MODE` 设成 0（流动站）并不能让模块
+        接受差分数据，表现为"移动站一直单点解、差分流过来了却没用"。
+        键按 `detect_port()` 探到的真实链路选（USB CDC 就写 `USBINPROT_RTCM3X`）。
+
+        **`base` 映射到"定点（fixed）"，不是 Survey-in**。首次部署没有准确
+        坐标时调 `set_mode('base')`，模块会用 Flash 里那次残留坐标立刻开始
+        播 1005 —— 坐标可能是几公里外的旧位置，移动站反而解不出来。
+        要 Survey-in 请显式调 `set_mode('survey_in')`；本方法会在 `data`
+        里带 `warning` 提示这一点（不阻断，因为已有准确坐标时 fixed 更快更稳）。
         """
         target = MODE_ALIASES.get(str(mode).strip().lower())
         if target is None:
             raise DriverBug(f'不认识的模式 {mode!r}'
                             f'（可用：rover/base/survey_in/fixed/disabled）')
 
+        port, _pmsg, _pdata = self.detect_port()
         layers = (K.LAYER_RAM | K.LAYER_FLASH) if persist else K.LAYER_RAM
-        ok, message, data = self._valset([('TMODE_MODE', target)], layers=layers)
+
+        items = [('TMODE_MODE', target)]
+        # 流动站必须能收 RTCM3；不显式写的话出厂默认是不收的。
+        # 注意键名不能拼错成 `UART1INPROT_RTCM3X`（那是 UART1 的），
+        # 走 USB CDC 时要写 `USBINPROT_RTCM3X`。
+        inprot_key = None
+        if target == MODE_DISABLED:     # disabled == 流动站
+            inprot_key = f'{port}INPROT_RTCM3X'
+            if K.lookup(inprot_key) is None:
+                inprot_key = None       # 固件/键表没有这个口，退回只写 TMODE
+            else:
+                items.append((inprot_key, 1))
+
+        ok, message, data = self._valset(items, layers=layers)
         if not ok:
             hint = '模块拒绝了这条配置（NAK）' if message == 'NAK' else '模块没有回 ACK'
             return False, f'切换模式失败：{hint}', {
                 'error': 'nak' if message == 'NAK' else 'timeout',
-                'mode': mode, 'target': target}
+                'mode': mode, 'target': target, 'port': port}
 
-        data.update({'requested': mode, 'target': target,
+        data.update({'requested': mode, 'target': target, 'port': port,
                      'persist': bool(persist), 'restart': {'skipped': True}})
+        # 记住这次写的角色：`check_running_config()` 重启后要据此决定核哪些键
+        # （流动站核差分输入协议，基站核坐标与 RTCM 播发）。
+        self._last_mode = target
+        if inprot_key:
+            data['inprot_keys'] = [inprot_key]
+        if target == MODE_FIXED:
+            data['warning'] = ('base 映射到"定点坐标"模式，会沿用模块里已有的坐标；'
+                               '首次部署请先 set_mode("survey_in") 收敛出坐标')
+            data['hint_mode'] = 'survey_in'
         if not verify:
             data['mode'] = MODE_LABEL.get(target, 'unknown')
             return True, f'已切换到 {MODE_LABEL.get(target)}（未回读校验）', data
 
         # 回读确认：ACK 只代表"收到了"，不代表"值和我要的一样"
-        values, _ = self._valget(['TMODE_MODE'])
+        names = ['TMODE_MODE'] + ([inprot_key] if inprot_key else [])
+        values, _ = self._valget(names)
         actual = int(values.get('TMODE_MODE', -1))
         data['mode'] = MODE_LABEL.get(actual, 'unknown')
+        bad = []
         if actual != target:
-            return False, (f'写入后回读不一致：要 {MODE_LABEL.get(target)}，'
-                           f'实际 {MODE_LABEL.get(actual, actual)}'), data
-        return True, f'已切换到 {MODE_LABEL.get(target)}', data
+            bad.append(f'TMODE_MODE 要 {MODE_LABEL.get(target)}，'
+                       f'实际 {MODE_LABEL.get(actual, actual)}')
+        if inprot_key and int(values.get(inprot_key, 0) or 0) != 1:
+            bad.append(f'{inprot_key} 未生效（读回 '
+                       f'{values.get(inprot_key)!r}），移动站将收不到差分')
+        if bad:
+            return False, '写入后回读不一致：' + '；'.join(bad), data
+        msg = f'已切换到 {MODE_LABEL.get(target)}'
+        if inprot_key:
+            msg += f'（{port} 已开启 RTCM3 输入）'
+        return True, msg, data
 
     def set_mode_memory_only(self, mode):
         """只改 RAM 层切模式（不碰 Flash）。F9P 支持，见 set_mode 的 persist=False。"""
@@ -1154,11 +1264,26 @@ class ZEDF9PDriver(BaseDriver):
         active = bool(raw[37])
 
         def _combine(main, hp):
-            return (main + hp / 10000.0) / 100.0
+            # 与 `get_fixed_ecef()` / `get_svin_config()` 完全同一条单位链：
+            # NAV-SVIN 的 meanX/Y/Z 是 **cm**（I4），meanXHP/YHP/ZHP 是
+            # **0.1mm** 的高精度小数段（I1，有符号）。
+            #   1 cm = 100 × 0.1mm   ← 是 100，不是 10000
+            # 所以先把 HP 段 /100 折算成 cm，与主段相加，再整体 /100 换成米。
+            #
+            # 早期这里写成 `(main + hp / 10000.0) / 100.0`：HP 段被多除了一次 100，
+            # 折合贡献从最大 12.7mm 缩到 0.127mm，坐标最多偏 1.27cm。
+            # 偏差小到"看起来很正常"，而基站坐标一旦被流程层固化就再也纠不回来。
+            return (main + hp / 100.0) / 100.0
 
         data = {
             'duration_s': dur,
             'obs': obs,
+            # **单位已核实**：NAV-SVIN.meanAcc 是 `U4`，原始值单位 **0.1mm**
+            # （不是 mm）。有报告曾怀疑这里多乘了一个 0.1，核对结论是
+            # **不用改**：真机无天线时原始值 0xE8D4A510 × 0.1mm = 94868.3264m，
+            # 量级正好对上"溢出垃圾值"；若按 mm 解释会变成 948683m（约 950km），
+            # 明显不合理。测试 `test_survey_status_provides_flow_field_names`
+            # 用 25 → 2.5mm 也钉住了这条。
             'mean_acc_mm': mean_acc * 0.1,
             # **流程层契约（第三个同类坑）**：`_step_svin_wait()` 的收敛判定、
             # 进度文案、以及落库字段全读 `mean_acc`（口径是**米**），
@@ -1359,6 +1484,10 @@ class ZEDF9PDriver(BaseDriver):
         # 探测会被淹没；等真正要用端口的动作（set_message_rate / silence_outputs）
         # 发生时再探，那时流已经稳定。
         self._port = None
+        # 上一次 `set_mode()` 写下去的模式（TMODE 枚举值）。None = 本次会话还没切过。
+        # `check_running_config()` 靠它决定重启后核哪些运行态键：
+        # 流动站核差分输入协议，基站核坐标与 RTCM 播发。
+        self._last_mode = None
 
     # ==================== 端口识别 ====================
     def _port_from_name(self, port_name=None):
@@ -1507,34 +1636,44 @@ class ZEDF9PDriver(BaseDriver):
             line = self.channel.read_line(min(0.25, max(0.05, deadline - time.time())))
             if line is not None:
                 self.channel.absorb(line)
+            # 查询类等待循环也要喂心跳：模块不应答时这里会干等 1.5~2 秒，
+            # 多个查询叠起来就是几十秒无心跳，看门狗会把租约杀掉。
+            if self.channel.on_beat is not None:
+                try:
+                    self.channel.on_beat()
+                except Exception:
+                    pass
             raw = self.channel.ubx_last(cls, mid)
             if raw is not None:
                 return raw
         return None
 
     def _port_key(self, bare_key, port=None):
-        """给裸键名加端口后缀。RTCM 键**没有端口维度**（RTCM 只从指定口出，
-        且键表里只有一组），原样返回。
+        """给裸键名加端口后缀，得到该端口上真正要写的键名。
 
         `bare_key` 形如 `NAVOUT_NAV_PVT` / `NMEAMOUT_GGA` / `RXMOUT_RXM_RAWX` /
-        `RTCM_1005`。返回 `NAVOUT_NAV_PVT_UART1` / `NAVOUT_NAV_PVT_USB` 这样
+        `RTCM_1005`，返回 `NAVOUT_NAV_PVT_UART1` / `RTCM_1005_USB` 这样
         **带完整端口后缀**的名字。
+
+        **RTCM 也必须按端口选**（早期版本在这里直接原样返回，是错的）。
+        RTCM 的 MSGOUT 键和 NAV/RXM/NMEA 一样，五端口各一个 ID。
+        F9P 模块上的 USB 是 CDC 复合口（VID:PID=1546:01A9），配置命令与
+        RTCM 数据走同一个 USB 端点；现场绝大多数部署是「PC → USB 线 → F9P，
+        NTRIP caster 也从这条链路取 RTCM」。此时写 `RTCM_1005`（= UART1 那份）
+        模块照样回 ACK，但 USB 口上一个 RTCM 字节都不会出现 ——
+        和当年「写 UART1 键关不掉 USB 上的 NAV-PVT」是同一个病。
 
         **UART1 的后缀是 `_UART1`，不是空串**。旧实现把 UART1 映射成空串，
         靠键表里那些"裸名"记录兜着 —— 但裸名只是 UART1 的兼容别名，
-        一旦键表按端口重新登记（2026-11 的改动），空串就会拼出查不到的名字，
+        一旦键表按端口重新登记，空串就会拼出查不到的名字，
         `silence_outputs()` 于是静默跳过，症状又是"关不掉输出"。
         宁可多打五个字符，也不要一个隐式约定。
         """
         if port is None:
             port, _msg, _data = self.detect_port()
-        if bare_key.startswith('RTCM_'):
-            return bare_key
-        suffix = PORT_SUFFIX.get(port)
-        if suffix is None:
+        if port not in PORT_SUFFIX:
             raise DriverBug(f'不认识的端口 {port!r}，可选 {sorted(PORT_SUFFIX)}')
-        # NAVOUT_ / NMEAMOUT_ / RXMOUT_ 三组一律拼后缀，规则完全相同
-        for prefix in ('NAVOUT_', 'NMEAMOUT_', 'RXMOUT_'):
+        for prefix in ('NAVOUT_', 'NMEAMOUT_', 'RXMOUT_', 'RTCM_'):
             if bare_key.startswith(prefix):
                 return f'{prefix}{bare_key[len(prefix):]}_{port}'
         return bare_key
@@ -1930,15 +2069,19 @@ class ZEDF9PDriver(BaseDriver):
 
         返回的 `msm_type` / `enabled` 是流程层判断"配没配对"的依据，
         键名要和 Quectel 驱动保持一致，否则 writer 里就得出型号分支。
+
+        **按真实链路端口回读**：RTCM 的 MSGOUT 键分五个端口，走 USB CDC 时
+        查 `RTCM_1005`（= UART1 那份）永远读到 0，于是"明明配了却报未开启"。
         """
-        names = [f'RTCM_{num}' for num in K.RTCM_OUT]
+        port, _msg, _pdata = self.detect_port()
+        names = [self._port_key(f'RTCM_{num}', port) for num in K.RTCM_OUT]
         values, layer = self._valget(names)
         if not values:
             return False, '读取 RTCM 配置失败（无 VALGET 应答）', {'error': 'timeout'}
 
         enabled = {}
         for num in K.RTCM_OUT:
-            rate = int(values.get(f'RTCM_{num}', 0) or 0)
+            rate = int(values.get(self._port_key(f'RTCM_{num}', port), 0) or 0)
             if rate > 0:
                 enabled[num] = rate
         obs = [n for n in enabled if n in OBSERVATION_RTCM]
@@ -1951,6 +2094,7 @@ class ZEDF9PDriver(BaseDriver):
             'rates': {str(k): v for k, v in enabled.items()},
             'msm_type': msm_type,
             'layer': layer,
+            'port': port,
             'problems': problems,
             # 给前端展示用的一句话
             'summary': ('开启：' + '、'.join(str(n) for n in sorted(enabled))
@@ -1971,6 +2115,11 @@ class ZEDF9PDriver(BaseDriver):
         按手册推荐组合一次配齐：
             1005 + 各星座 MSM + 1230
         `constellations` 可传入要开的星座子集（默认全开）。
+
+        **RTCM 的 MSGOUT 键是分端口的**：本方法按 `detect_port()` 探到的
+        真实链路端口（USB CDC 或 UART1）选键。写错端口时模块回 ACK，
+        但物理口一个 RTCM 字节都不出 —— 现场表现为"基站配好了但移动站
+        永远浮点"。`port=` 显式传入可跳过探测（诊断/演练用）。
         """
         try:
             tier = int(msm_type)
@@ -1979,6 +2128,18 @@ class ZEDF9PDriver(BaseDriver):
         if tier not in (4, 7):
             return False, f'F9P 只支持 MSM4 或 MSM7（收到 MSM{tier}）', {
                 'error': 'bad_msm', 'msm_type': msm_type}
+
+        port = kwargs.get('port')
+        if port is None:
+            port, _msg, _data = self.detect_port()
+        if port not in PORT_SUFFIX:
+            return False, f'不认识的端口 {port!r}', {'error': 'bad_port'}
+        # 键表必须真的有这个端口的 RTCM 键，否则说明端口名和键表脱节了。
+        missing = [n for n in list(OBSERVATION_RTCM) + [1005, 1230]
+                   if K.lookup_rtcm(n, port) is None]
+        if missing:
+            return False, (f'{port} 端口缺少 RTCM 键：{missing}'), {
+                'error': 'no_keys', 'port': port, 'missing': missing}
 
         wanted = kwargs.get('constellations') or MSM_CONSTELLATIONS
         wanted = [str(c).upper() for c in wanted]
@@ -2012,11 +2173,15 @@ class ZEDF9PDriver(BaseDriver):
 
         # 先把没被选中的观测报文显式关掉，再开新的。
         # 不关的话 MSM4/MSM7 会混在一起 —— VALSET 是"写值"不是"覆盖整组"。
+        #
+        # **键名必须带真实链路端口**：RTCM 的 MSGOUT 键分五个端口，走 USB CDC
+        # （COM12 / ttyACMx）时写 `RTCM_1005`（= UART1 那份）会 ACK 但不出数据。
+        # `_port_key()` 会按 `detect_port()` 的结果拼后缀。
         items = []
         for num in OBSERVATION_RTCM:
-            items.append((f'RTCM_{num}', plan.get(num, 0)))
+            items.append((self._port_key(f'RTCM_{num}', port), plan.get(num, 0)))
         for num in (1005, 1230):
-            items.append((f'RTCM_{num}', 1))
+            items.append((self._port_key(f'RTCM_{num}', port), 1))
         # 4072.0/4072.1 **不在这里写 0**：本固件没有对应的配置键
         # （真机 VALGET 静默不回），带进 VALSET 有可能让整条配置被无视。
         # 详见 ubx_keys.UNSUPPORTED_RTCM。
@@ -2027,8 +2192,8 @@ class ZEDF9PDriver(BaseDriver):
             return False, f'配置 RTCM 输出失败（{message}）', {
                 'error': 'nak' if message == 'NAK' else 'timeout'}
         data.update({'msm_type': tier, 'plan': {str(k): v for k, v in plan.items()},
-                     'constellations': wanted})
-        return True, (f'已配置 MSM{tier}：' +
+                     'constellations': wanted, 'port': port})
+        return True, (f'已配置 MSM{tier}（{port} 端口）：' +
                       '、'.join(str(n) for n in sorted(plan))), data
 
     def restore_rtcm_config(self, fields):
@@ -2205,7 +2370,7 @@ class ZEDF9PDriver(BaseDriver):
         return True, '配置已固化到 Flash', {'save_mask': hex(save_mask),
                                          'device_mask': hex(K.CFG_CFG_DEV_BBR_FLASH)}
 
-    def read_persisted(self, key_names=None):
+    def read_persisted(self, key_names=None, layer=None):
         """读 Flash 层的配置（poll 层 2），用来证明"真的落盘了"。
 
         ## 为什么不能只读 RAM
@@ -2220,11 +2385,65 @@ class ZEDF9PDriver(BaseDriver):
         或 `K.POLL_LAYER_DEFAULT`（读默认值，用于确认"这个键出厂是多少"）。
 
         返回 `(values, layer)`，与 `_valget` 一致；读不到时 `values` 为空 dict。
-        `key_names=None` 表示读 `CAPS` 里声明的那批常用键（`PERSIST_CHECK_KEYS`）。
+        `key_names=None` 表示读 `PERSIST_CHECK_KEYS`（核心档）。
+
+        `layer=None` 取 Flash；显式传 `K.POLL_LAYER_RAM` 可以拿来读运行态
+        （真机自测里用它对照"Flash 里存的"与"当前跑的"是否是同一个值）。
         """
         if key_names is None:
             key_names = self.PERSIST_CHECK_KEYS
-        return self._valget(list(key_names), layer=K.POLL_LAYER_FLASH)
+        if layer is None:
+            layer = K.POLL_LAYER_FLASH
+        # 去重保序：调用方可能把核心档和扩展档拼起来传进来
+        return self._valget(list(dict.fromkeys(key_names)), layer=layer)
+
+    def check_running_config(self, keys=None):
+        """重启后核对**运行态（RAM 层）**，返回 `(ok, message, data)`。
+
+        ## 为什么这条不能省 —— 它和 `verify_persisted()` 是两件事
+
+            `verify_persisted()`  重启**前**读 Flash  → 证明"写进去了"
+            本方法                重启**后**读 RAM    → 证明"重启跑的就是它"
+
+        只有前者时有个盲区：Flash 里是对的，但重启时模块可能因为
+        别的因素没加载（配置被 VALDEL、BBR 里有更高优先级的残留、
+        `CFG-SEC-CFG_LOCK` 锁了、或者用户其实按了恢复出厂）。
+        两个都过，才称得上"掉电后仍然生效"。
+
+        ## 和流程层 `_step_verify_mode()` 的分工
+
+        流程层在重启后已经用 `get_mode()` / `get_svin_config()` 核过
+        `TMODE_MODE` 和坐标（那两个方法走 `_valget` 默认的 RAM 层，本来就
+        是运行态）。本方法**不重复核这些**，只补它没管的部分：
+        差分输入协议到底开没开（流动站最容易漏的一项）。
+        传 `keys=` 可以显式指定要核哪些键，此时按传入的核。
+
+        只读 RAM，**不读 Flash** —— Flash 那一半是 `verify_persisted()` 的事，
+        两边混在一起，报告里就分不清"没写进去"和"没加载上"。
+        """
+        names = list(keys) if keys else (
+            list(self.ROVER_RAM_CHECK_KEYS) if self._last_mode_is_rover()
+            else list(self.PERSIST_CHECK_KEYS))
+        values, layer = self._valget(names)
+        if not values:
+            return False, '重启后读不到运行态配置（无 VALGET 应答）', {
+                'error': 'timeout', 'layer': layer}
+
+        data = {'layer': layer, 'read': dict(values), 'missing': [], 'unexpected': {}}
+        # 差分输入协议：流动站至少要有一条是开的，两条全 0 就是"收不到差分"。
+        # 只报"全都没开" —— 某个口没开是正常的（另一个口开着就够）。
+        inprot = {k: values.get(k) for k in self.ROVER_RAM_CHECK_KEYS if k in values}
+        if inprot:
+            data['inprot'] = inprot
+            if not any(inprot.values()):
+                data['unexpected'] = {k: {'want': 1, 'got': 0} for k in inprot}
+                return False, ('重启后 ' + '、'.join(inprot) +
+                               ' 全为 0：移动站收不到 RTCM3 差分'), data
+        return True, f'重启后运行态读到 {len(values)} 个键', data
+
+    def _last_mode_is_rover(self):
+        """上一次 `set_mode` 写的是不是流动站。"""
+        return getattr(self, '_last_mode', None) == MODE_DISABLED
 
     def verify_persisted(self, expected=None):
         """确认配置在 Flash 层与预期一致，返回 `(ok, message, data)`。
@@ -2232,11 +2451,20 @@ class ZEDF9PDriver(BaseDriver):
         `expected` 是 `{键名: 期望物理值}`；不给就用 `read_persisted()` 的返回值
         做一次"能读到就算过"的检查（这种情况只证明 Flash 里有值，不证明值对不对）。
 
+        **给了 `expected` 时也读扩展档**：调用方显式传了期望值的键一定是这次
+        真写过的（比如改过波特率），只读核心档会把它们当成"Flash 里没有"报错。
+
         比较**按键逐个比，不按整表比** —— 模块会对没写过的键回默认值，
         整表比会把"这个键本来就是默认值"误判成失败。
         浮点值按 1e-6 相对误差比，避免 1.2 与 1.1999999 互相判错。
         """
-        values, layer = self.read_persisted(list(expected) if expected else None)
+        if expected:
+            # 核心档 ∪ 调用方给的键 —— 扩展档里的键（波特率/协议开关）
+            # 平时不必查，但调用方既然传了期望值，就说明这次真写过。
+            names = list(dict.fromkeys(list(expected) + list(self.PERSIST_CHECK_KEYS)))
+        else:
+            names = None
+        values, layer = self.read_persisted(names)
         if not values:
             return False, '读不到 Flash 层配置（无 VALGET 应答）', {
                 'error': 'timeout', 'layer': layer}
@@ -2277,14 +2505,25 @@ class ZEDF9PDriver(BaseDriver):
 
         ## 两个必须提醒调用方的后果
 
-        1. **波特率会回到 38400**。如果当前跑在别的档位，下发完这条命令
-           就再也收不到模块的回话了 —— 所以本方法先 `_send_ubx` 再
-           主动把通道波特率改回 `DEFAULT_BAUD`。
+        1. **波特率会回到 38400**（`clear_flash=True` 时）。如果当前跑在别的档位，
+           下发完这条命令就再也收不到模块的回话了 —— 所以本方法先 `_send_ubx`，
+           再主动把通道波特率改回 `DEFAULT_BAUD`。
+           `clear_flash=False` 时**不切**：那种情况下模块重载的是 Flash 里
+           仍在的老配置，速率大概率没变，硬切到 38400 等于主动把一条好好的链路
+           切乱。该场景改为"先按当前速率探一次，探不到才退回默认档"，
+           结果记在 `data['baud_source']`（`unchanged` / `fallback_default`）。
         2. **Survey-in / 定点坐标全部丢失**。基准站标定场景里这是"从零开始"，
            流程层如果只是想把配置存盘，应该用 `save()` 而不是这个方法。
 
-        `clear_flash=False` 时不清 Flash，只把 RAM/BBR 恢复默认 ——
-        用于"配置改坏了，先回到能动起来的状态，但保留 Flash 里的老配置"。
+        ## 时序（为什么 sleep 0.3 s）
+
+        `loadMask` 是**立即生效**的，不等重启。模块处理完这条 CFG-CFG 的
+        ACK 之后就已经在新配置下工作了，所以 ACK 一到就得切 host 波特率。
+        中间的 0.3 s 是留模块把 ACK 尾巴发完、内部装载完 ——
+        这段时间里 host 若还在读，可能丢 1~2 字节，但不会影响后续通讯。
+
+        `reboot_after=True` 时再发 CFG-RST。此时模块和 host 已经对齐在
+        同一个速率上，重启命令能正常收到。
         """
         device = K.CFG_CFG_DEV_BBR | (K.CFG_CFG_DEV_FLASH if clear_flash else 0)
         # 载荷是 13 字节：clearMask(4) saveMask(4) loadMask(4) deviceMask(1)。
@@ -2304,58 +2543,185 @@ class ZEDF9PDriver(BaseDriver):
             data['error'] = 'nak' if message == 'NAK' else 'timeout'
             return False, f'恢复出厂设置失败（{message}）', data
 
-        # 复位后波特率回默认档，本端口必须跟着切，否则后面全是乱码
+        # 波特率回默认档 —— 但**只在真的清了 Flash/BBR 之后**才必然如此。
+        #
+        # CFG-CFG 的 `loadMask` 是"从**持久存储**重载默认值"，它立即生效
+        # （不等重启）。所以 `clear_flash=True` 时，模块在这条命令 ACK 的
+        # 那一刻就已经跑在 38400 上了，host 必须跟着切，否则后面全是乱码。
+        #
+        # `clear_flash=False` 时清的是 RAM/BBR、Flash 里的用户配置**还在**，
+        # 重载回来的就是 Flash 里那份（可能仍是 115200）。这种情况下
+        # 仍然切到 38400 是错的 —— 会主动把一条好好的链路切成乱码。
+        # 该场景按"先探一次再说"处理：只有在探测不到才退回默认档。
         time.sleep(0.3)
-        if self.channel.baud != self.DEFAULT_BAUD:
-            try:
-                self.channel.baud = self.DEFAULT_BAUD
-                if self.channel.is_open:
-                    self.channel._serial.baudrate = self.DEFAULT_BAUD
-            except Exception as e:                          # noqa: BLE001
-                logging.debug(f'恢复出厂后切波特率失败（忽略）：{e}')
-        data['baud'] = self.channel.baud
+        if clear_flash:
+            self._switch_baud(self.DEFAULT_BAUD, reason='恢复出厂（清 Flash）')
+            data['baud'] = self.channel.baud
+            data['baud_source'] = 'default'
+        else:
+            # 不清 Flash：模块重载的是 Flash 里的老配置，速率大概率没变。
+            # 先按当前速率问一句，答得上就保持不动；答不上说明它确实变了。
+            ok_probe, _m, _d = self.detect()
+            if ok_probe:
+                data['baud'] = self.channel.baud
+                data['baud_source'] = 'unchanged'
+            else:
+                self._switch_baud(self.DEFAULT_BAUD, reason='恢复出厂（探不到，退回默认档）')
+                data['baud'] = self.channel.baud
+                data['baud_source'] = 'fallback_default'
 
         if reboot_after:
             # CFG-CFG 的清除动作在模块重启后才真正生效
-            r_ok, r_msg = self.reboot()
+            r_ok, r_msg, r_data = self.reboot()
             data['reboot'] = r_msg
+            if r_data:
+                data['reboot_data'] = r_data
             if not r_ok:
                 data['error'] = 'reboot_incomplete'
                 return False, f'配置已清除，但重启未确认（{r_msg}）', data
         return True, '已恢复出厂设置', data
 
-    def reboot(self):
-        """软重启（UBX-CFG-RST）。
+    def _switch_baud(self, baud, reason=''):
+        """把 host 侧通道切到 `baud`（模块侧由它自己的配置决定）。
 
-        载荷：`navBbrMask(2) | resetMode(1)`。
-        `0x0000` = 不清 BBR（保留配置），`0x02` = controlled software reset。
-        **故意不用 0xFFFF**：那会清掉全部配置，等于恢复出厂 —— 标定场景绝不能这样。
-
-        重启命令不回 ACK（模块直接复位），所以 `wait_ack=False`。
+        包一层是为了把"改不成功也不该中断流程"这件事集中在一个地方：
+        `_serial.baudrate` 在某些 USB 转串口驱动上会抛，
+        而这时正确做法是继续走、让后面的 MON-VER 探测去暴露真问题。
         """
-        payload = struct.pack('<HB', 0x0000, 0x02)
+        try:
+            self.channel.baud = int(baud)
+            if self.channel.is_open:
+                self.channel._serial.baudrate = int(baud)
+        except Exception as e:                              # noqa: BLE001
+            logging.debug(f'切换波特率到 {baud} 失败（{reason}，忽略）：{e}')
+
+    def reboot(self, verify=True):
+        """软重启（UBX-CFG-RST），并**确认回来的还是那块 F9P**。
+
+        ## 载荷是 4 字节，不是 3 字节
+
+        `navBbrMask(2) | resetMode(1) | reserved0(1)`（UBX-18010802 §UBX-CFG-RST）。
+        早期写成 `struct.pack('<HB', ...)` 只发 3 字节 —— 模块通常容忍短载荷
+        （缺的 byte 按 0 处理），现场也能重启，但严格按协议不对，
+        而且一旦某个固件版本改成严格校验就会变成一条静默失败的重启。
+
+        `navBbrMask = 0x0000`（热启动，**不清 BBR**）。
+        绝不能给 0xFFFF：那是冷启动，会清掉全部星历/历书/位置，
+        标定场景里等于把"清 BBR"干了一遍，重启后要重新收敛几十秒。
+
+        ## `resetMode` 必须是 0x01，不能是 0x02
+
+        枚举见 `RESET_MODE_CONTROLLED_SOFTWARE` 的注释。关键差别：
+
+            0x01 受控软件复位            → 清 RAM、**重载配置**
+            0x02 受控软件复位（仅 GNSS） → 只重启 GNSS 任务、**不重载配置**
+
+        标定流程在这一步之后要验证"配置落盘了、重启后还在"。用 0x02 重启，
+        RAM 根本没被重新加载，验证随即变成自证 —— 哪怕 Flash 一个字节没写进去，
+        重启后读 RAM 也照样全对。所以这里用 0x01。
+
+        ## 为什么不能只看"串口上有数据回来"
+
+        早先的实现等 8 秒，只要冒出来任何一行字节就报"重启完成"。这有三个漏洞：
+
+        1. **分不清是谁在说话**。USB 转串口的适配器空转、上位机别的程序回显、
+           或者模块进了 safe boot（9600 baud 而 host 在 38400，收到的是乱码）
+           —— 这些都会让 `read_line()` 返回非 None。乱码被当成"开机首帧"，
+               驱动报成功，实际模块压根没起来。
+        2. **分不清是重启后还是重启前**。`before` 计数只比较 UBX 帧数增量，
+           而重启瞬间缓冲里可能还压着重启前的旧帧。
+        3. **不验证波特率**。配置里改过 `UART1_BAUDRATE` 的话，
+           "能收到数据"根本不能证明 host 的波特率和模块对上了。
+
+        所以现在等的是**一条 MON-VER 查询的应答**：主动发一帧、拿到载荷、
+        解析出 `F9P` 才算数。这同时把上面三件事一起证了 ——
+        帧校验能过说明波特率和帧格式都对，载荷里有 `F9P` 说明是同一块板。
+
+        `verify=False` 退回"看到任何字节就算起来"的老判据（模块忙、
+        或本来就指望它不回话时用），并在 `data['verify']` 里如实标注 `'loose'`。
+        """
+        payload = struct.pack('<HBB', 0x0000,
+                              self.RESET_MODE_CONTROLLED_SOFTWARE, 0x00)
         before = dict(self.channel.counters)
         ok, message = self._send_ubx(*K.MSG_CFG_RST, payload, wait_ack=False)
+        if not ok:
+            # CFG-RST 不回 ACK 是正常的，但 `_send_ubx` 在 wait_ack=False 下
+            # 仍可能因写失败而回 False（串口断了）。
+            return False, f'重启命令没有发出去（{message}）', {
+                'error': 'send_failed', 'reset_mode': self.RESET_MODE_CONTROLLED_SOFTWARE}
+
+        data = {'reset_mode': self.RESET_MODE_CONTROLLED_SOFTWARE,
+                'nav_bbr_mask': 0x0000}
         # 重启后模块会静默几百毫秒再恢复输出
         self.channel.reopen(delay=0.8)
-        deadline = time.time() + 8.0
-        found = False
+
+        if not verify:
+            found = self._wait_any_traffic(before, timeout=8.0)
+            data.update({'verify': 'loose', 'boot_frame': found})
+            if not found:
+                silent = ((self.channel.counters.get('lines', 0)
+                           - before.get('lines', 0)) <= 0)
+                data.update({'error': 'no_boot_frame', 'silent': silent})
+                return False, ('重启后串口完全静默，模块可能没有重启' if silent
+                               else '重启完成（未抓到首帧，按串口恢复输出判定）'), data
+            return True, '重启完成（未核验身份）', data
+
+        # 正式判据：等到一条能解析出 F9P 的 MON-VER
+        outcome = self._wait_identity(after=before, timeout=8.0)
+        data.update(outcome['data'])
+        if not outcome['ok']:
+            return False, outcome['message'], data
+        return True, outcome['message'], data
+
+    def _wait_any_traffic(self, before, timeout=8.0):
+        """等串口上出现任何字节/UBX 帧（宽松判据，只给 `verify=False` 用）。"""
+        deadline = time.time() + float(timeout)
         while time.time() < deadline:
             line = self.channel.read_line(0.5)
             if line is not None:
                 self.channel.absorb(line)
-                found = True
-                break
+                return True
             if (self.channel.counters.get('ubx', 0)
                     - before.get('ubx', 0)) > 0:
-                found = True
-                break
-        if not found:
-            silent = (self.channel.counters.get('lines', 0) - before.get('lines', 0)) <= 0
-            return False, ('重启后串口完全静默，模块可能没有重启' if silent
-                           else '重启完成（未抓到首帧，按串口恢复输出判定）'), {
-                'error': 'no_boot_frame', 'silent': silent}
-        return True, '重启完成', {'raw': '', 'boot_frame': found}
+                return True
+        return False
+
+    def _wait_identity(self, after=None, timeout=8.0):
+        """反复问 MON-VER 直到模块答出 F9P，返回 `dict(ok, message, data)`。
+
+        在 `timeout` 内**重试查询**（而不是发一次就死等）：模块刚上电时
+        可能还在跑自检、暂时不回 MON-VER，重发是安全的（查询幂等）。
+        每轮之间留一点间隔，避免把还没醒的模块刷爆。
+        """
+        after = dict(after or {})
+        deadline = time.time() + float(timeout)
+        attempts = 0
+        last = ''
+        while time.time() < deadline:
+            attempts += 1
+            ok, message, info = self.detect()
+            if ok:
+                return {'ok': True, 'message': f'重启完成，{message}',
+                        'data': {'verify': 'mon_ver', 'attempts': attempts,
+                                 'ident': info}}
+            last = message
+            # 这一轮已经消费到的字节数变化说明模块在说话，值得马上再问一次；
+            # 完全静默则多等一会儿，别把超时预算耗在无意义的连发上。
+            grew = (self.channel.counters.get('lines', 0)
+                    - after.get('lines', 0)) > 0
+            if not grew:
+                time.sleep(0.3)
+        silent = ((self.channel.counters.get('lines', 0) - after.get('lines', 0)) <= 0
+                  and (self.channel.counters.get('ubx', 0) - after.get('ubx', 0)) <= 0)
+        return {
+            'ok': False,
+            'message': ('重启后问不到 MON-VER（串口完全静默，模块可能没有重启）'
+                        if silent else
+                        f'重启后有数据但认不出 F9P（{last}）：'
+                        f'可能是波特率不匹配或模块进了 safe boot'),
+            'data': {'verify': 'mon_ver', 'attempts': attempts,
+                     'silent': silent, 'error': 'no_identity'},
+        }
 
     # ==================== 天线 ====================
     def read_antenna_info(self):

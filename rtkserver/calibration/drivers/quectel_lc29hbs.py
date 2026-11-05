@@ -336,7 +336,14 @@ class LC29HBSDriver(BaseDriver):
         data['build_date'] = fields[1] if len(fields) > 1 else None
         data['build_time'] = fields[2] if len(fields) > 2 else None
         data['model'] = self.DISPLAY_NAME
+        data['display_name'] = self.DISPLAY_NAME
         data['model_key'] = self.MODEL_KEY
+        # 本型号文档没有 PQTMSN / PQTMUNIQID 命令，SN/唯一ID 留空并标注来源，
+        # service.py 前端能区分"读不到"和"不支持"。
+        data['sn'] = ''
+        data['sn_source'] = ''
+        data['uniq_id'] = ''
+        data['caps'] = dict(self.runtime_caps)
 
         ok, _msg, svin = self.get_svin_config()
         if ok and svin:

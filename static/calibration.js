@@ -1463,12 +1463,12 @@
   // 让用户点了才弹"请先等它结束"，是最容易被当成"程序卡了"的交互。
   //
   // 禁用清单：
-  //   扫描在跑 → 锁「读取模块信息」「重新读取」；
+  //   扫描在跑 → 锁「读取模块信息」；
   //   读取模块信息在跑 → 锁「扫描串口」。
   // 「开始标定」不在这里锁：它由 status 轮询里的 setFormLocked() 管，
   // 两条线都结束后自然会放开，这里再插一手会和轮询打架。
   var BUSY_IDS = {
-    scan: ['cal-detect', 'cal-rescan'],
+    scan: ['cal-detect'],
     detect: ['cal-scan']
   };
 
@@ -1989,7 +1989,7 @@
     var ids = ['cal-port', 'cal-baud', 'cal-module', 'cal-cors-host', 'cal-cors-port',
       'cal-cors-user', 'cal-cors-password', 'cal-cors-mount', 'cal-duration',
       'cal-svin-profile', 'cal-fix-timeout', 'cal-load-mounts', 'cal-on-slow',
-      'cal-coord-msg', 'cal-msm', 'cal-svin-resume', 'cal-scan', 'cal-rescan',
+      'cal-coord-msg', 'cal-msm', 'cal-svin-resume', 'cal-scan',
       'cal-detect', 'cal-start', 'cal-goto-measure'];
     ids.forEach(function (id) {
       var el = $(id);
@@ -2306,7 +2306,6 @@
       if (panel) panel.classList.add('is-hidden');
     });
     bindScanTable();
-    on($('cal-rescan'), 'click', function () { loadOptions(); });
     on($('cal-load-mounts'), 'click', loadMountpoints);
     on($('cal-module'), 'change', function () {
       applyCapabilities();

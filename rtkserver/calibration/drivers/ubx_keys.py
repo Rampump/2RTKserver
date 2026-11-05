@@ -168,20 +168,63 @@ INPROT = {
 #   1) 所有观测报文必须同速率；2) 不可混用 MSM4 与 MSM7；
 #   3) 必须含 1230 或 1033，否则 GLONASS 只能浮点解；
 #   4) 同一星座只能开一种观测报文。
-RTCM_OUT = {
-    1005:  (0x209102BE, U1, 1.0, '基站坐标（必需）'),
-    1074:  (0x209102CC, U1, 1.0, 'GPS MSM4'),
-    1077:  (0x209102CD, U1, 1.0, 'GPS MSM7'),
-    1084:  (0x209102D1, U1, 1.0, 'GLONASS MSM4'),
-    1087:  (0x209102D2, U1, 1.0, 'GLONASS MSM7'),
-    1094:  (0x20910318, U1, 1.0, 'Galileo MSM4'),
-    1097:  (0x20910319, U1, 1.0, 'Galileo MSM7'),
-    1124:  (0x209102D6, U1, 1.0, '北斗 MSM4'),
-    1127:  (0x209102D7, U1, 1.0, '北斗 MSM7'),
+#
+# **RTCM 的 MSGOUT 键也是分端口的**（这一点早期判断错了，代价很大）：
+# 每条 RTCM 报文在 I2C/UART1/UART2/USB/SPI 上各有一个键，ID 同样连续递增。
+# 所以这里按 `{报文号: (note, {port: id})}` 存全端口，和 `NAV_OUT_PORTS`
+# 是同一个套路；`RTCM_OUT` 只是它的 UART1 视图（老调用方的兼容入口）。
+#
+# 为什么必须这样做：F9P 模块上的 USB 是 **CDC 复合口**（VID:PID=1546:01A9），
+# 配置命令和 RTCM 数据走的是同一个 USB 端点。现场绝大多数部署就是
+# "PC → USB 线 → F9P，NTRIP caster 也从这条链路取 RTCM"。此时写
+# `..._UART1` 键模块**照样回 ACK**，但 USB 口上一字节 RTCM 都不会出现 ——
+# 和当初那次"关不掉 NAV-PVT"是完全同一种病。
+RTCM_OUT_PORTS = {
+    1005: ('基站坐标（必需）', {'I2C': 0x209102BD, 'UART1': 0x209102BE,
+                              'UART2': 0x209102BF, 'USB': 0x209102C0,
+                              'SPI': 0x209102C1}),
+    # 1074/1084/1094/1124 这四个 MSM4 曾经全部抄成 `1077/1087/1097/1127 的 I2C 键`
+    # （0x209102CC/0x209102D1/0x20910318/0x209102D6）。因为 ID 真实存在、
+    # 类型也是 U1，`_self_check()` 的 canonical 又只看报文号不看 ID 指向谁，
+    # 于是「默认 MSM4 配置」这条主路径上物理口一条观测报文都不播，
+    # 现场只能看到 1005，移动站永远进不了固定解。
+    1074: ('GPS MSM4', {'I2C': 0x2091035E, 'UART1': 0x2091035F,
+                       'UART2': 0x20910360, 'USB': 0x20910361,
+                       'SPI': 0x20910362}),
+    1077: ('GPS MSM7', {'I2C': 0x209102CC, 'UART1': 0x209102CD,
+                       'UART2': 0x209102CE, 'USB': 0x209102CF,
+                       'SPI': 0x209102D0}),
+    1084: ('GLONASS MSM4', {'I2C': 0x20910363, 'UART1': 0x20910364,
+                           'UART2': 0x20910365, 'USB': 0x20910366,
+                           'SPI': 0x20910367}),
+    1087: ('GLONASS MSM7', {'I2C': 0x209102D1, 'UART1': 0x209102D2,
+                           'UART2': 0x209102D3, 'USB': 0x209102D4,
+                           'SPI': 0x209102D5}),
+    1094: ('Galileo MSM4', {'I2C': 0x20910368, 'UART1': 0x20910369,
+                           'UART2': 0x2091036A, 'USB': 0x2091036B,
+                           'SPI': 0x2091036C}),
+    1097: ('Galileo MSM7', {'I2C': 0x20910318, 'UART1': 0x20910319,
+                           'UART2': 0x2091031A, 'USB': 0x2091031B,
+                           'SPI': 0x2091031C}),
+    1124: ('北斗 MSM4', {'I2C': 0x2091036D, 'UART1': 0x2091036E,
+                        'UART2': 0x2091036F, 'USB': 0x20910370,
+                        'SPI': 0x20910371}),
+    1127: ('北斗 MSM7', {'I2C': 0x209102D6, 'UART1': 0x209102D7,
+                        'UART2': 0x209102D8, 'USB': 0x209102D9,
+                        'SPI': 0x209102DA}),
     # 曾有 bug：写成 0x20910303，那是 _I2C 端口，比 UART1 小 1。
     # 于是"开了 1230"的 ACK 落在 I2C 上，UART1 上根本没有 GLONASS 码相位偏差，
     # 现场表现为 RTK 一直浮点、怎么调星座都没用。
-    1230:  (0x20910304, U1, 1.0, 'GLONASS 码相位偏差（必需）'),
+    1230: ('GLONASS 码相位偏差（必需）', {'I2C': 0x20910303, 'UART1': 0x20910304,
+                                        'UART2': 0x20910305, 'USB': 0x20910306,
+                                        'SPI': 0x20910307}),
+}
+
+# UART1 视图：`ALL_KEYS` 与老调用方（`RTCM_1005` 这样的裸名）都用它。
+# **新代码请走 `lookup_rtcm(num, port)` 取端口维度的 ID。**
+RTCM_OUT = {
+    num: (ids['UART1'], U1, 1.0, f'{note}（UART1 视图，见 RTCM_OUT_PORTS）')
+    for num, (note, ids) in RTCM_OUT_PORTS.items() if ids.get('UART1')
 }
 
 # 这些键存在、也 ACK，但 F9P 不会因此输出报文（只支持输入）。
@@ -523,6 +566,16 @@ for _prefix, _table, _np in (('NAVOUT_', NAV_OUT_PORTS, 'NAV_'),
     for _name, _key_id in _msgout_port_names(_prefix, _table, _np).items():
         ALL_KEYS[_name] = (_key_id, U1, 1.0, 'MSGOUT 输出速率（分端口键）')
 
+# RTCM 的端口维度登记：查找名形如 `RTCM_1005` / `RTCM_1005_UART1` /
+# `RTCM_1005_USB`。裸名 `RTCM_1005` 是 UART1 那份的兼容别名（与
+# `RTCM_OUT` 一致），带端口后缀的才是驱动实际写入时用的全部候选。
+# 把两套都登记进来，"键是否存在"就有唯一答案，不需要调用方猜端口命名。
+for _num, (_note, _ids) in RTCM_OUT_PORTS.items():
+    for _port, _key_id in _ids.items():
+        if _key_id:
+            ALL_KEYS[f'RTCM_{_num}_{_port}'] = (
+                _key_id, U1, 1.0, f'{_note}（{_port} 端口键）')
+
 
 # ==================== 输出键的端口归属 ====================
 # 这组 MSGOUT 键（NAV/NMEA/RXM 三族）是"整组快照 / 整组静音 / 整组还原"
@@ -531,7 +584,7 @@ for _prefix, _table, _np in (('NAVOUT_', NAV_OUT_PORTS, 'NAV_'),
 # 取决于端口命名约定（UART1 的后缀到底是空串还是 `_UART1`），
 # 改一次约定就要全库找一遍拼接点。现在键表自己说话，驱动只做 `lookup()` 复验。
 #
-# RTCM 键**不在这里**：它没有端口维度，由 `RTCM_OUT` 单独管，
+# RTCM 键**不在这里**：它由 `RTCM_OUT_PORTS` / `lookup_rtcm()` 单独管，
 # 也绝不能被静音逻辑碰到（关掉 1005 等于把基站掐死）。
 # 注意 `RXMOUT_RXM_RTCM_*` 是 **RXM 族里名为 RTCM 的 UBX 报文**
 # （周期播发的 RTCM 原始数据 UBX 封装），不是 RTCM3 播发开关 ——
@@ -566,6 +619,20 @@ def lookup_msgout(family, name, port):
     table = {'NAV': NAV_OUT_PORTS, 'RXM': RXM_OUT_PORTS, 'NMEA': NMEA_OUT_PORTS}[family]
     ids = table.get(name) or {}
     return ids.get(port)
+
+
+def lookup_rtcm(num, port):
+    """取某端口上某条 RTCM 报文的 MSGOUT 键 ID，取不到返回 None。
+
+    `num` 是报文号（1005 / 1074 / ... / 1230），`port` ∈ `OUTPUT_PORTS`。
+    RTCM 的 MSGOUT 键和 NAV/RXM/NMEA 一样分端口 —— 走 USB CDC 链路
+    （COM12 / ttyACMx）时必须取 `USB` 那一份，写 `UART1` 的键模块会 ACK
+    但 USB 口不出数据。见 `RTCM_OUT_PORTS` 的注释。
+    """
+    entry = RTCM_OUT_PORTS.get(num)
+    if entry is None:
+        return None
+    return entry[1].get(port)
 
 
 # ==================== UBX 消息号 ====================
@@ -697,6 +764,73 @@ def _self_check():
             f'键 ID 撞车（不同键共用一个 ID，写入必错一组）：{bad}'
             f'\n提示：MSGOUT 的端口偏移是 I2C→UART1→UART2→USB→SPI，'
             f'UART1 = I2C+1、USB = I2C+3。')
+    _self_check_msgout_ids()
+
+
+def _self_check_msgout_ids():
+    """自检「ID 的端口偏移与名字是否自洽」——专治抄错端口。
+
+    **为什么需要它**：`_self_check()` 的撞车检查只要求「不同 canonical 不共用
+    同一个 ID」，而把 `RTCM_1074` 抄成 1077 的 I2C 键时，ID 真实存在、canonical
+    也确实是 `1074`，于是撞车检查完全放行 —— 这正是当初 4 个 MSM4 全抄错
+    却能被导入期自检和 `test_matches_pyubx2_authoritative_table()` 双双放过
+    的原因。这里补上一条不依赖 pyubx2 的结构性约束：
+
+        **同一报文在五个端口上的 ID 是连续整数**：
+        `I2C, I2C+1, I2C+2, I2C+3, I2C+4`（对应 UART1/UART2/USB/SPI）。
+
+    注意**不能看 ID 的二进制低位**：每个报文的基址（I2C 那一份）本身
+    可奇可偶（1005 是 0x...BD 奇数，1077 是 0x...CC 偶数），低位没有意义。
+    正确的判据是以该组最小 ID（= I2C）为基准的相对偏移。
+    抄了别的端口的键 → 偏移不是 0..4；抄了别的**报文**的键 →
+    偏移重复或跨度不等于 4。
+    """
+    order = ('I2C', 'UART1', 'UART2', 'USB', 'SPI')
+    problems = []
+
+    def _check_group(label, ids):
+        present = {p: ids[p] for p in order if ids.get(p) is not None}
+        if not present:
+            return
+        base = min(present.values())
+        used = {}
+        for port, key_id in present.items():
+            off = key_id - base
+            if not (0 <= off <= 4):
+                problems.append(
+                    f'{label}_{port} 的 ID {key_id:#010x} 不在本组 5 连号范围内'
+                    f'（基址 {base:#010x}），很可能抄了别的报文的键')
+                continue
+            used.setdefault(off, []).append(port)
+        for off, ports in used.items():
+            if len(ports) > 1:
+                problems.append(
+                    f'{label} 的多个端口落到同一偏移 {off}：{ports}'
+                    f'（ID {[hex(present[p]) for p in ports]}）')
+        # 每个端口必须落在自己该在的偏移上：I2C=0, UART1=1, UART2=2, USB=3, SPI=4
+        want = {p: i for i, p in enumerate(order)}
+        for port in present:
+            if (present[port] - base) != want[port]:
+                problems.append(
+                    f'{label}_{port} 的偏移应为 {want[port]}，'
+                    f'实际 {(present[port] - base)}（ID {present[port]:#010x}，'
+                    f'基址 {base:#010x}）——端口抄错')
+
+    # ---- 1) RTCM 每条报文的五个端口 ----
+    for num, (_note, ids) in RTCM_OUT_PORTS.items():
+        _check_group(f'RTCM_{num}', ids)
+
+    # ---- 2) MSGOUT 三族 ----
+    for family, table in (('NAV', NAV_OUT_PORTS), ('RXM', RXM_OUT_PORTS),
+                          ('NMEA', NMEA_OUT_PORTS)):
+        for name, ids in table.items():
+            _check_group(f'{family}_{name}', ids)
+
+    if problems:
+        raise AssertionError(
+            '键表端口归属自检失败：\n  ' + '\n  '.join(problems) +
+            '\n提示：MSGOUT 键按 I2C→UART1→UART2→USB→SPI 连续编号，'
+            '写错端口时模块照样 ACK，但物理口纹丝不动。')
 
 
 _self_check()

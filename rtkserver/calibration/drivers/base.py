@@ -831,7 +831,14 @@ class Channel:
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     break
-                line = self.read_line(remaining)
+                line = self.read_line(min(remaining, 0.5))
+                # 每轮读都喂心跳：模块在吐无关数据时（F9P 吐 NAV-SVIN），
+                # classify 不会匹配应答，内层会一直循环直到 deadline。
+                if self.on_beat is not None:
+                    try:
+                        self.on_beat()
+                    except Exception:
+                        pass
                 if line is None:
                     break
                 kind = self.classify(line, name, body)
@@ -842,6 +849,14 @@ class Channel:
                 if kind == 'echo':
                     continue
                 self.absorb(line)                 # 无关输出：进缓存，不算应答
+            # 重试间隙喂心跳：NMEA 路径（Quectel）不等 UBX-ACK，
+            # 以前这里干等 timeout×retries 秒不喂心跳，自动识别时
+            # F9P 不答 NMEA 命令，多个驱动叠起来 30 秒无心跳被看门狗杀。
+            if self.on_beat is not None:
+                try:
+                    self.on_beat()
+                except Exception:
+                    pass
             if attempt < retries:
                 logging.debug(f'{name} 无应答，第 {attempt + 1} 次重试')
                 time.sleep(max(0.0, interval))
@@ -854,7 +869,12 @@ class Channel:
             remaining = deadline - time.time()
             if remaining <= 0:
                 return False, ''
-            line = self.read_line(remaining)
+            line = self.read_line(min(remaining, 0.5))
+            if self.on_beat is not None:
+                try:
+                    self.on_beat()
+                except Exception:
+                    pass
             if line is None:
                 return False, ''
             if message_name(line) == name.upper():
