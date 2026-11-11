@@ -1897,6 +1897,28 @@ class CoordinateWriter:
         # 为什么要在这里记、而不是在收尾时现读：下面马上就要一条条改成标定用的值，
         # 改完再读就只剩"我们写进去的"，那时已经无从知道用户原来是什么样。
         #
+        # ## ⚠️ 为什么**优先取备份快照**，而不是现场读（2026-11-11 真机实测纠正）
+        #
+        # 早先这里直接逐条 `get_message_rate()` 现场读。**那是错的**，因为
+        # 本函数跑在 `_step_cors_rover_setup` **之后** —— 那一步为了进流动站要
+        # `set_mode('rover', persist=True, restart=True)`，而 **LG290P 的固件在
+        # 切模式（SAVEPAR + 重启）时会把 NMEA 输出整表重置为固件默认值（全 1）**。
+        #
+        # 真机证据（同一块 LG290P03AANR01A03S，同一天线位置）：
+        #   标定前（base，未动过）           → GGA/GSA/GSV/GLL/VTG/RMC = 全 0
+        #   `set_mode('rover', persist=True, restart=True)` 之后 → **全 1**
+        #   而 `set_mode_memory_only('rover')`（不落盘不重启）→ 保持全 0
+        #   手动写 0 + SAVEPAR + 重启        → 保持 0（说明不是"重启丢配置"）
+        # 也就是说：**只有"切模式"这个动作会重置 NMEA**，且是固件行为、我们无法阻止。
+        #
+        # 于是在这里现场读，读到的是"模块刚重置出来的默认值"，不是用户原来的配置。
+        # 拿它去还原，效果就是：标定一次，用户的"全 0"被永久改成"全 1"
+        # —— 用户切回流动站后发现 GSV/GLL/VTG/RMC 全都莫名其妙在输出了。
+        #
+        # 备份快照（`self._backup`）是 BACKUP 阶段 `backup.capture()` 采的，
+        # 那时**还没切模式**，读到的才是用户真正的原始配置。所以有快照就用快照；
+        # 没有（只测不写 / 备份失败 / 老备份缺字段）才退回现场读，并如实告警。
+        #
         # 记录口径（三者刻意不同，别混）：
         #   · 原样记录（整数，含 0）：GGA/GSA 与 QUIET_NMEA —— 下一段会逐条 overwrite，
         #     所以读到什么就得记什么，读到 0 就是 0，还原也要还原成 0；
@@ -1904,19 +1926,32 @@ class CoordinateWriter:
         #     "没读到"≠"当时是 0"，按 0 下发会把一条本来开着的语句关掉；
         #   · 定位间隔单独记：`FIXRATE_SAFE_MS` 会把 1000 ms 改成 100 ms，
         #     这个改动同样会落盘，不还原就把用户的 1 Hz 永久改成 10 Hz 了。
-        orig_rates, orig_fix = {}, None
-        for name in RESTORE_NMEA:
-            ok0, _m0, d0 = self.driver.get_message_rate(name)
-            if not ok0:
-                orig_rates[name] = None
-                continue
-            fields = (d0 or {}).get('fields') or []
-            orig_rates[name] = _to_int(fields[-1]) if fields else None
+        snap_rates = ((self._backup or {}).get('rates') or {})
+        orig_rates, orig_fix, orig_source = {}, None, 'live'
+        if snap_rates:
+            orig_source = 'backup'
+            for name in RESTORE_NMEA:
+                # 快照里没有这条（老备份 / 该型号没这个字段）→ None，还原时跳过，
+                # **不要**退化成现场读：现场的值此刻已经被 set_mode 污染了。
+                orig_rates[name] = _to_int(snap_rates.get(name))
+            logging.info('NMEA 原值取自备份快照（BACKUP 阶段、切模式之前）：%s', orig_rates)
+        else:
+            logging.warning('没有可用的备份快照，NMEA 原值只能现场读取；'
+                            '若本型号切模式会重置 NMEA（如 LG290P），还原值可能不准')
+            for name in RESTORE_NMEA:
+                ok0, _m0, d0 = self.driver.get_message_rate(name)
+                if not ok0:
+                    orig_rates[name] = None
+                    continue
+                fields = (d0 or {}).get('fields') or []
+                orig_rates[name] = _to_int(fields[-1]) if fields else None
         try:
             okf, _mf, df = self.driver.get_fix_rate()
             if okf:
                 # 应答形如 `$PQTMCFGFIXRATE,OK,1000*XX` → fields=[...]；
                 # 拿最后一个纯数字字段（不写死下标：中间是否带 OK 由驱动层剥掉了）。
+                # 定位间隔**只能现场读**：`backup.RATE_TARGETS` 里没有它（它不是
+                # 报文速率，是定位节拍），且 `set_mode` 不会改它（真机实测 1000 不变）。
                 flds = (df or {}).get('fields') or []
                 for item in reversed(flds):
                     val = _to_int(item)
@@ -1926,7 +1961,8 @@ class CoordinateWriter:
         except Exception as e:                  # noqa: BLE001 - 读不到就按未知处理
             logging.info('读取原始定位间隔失败（收尾将按 %s ms 兜底）：%s',
                          FIXRATE_DEFAULT_MS, e)
-        self._nmea_orig = {'rates': orig_rates, 'fix_rate': orig_fix, 'configured': {}}
+        self._nmea_orig = {'rates': orig_rates, 'fix_rate': orig_fix,
+                           'configured': {}, 'source': orig_source}
 
         applied = {}
         for name in ('GGA', 'GSA'):
@@ -3448,9 +3484,9 @@ class CoordinateWriter:
         if self._caps('silence'):
             # 3.5a 静音**之前先刮一份完整快照**。
             #
-            # 备份表 `backup.RATE_TARGETS` 只有 12 条（GGA/RMC/GSA/GLL + 七条 RTCM），
-            # **一条 NAV-* 都没有**；而下面的 silence_outputs 会把 NAV/NMEA/RXM
-            # 那 69 个键里开着的一律写 0。于是还原分支只回放那 12 条时，
+            # 备份表 `backup.RATE_TARGETS` 只有十几条（GGA/GSA/GSV/GLL/VTG/RMC
+            # + 七条 RTCM），**一条 NAV-* 都没有**；而下面的 silence_outputs 会把
+            # NAV/NMEA/RXM 那 69 个键里开着的一律写 0。于是还原分支只回放那十几条时，
             # 被关掉的 NAV-PVT / NAV-SAT / NAV-ODO ... 一条都放不回来 ——
             # 模块从此只剩 RTCM，用户 u-center 里星图全空，
             # 而界面显示"已按备份回放"、不报任何错。
@@ -3847,7 +3883,8 @@ class CoordinateWriter:
 
         report = {'restored': restored, 'failed': sorted(failed),
                   'fix_rate': fix_note, 'target_fix_rate': want_fix,
-                  'saved': saved, 'rebooted': rebooted, 'unread': missing}
+                  'saved': saved, 'rebooted': rebooted, 'unread': missing,
+                  'source': orig.get('source') or 'live'}
         self.result['nmea_restore'] = report
         if failed:
             self._warn(f'{len(failed)} 条 NMEA 输出还原失败：{failed}。'

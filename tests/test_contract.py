@@ -2499,6 +2499,107 @@ class TestCalibrationCors(unittest.TestCase):
         self.assertEqual(calls, [], '没改过 NMEA 就不该发任何还原命令')
         self.assertNotIn('nmea_restore', w.result, '没做过的事不要写进结果')
 
+    def test_backup_rate_targets_cover_writer_restore_nmea(self):
+        """备份必须覆盖标定会改动的**全部** NMEA 语句，否则关掉的还原不回来。
+
+        2026-11-11 真机暴露的缺陷：`backup.RATE_TARGETS` 只有 GGA/RMC/GSA/GLL，
+        缺 GSV 和 VTG —— 而 `writer.QUIET_NMEA` 恰恰会把 GSV/GLL/VTG/RMC 关成 0。
+        于是 GSV/VTG 被关了以后：收尾还原没有"原值"可依（现场读到的已经是 0），
+        备份回滚也放不回来，用户切回流动站后 GSV 星图与 VTG 航向永久消失。
+
+        这条测试把两份清单焊在一起：`RATE_TARGETS` ⊇ `RESTORE_NMEA`（去掉 ZDA，
+        因为 ZDA 在 LG290P 上读回 `ERROR,1`，本就按"未配置"处理）。
+        """
+        from rtkserver.calibration import backup
+        from rtkserver.calibration import writer as writer_mod
+
+        # ZDA 是"模块没配置过就回 ERROR,1"的类型，备份里记 None 即可，
+        # 但它同样属于"标定会关掉的语句"，所以也必须在备份范围内 —— 不排除，
+        # 一起覆盖才能让"关掉了能不能放回来"这个问题只有一个答案。
+        missing = [n for n in writer_mod.RESTORE_NMEA
+                   if n not in backup.RATE_TARGETS]
+        self.assertEqual(missing, [],
+                         f'这些语句会被标定关掉，但备份没记：{missing}；'
+                         f'届时既无法还原也无法回滚')
+
+    def test_cors_nmea_orig_prefers_backup_snapshot(self):
+        """NMEA "原值"必须取自 BACKUP 阶段的快照，不能现场读。
+
+        ## 为什么现场读是错的（2026-11-11 真机实测）
+
+        `_step_cors_nmea_setup` 跑在 `_step_cors_rover_setup` **之后**，而那一步
+        为了进流动站要 `set_mode('rover', persist=True, restart=True)`。
+        **LG290P 固件在切模式（SAVEPAR + 重启）时会把 NMEA 整表重置为固件默认（全 1）**。
+
+        实测证据（同硬件同天线）：
+          · 标定前 base 未动过              → GGA/GSA/GSV/GLL/VTG/RMC 全 0
+          · `set_mode_memory_only('rover')` → 保持全 0（不落盘不重启，不重置）
+          · `set_mode('rover', persist=True, restart=True)` → **全 1**
+          · 手动写 0 + SAVEPAR + 重启        → 保持 0（不是"重启丢配置"）
+
+        于是在这里现场读，读到的是模块刚重置出来的默认值，不是用户原来的配置；
+        拿它去还原，等于"标定一次把用户的 0 永久改成 1"。
+        备份快照是 BACKUP 阶段采的，那时还没切模式，才是真正的原值。
+        """
+        from rtkserver.calibration import writer as writer_mod
+
+        live_reads = []
+
+        class _Driver:
+            PASSIVE = False
+            RESTART_REQUIRED = True
+            DISPLAY_NAME = 'Fake'
+            CAPS = {'msg_rate': True, 'fix_rate': True, 'silence': False}
+
+            def caps(self, key, default=False):
+                return self.CAPS.get(key, default)
+
+            def get_message_rate(self, name):
+                live_reads.append(name)
+                # 模拟"切模式之后固件已重置为 1"
+                return True, 'OK', {'fields': [name, '1']}
+
+            def set_message_rate(self, name, rate):
+                return True, 'OK', {}
+
+            def get_fix_rate(self):
+                return True, 'OK', {'fields': ['1000']}
+
+        class _Plan:
+            method = 'cors'
+            kind = 'write'
+            cors = {'duration': 60}
+
+        backup_snapshot = {
+            'rates': {'GGA': 0, 'GSA': 0, 'GSV': 0, 'GLL': 0, 'VTG': 0, 'RMC': 0,
+                      'RTCM3-1005': 1},
+            'mode': {'mode': 'base'},
+        }
+
+        w = writer_mod.CoordinateWriter(driver=_Driver(), channel=None)
+        w._backup = backup_snapshot
+        # 只跑到原值记录即可：把方法里"记完原值就开始写配置"的后半段挡住
+        w.driver.set_message_rate = lambda n, r: (True, 'OK', {})
+        w._restore_memory_mode = lambda: None
+        w._readonly = False
+        try:
+            w._step_cors_nmea_setup(_Plan())
+        except Exception:                        # noqa: BLE001 - 后半段会因假驱动炸，不重要
+            pass
+
+        rates = (w._nmea_orig or {}).get('rates') or {}
+        self.assertEqual(rates.get('GGA'), 0,
+                         '原值必须取自备份快照（0），不能被切模式重置后的 1 污染')
+        self.assertEqual(rates.get('GSV'), 0)
+        self.assertEqual(rates.get('VTG'), 0)
+        self.assertEqual((w._nmea_orig or {}).get('source'), 'backup',
+                         '必须标明原值来源是备份，便于排查')
+        # 现场读不是绝对禁止：`before` 段还要读 GGA/GSA 给日志与告警用
+        # （"切换后 GGA 输出为 X"）。要保证的是**还原用的原值**不来自现场。
+        # 这里直接比对：快照说有 7 条要还原，现场读的条数就不该影响 `rates` 的取值口径。
+        self.assertEqual(len(rates), len(writer_mod.RESTORE_NMEA),
+                         '快照里的每一条都要进 orig_rates（含 None）')
+
     def test_cors_reuse_branch_skips_survey_but_keeps_verify(self):
         """A1 复用分支只许省"测量"，写入 / NVM / 1005 校验一步都不许省。
 

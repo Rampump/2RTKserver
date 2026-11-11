@@ -37,7 +37,14 @@ BACKUP_VERSION = 1
 #   ① 备份不覆盖 108X~112X，回滚时无法还原；
 #   ② 还原后基准站悄悄退回只播 GPS，下游可用卫星数直接砍一半。
 # 注意写的名字是 `107X` 这种通配名，**不是** `1074`：具体消息号模块回 ERROR,1。
-RATE_TARGETS = ('GGA', 'RMC', 'GSA', 'GLL',
+#
+# NMEA 一侧必须覆盖**标定流程真的会改动的全部语句**，不只是"常见的 4 条"：
+# `writer.QUIET_NMEA` 会把 GSV/GLL/VTG/RMC 关成 0，`writer.RESTORE_NMEA` 也就
+# 按这 7 条还原。早先这里只有 GGA/RMC/GSA/GLL，**缺 GSV 和 VTG** ——
+# 结果是 CORS 标定把 GSV/VTG 关了之后，收尾还原既没有"原值"可依（现场读到的
+# 已经是 0），备份回滚也放不回来，用户切回流动站后 GSV 星图与 VTG 航向永久消失。
+# 两份清单必须保持一致：`backup.RATE_TARGETS` ⊇ `writer.RESTORE_NMEA` 里的 NMEA 项。
+RATE_TARGETS = ('GGA', 'RMC', 'GSA', 'GLL', 'GSV', 'VTG', 'ZDA',
                 'RTCM3-1005', 'RTCM3-1006', 'RTCM3-1033',
                 'RTCM3-107X', 'RTCM3-108X', 'RTCM3-109X',
                 'RTCM3-111X', 'RTCM3-112X')
