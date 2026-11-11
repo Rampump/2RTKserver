@@ -2378,6 +2378,127 @@ class TestCalibrationCors(unittest.TestCase):
                       '只允许喂新增样本，禁止整批重喂')
         self.assertIn('kept_idx', body, '必须用 3σ 返回的下标做增量喂入')
 
+    def test_cors_nmea_restore_runs_after_restart(self):
+        """标定期间改掉的 NMEA / 定位间隔，必须在**最终重启之后**、校验之前还回去。
+
+        这是"每标定一次，模块被永久改成只出 GGA/GSA、定位 10 Hz"的修复点。
+        `_step_cors_nmea_setup` 把 GSV/GLL/VTG/RMC/ZDA 关 0、把定位间隔钉到
+        100 ms，紧接着 `_reinit_rtk_engine` 走 SAVEPAR + 重启 —— 这批"标定专用"
+        设置就进了 NVM，而后面配报文只碰 RTCM。不还原的后果不是报错，而是
+        用户切回流动站后发现 RMC/GSV 全没了，且完全看不出是谁干的。
+
+        顺序是硬约束：放在 `_step_restart` **之前**会被后面那次重启覆盖回去，
+        等于白做一遍；放在 `_step_verify_*` 之后则校验跑在中间态上。
+        """
+        source = self._read('rtkserver', 'calibration', 'writer.py')
+        body = source[source.index('    def run(self, plan, backup=None):'):]
+        body = body[:body.index('    # ---------- 失败收尾')]
+
+        self.assertIn('self._restore_nmea_after_write(plan)', body,
+                      'run() 必须调用 NMEA 还原')
+        restore_at = body.index('self._restore_nmea_after_write(plan)')
+        self.assertLess(body.rindex('self._step_restart(plan)'), restore_at,
+                        '还原必须在最终重启之后，否则被重启覆盖')
+        self.assertLess(restore_at, body.index('self._step_verify_mode(plan)'),
+                        '还原要在校验之前，让校验跑在最终状态上')
+        self.assertLess(restore_at, body.index('self._step_verify_rtcm(plan)'))
+        # 只测不写分支在 `return self.result` 处提前退出，压根到不了这一步：
+        # 那条路不许写 NVM，当然也不许为了"还原"去 SAVEPAR/重启。
+        branch = body[body.index("elif plan.method == 'external_rover':"):]
+        branch = branch[:branch.index('else:', 10)]
+        self.assertNotIn('_restore_nmea_after_write', branch,
+                         '只测不写分支不许出现 NMEA 还原（它要落盘 + 重启）')
+
+    def test_cors_nmea_restore_never_writes_unknown_as_zero(self):
+        """标定前**没读到**的 NMEA 原值，还原时必须跳过，不能按 0 下发。
+
+        "没读到"和"当时是 0"是两件事：
+          · 读到 0      → 用户本来就关着 → 还原成 0 是对的（必须能写 0）；
+          · 读不到（None）→ 模块没配置过这条语句，回 ERROR,1 →
+            此时写 0 会把一条本来开着的输出关掉，等于换个方向继续破坏。
+
+        这里直接跑一次 `_restore_nmea_after_write`：GGA 原值 1、GSV 原值 0、
+        VTG 读不到，断言只有前两条被下发，且下发值分别是 1 和 0。
+        """
+        from rtkserver.calibration import writer as writer_mod
+
+        calls = []
+
+        class _Driver:
+            PASSIVE = False
+            RESTART_REQUIRED = True
+            CAPS = {'msg_rate': True, 'fix_rate': True}
+
+            def set_message_rate(self, name, rate):
+                calls.append(('rate', name, rate))
+                return True, f'{name}={rate}', {}
+
+            def set_fix_rate(self, ms):
+                calls.append(('fix', ms))
+                return True, f'{ms}', {}
+
+            def save(self):
+                calls.append(('save',))
+                return True, 'OK', {}
+
+            def reboot(self):
+                calls.append(('reboot',))
+                return True, 'OK', {}
+
+        w = writer_mod.CoordinateWriter(driver=_Driver(), channel=None)
+        w._nmea_orig = {
+            'rates': {'GGA': 1, 'GSV': 0, 'VTG': None},
+            'fix_rate': 1000,
+            'configured': {'GGA': 1, 'GSV': 0, 'VTG': 0, 'FIXRATE': 100},
+        }
+        w._restore_nmea_after_write(None)
+
+        rates = {c[1]: c[2] for c in calls if c[0] == 'rate'}
+        self.assertEqual(rates.get('GGA'), 1, '原来开着的必须开回来')
+        self.assertEqual(rates.get('GSV'), 0,
+                         '原来就是 0 的必须还原成 0（0 是合法速率）')
+        self.assertNotIn('VTG', rates,
+                         '读不到原值的语句必须跳过，写 0 会把本来开着的关掉')
+        self.assertIn(('fix', 1000), calls, '定位间隔必须还原成标定前的值')
+        self.assertIn(('save',), calls, '只改 RAM 不落盘，断电后还原就丢了')
+        self.assertIn(('reboot',), calls, '还原要重启才对当前数据面生效')
+
+        report = w.result['nmea_restore']
+        self.assertEqual(report['restored'], {'GGA': 1, 'GSV': 0})
+        self.assertEqual(report['unread'], ['VTG'], '读不到的必须如实记下')
+
+    def test_cors_nmea_restore_skips_when_nothing_changed(self):
+        """没有动过 NMEA 的流程（非 CORS 标定）不许凭空发还原命令。
+
+        `_nmea_orig` 为空表示"本条链路根本没用过标定专用 NMEA 配置"，
+        此时去写 GGA/GSV 只会平白多一次 SAVEPAR 擦写和一次重启。
+        """
+        from rtkserver.calibration import writer as writer_mod
+
+        calls = []
+
+        class _Driver:
+            PASSIVE = False
+            RESTART_REQUIRED = True
+            CAPS = {'msg_rate': True}
+
+            def set_message_rate(self, name, rate):
+                calls.append((name, rate))
+                return True, 'OK', {}
+
+            def save(self):
+                calls.append(('save',))
+                return True, 'OK', {}
+
+            def reboot(self):
+                calls.append(('reboot',))
+                return True, 'OK', {}
+
+        w = writer_mod.CoordinateWriter(driver=_Driver(), channel=None)
+        w._restore_nmea_after_write(None)
+        self.assertEqual(calls, [], '没改过 NMEA 就不该发任何还原命令')
+        self.assertNotIn('nmea_restore', w.result, '没做过的事不要写进结果')
+
     def test_cors_reuse_branch_skips_survey_but_keeps_verify(self):
         """A1 复用分支只许省"测量"，写入 / NVM / 1005 校验一步都不许省。
 
@@ -4868,6 +4989,61 @@ class TestMeasureOnlyRequiresRover(unittest.TestCase):
         self.assertIn('_has_command_set(info)', block,
                       '必须在"已知型号且能下发命令"时才判 dual_mode')
         self.assertIn("not info['caps'].get('dual_mode')", block)
+
+    def test_reinit_never_restarts_in_readonly_mode(self):
+        """只测不写在 `_reinit_rtk_engine` 里必须**在落盘/重启之前返回**。
+
+        这是"第二次仅测量标定 100% 失败"的修复点。那条路在 RAM 里临时切到
+        rover（NVM 里仍是 base），如果这里照常跑 SAVEPAR + 重启，会有两层后果，
+        而且都不可接受：
+
+          1) 重启让 RAM 的 rover 失效，回读读到的必然是 NVM 里的 base，
+             后面那句"重启后必须是 rover"会 100% 判死 —— 报错还会说
+             "配置没有持久化成功"，把用户指向完全错误的方向；
+          2) 顺手把只改过 RAM 的 NMEA 速率一起写进 NVM，
+             跟"只测量、不写入"的承诺直接矛盾。
+
+        所以这里的契约是：`_readonly` 判断必须是函数的**第一件事**，
+        return 之前不许出现 save / reboot / get_mode 判死。
+        """
+        import inspect
+        from rtkserver.calibration import writer as writer_mod
+
+        src = inspect.getsource(writer_mod.CoordinateWriter._reinit_rtk_engine)
+        self.assertIn('_readonly', src)
+        self.assertIn('_readonly_outputs', src,
+                      '只读路径必须转去"只确认输出"，而不是落盘/重启')
+
+        head = src[:src.index('_readonly_outputs(applied)')]
+        self.assertIn('return', src[src.index('_readonly_outputs(applied)'):][:80],
+                      '只读路径必须立即 return，不许继续往下走落盘 + 重启')
+        for forbidden in ('self.driver.save(', 'self.driver.reboot(',
+                          'self.driver.get_mode('):
+            self.assertNotIn(forbidden, head,
+                             f'只读判断之前就出现了 {forbidden}，等于先改了别人的设备')
+
+        # 只读分支只允许在 RAM 里保证采样输出开着（persist=False）
+        ro = inspect.getsource(writer_mod.CoordinateWriter._readonly_outputs)
+        self.assertIn('persist=False', ro, '只许改 RAM')
+        self.assertNotIn('self.driver.save(', ro)
+        self.assertNotIn('self.driver.reboot(', ro)
+        self.assertNotIn('set_fix_rate', ro, '定位间隔会被写进 NVM，这里不许碰')
+
+    def test_reinit_reports_savepar_failure_honestly(self):
+        """重启后模式不对时，报错要分清"存过盘但没生效"和"压根没存成"。
+
+        真实现象：模块刚从基准站切过来，NVM 里仍是 base，固件在 rover 模式下
+        拒绝 SAVEPAR —— 重启后当然回到 base。老文案一律说"配置没有持久化成功"，
+        用户会去翻 NVM、查 Flash，而真正的下一步是**断电冷启动一次**。
+        """
+        import inspect
+        from rtkserver.calibration import writer as writer_mod
+
+        src = inspect.getsource(writer_mod.CoordinateWriter._reinit_rtk_engine)
+        self.assertIn("applied.get('SAVEPAR')", src,
+                      '必须按本次 SAVEPAR 的实际结果分流文案')
+        self.assertIn('冷启动', src, '没存成盘时要直接告诉用户下一步怎么做')
+        self.assertIn('raise WriteFailed(', src)
 
     def test_frontend_locks_measure_for_base_only(self):
         """单模 / 流动站模块必须锁掉「仅测量」，理由按角色说。

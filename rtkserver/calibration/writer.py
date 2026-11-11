@@ -182,6 +182,13 @@ GGA_MIN_HZ = 0.8
 # 所以 GSA 是必开的（PDOP 准入要用），但必须按差分态的实测频率单独复核，
 # 见 _step_cors_nmea_setup 里 GSA 那段说明。
 QUIET_NMEA = ('GSV', 'GLL', 'VTG', 'RMC', 'ZDA')
+# 标定收尾要还原的 NMEA 语句集合：QUIET_NMEA + 标定时被显式打开的 GGA/GSA。
+# 为什么不复用 QUIET_NMEA：GGA/GSA 是**打开**的，不是关掉的，两者处理逻辑相反
+# （还原 0 会把 GGA 彻底关死，等于把"模块不输出 NMEA"这个坑原地复制一份）。
+RESTORE_NMEA = ('GGA', 'GSA') + QUIET_NMEA
+# 定位间隔在 NVM 里**读到是多少就是多少**：可能是出厂 1000 ms，也可能是
+# 上一轮标定留下的 100 ms。所以这里不做常量，只在"配置前没能读到"时兜底。
+FIXRATE_DEFAULT_MS = 1000
 # 注入差分后 GGA 频率的复核周期（秒）。
 # 为什么固化成常量：这个数决定了"多久能发现 GGA 掉速"。太短会被 1 Hz 的
 # 整数效应干扰（10 秒 10 条看着像 1.0），太长又会让一次失败白等几十秒。
@@ -717,6 +724,11 @@ class CoordinateWriter:
         # 只测不写模式下，模块被临时切走前的**内存模式**（'base' / 'rover' / None）。
         # 非 None 表示"我们动过内存态，收尾必须切回去"（附录D）。
         self._mem_restore_mode = None
+        # 标定期间被我们改过的 NMEA 原始配置（只在 CORS 标定里填）。
+        # 结构：{'rates': {'GGA': 1, 'GSV': 0, ...} | None,
+        #        'fix_rate': 1000 | None, 'configured': {...}}
+        # 收尾时按它还原，见 `_restore_nmea_after_write`。
+        self._nmea_orig = None
         self._step = ''
         self.result = {}
 
@@ -728,6 +740,7 @@ class CoordinateWriter:
         self._saved = False
         self._touched = False
         self._mem_restore_mode = None
+        self._nmea_orig = None
         # 只测不写（external_rover）：全程不发写命令，失败时也不能"回写"
         # —— 没有备份可回，回写反而会朝一块不归我们管的设备发命令。
         self._readonly = plan.method == 'external_rover'
@@ -830,6 +843,11 @@ class CoordinateWriter:
             self._step_setup_messages(plan)
             self._step_save(plan)
             self._step_restart(plan)
+            # 标定期间为了喂饱 GGA 关掉的 NMEA / 钉死的定位间隔，到这里必须还回去：
+            # 那批设置已经随 SAVEPAR 进了 NVM，不还原的话模块会被永久改成
+            # "只出 GGA/GSA、定位 10 Hz"（切回流动站后 RMC/GSV 全无）。
+            # 位置：必须在最终重启**之后**（否则被重启覆盖），校验之前（见函数注释）。
+            self._restore_nmea_after_write(plan)
             self._step_verify_mode(plan)
             self._step_verify_rtcm(plan)
             self._step_inject(plan)
@@ -1868,19 +1886,54 @@ class CoordinateWriter:
             ok0, _m0, d0 = self.driver.get_message_rate(name)
             if ok0:
                 fields = (d0 or {}).get('fields') or []
-                before[name] = fields[-1] if fields else None
-        # 只如实记录，不猜"模块默认值"：这个值受固件默认、上次标定残留、
+                before[name] = fields[-1] if fields else None        # 只如实记录，不猜"模块默认值"：这个值受固件默认、上次标定残留、
         # 是否保存过 NVM 三重影响（真机两次实测：一次读到 1、一次读到 0，
         # 同样都是 base→rover）。代码不依赖它，一律显式配置。
         if before.get('GGA') in (None, '0'):
             self._warn(f'切换后 GGA 输出为 {before.get("GGA", "未读到")}，'
                        f'已显式配置为 1 Hz（不依赖模块默认值）')
 
+        # ---- 记录"改之前"的完整 NMEA 状态，供收尾还原（见 _restore_nmea_after_write）----
+        # 为什么要在这里记、而不是在收尾时现读：下面马上就要一条条改成标定用的值，
+        # 改完再读就只剩"我们写进去的"，那时已经无从知道用户原来是什么样。
+        #
+        # 记录口径（三者刻意不同，别混）：
+        #   · 原样记录（整数，含 0）：GGA/GSA 与 QUIET_NMEA —— 下一段会逐条 overwrite，
+        #     所以读到什么就得记什么，读到 0 就是 0，还原也要还原成 0；
+        #   · 读不到（未配置过 → 模块回 ERROR,1）记 None：**还原时跳过**。
+        #     "没读到"≠"当时是 0"，按 0 下发会把一条本来开着的语句关掉；
+        #   · 定位间隔单独记：`FIXRATE_SAFE_MS` 会把 1000 ms 改成 100 ms，
+        #     这个改动同样会落盘，不还原就把用户的 1 Hz 永久改成 10 Hz 了。
+        orig_rates, orig_fix = {}, None
+        for name in RESTORE_NMEA:
+            ok0, _m0, d0 = self.driver.get_message_rate(name)
+            if not ok0:
+                orig_rates[name] = None
+                continue
+            fields = (d0 or {}).get('fields') or []
+            orig_rates[name] = _to_int(fields[-1]) if fields else None
+        try:
+            okf, _mf, df = self.driver.get_fix_rate()
+            if okf:
+                # 应答形如 `$PQTMCFGFIXRATE,OK,1000*XX` → fields=[...]；
+                # 拿最后一个纯数字字段（不写死下标：中间是否带 OK 由驱动层剥掉了）。
+                flds = (df or {}).get('fields') or []
+                for item in reversed(flds):
+                    val = _to_int(item)
+                    if val is not None:
+                        orig_fix = val
+                        break
+        except Exception as e:                  # noqa: BLE001 - 读不到就按未知处理
+            logging.info('读取原始定位间隔失败（收尾将按 %s ms 兜底）：%s',
+                         FIXRATE_DEFAULT_MS, e)
+        self._nmea_orig = {'rates': orig_rates, 'fix_rate': orig_fix, 'configured': {}}
+
         applied = {}
         for name in ('GGA', 'GSA'):
             ok, message, _data = self.driver.set_message_rate(name, 1)
             if ok:
                 applied[name] = 1
+                self._nmea_orig['configured'][name] = 1
             else:
                 # GGA 配不上是致命的（拿不到固定解判据）；GSA 配不上可降级（§7.2）
                 if name == 'GGA':
@@ -1900,6 +1953,8 @@ class CoordinateWriter:
         for name in QUIET_NMEA:
             ok, message, _data = self.driver.set_message_rate(name, 0)
             quiet[name] = 'off' if ok else f'failed:{message}'
+            if ok:
+                self._nmea_orig['configured'][name] = 0
         applied['QUIET'] = quiet
 
         # FIXRATE：`PQTMCFGMSGRATE` 的 Rate 语义是「每 N 次定位输出一次」，
@@ -1918,6 +1973,7 @@ class CoordinateWriter:
         ok, message, _data = self.driver.set_fix_rate(FIXRATE_SAFE_MS)
         if ok:
             applied['FIXRATE'] = FIXRATE_SAFE_MS
+            self._nmea_orig['configured']['FIXRATE'] = FIXRATE_SAFE_MS
         elif (message or '').startswith(self.driver.DISPLAY_NAME):
             logging.info('本型号不支持设置定位间隔，按实测频率校验：%s', message)
         else:
@@ -1952,14 +2008,33 @@ class CoordinateWriter:
 
     def _reinit_rtk_engine(self, applied):
         """落盘 + 重启 + 重连 + 回读确认：让 RTK 引擎按新配置真正重建。
-
         **这是 CORS 标定能不能拿到差分的关键一步**，不是可选的"保险动作"。
         模块的很多 RTK 相关配置（接收机模式、RTK 使能、定位间隔、消息调度）
         只写进运行时内存：命令回 OK、回读也能读到，但解算引擎仍跑在旧参数上。
         只有 `PQTMSAVEPAR` 落盘 + `PQTMSRR` 重启后，引擎才会重新初始化。
 
         重启会断串口，所以顺序必须是：落盘 → 重启 → 等启动 → 重开串口 → 回读确认。
+
+        ## 只测不写（external_rover）为什么**不重启**
+
+        这条路径在 RAM 里临时切到 rover（不写 NVM），采样完还要切回原来的基准站。
+        如果在这里跑「落盘 + 重启」，副作用有两层，而且都不可接受：
+
+          1) 重启会让 RAM 里的 rover 失效，读回来的必然是 NVM 里的 base ——
+             原来那句"重启后必须是 rover"会 100% 判死；更糟的是有人为了让它过，
+             顺手把 persist 改成 True，那就等于**把别人正在用的基准站改成流动站**；
+          2) 它会把本次临时调过的 NMEA 速率（只改了 RAM 的）一起写进 NVM，
+             用户事后拿厂商工具打开，发现自己的输出配置被一个"只测量不写入"
+             的功能改掉了 —— 与本模式的承诺直接矛盾。
+
+        代价是什么：不重启，消息速率可能仍是旧调度。所以这里不刷 NVM，
+        而是**不管配置结果，显式再打开一次**要求的输出（`enable_outputs`），
+        再靠流程后面的 GGA 实测频率兜底 —— 实测不达标就失败，不会带着
+        0.02 Hz 的 GGA 白跑十分钟。宁可失败，不改别人的设备。
         """
+        if getattr(self, '_readonly', False):
+            self._readonly_outputs(applied)
+            return
         self._stage('RTK_REINIT', '保存配置并重启模块，初始化 RTK 解算引擎')
         # save()/reboot() 在基类都有默认实现（回 unsupported），不判"有没有方法"：
         # 判不出来的后果是"跳过引擎重建"这条告警，而它恰好会掩盖"驱动根本没实现"
@@ -1998,15 +2073,75 @@ class CoordinateWriter:
 
         # 回读确认：配置确实还在（NVM 落盘成功），否则后面白等固定解
         ok3, message3, mode_data = self.driver.get_mode()
-        if not ok3 or (mode_data or {}).get('mode') != 'rover':
+        got_mode = (mode_data or {}).get('mode')
+        if not ok3 or got_mode != 'rover':
+            # 报错要分两种，别混成一句"配置没有持久化成功"——
+            # 那句话只在"我们**确实**存过盘"时成立。
+            hint = ''
+            if not getattr(self, '_saved', False) or applied.get('SAVEPAR') != 'ok':
+                # 见上面 SAVEPAR 失败只告警的分支：没存成盘，重启当然回旧模式
+                hint = ('；本次 SAVEPAR 没有成功，模块重启后回到了 NVM 里的旧配置。'
+                        '常见原因：模块刚从基准站切过来且 NVM 里仍是 base，'
+                        '或固件在 rover 模式下拒绝 SAVEPAR。'
+                        '可先断电冷启动一次再重试')
             raise WriteFailed(
                 'RTK_REINIT',
-                f'重启后工作模式是 {(mode_data or {}).get("mode")}（应为 rover）：'
-                f'配置没有持久化成功，RTK 引擎不会按新参数重建', mode_data)
+                f'重启后工作模式是 {got_mode}（应为 rover）：'
+                f'配置没有持久化成功，RTK 引擎不会按新参数重建{hint}', mode_data)
 
         self._record_step('RTK_REINIT', True,
                           '已落盘并重启，串口重连且回读确认仍为流动站',
                           self.result['rtk_reinit'])
+
+    def _readonly_outputs(self, applied):
+        """只测不写：不落盘、不重启，只把**这次要用的输出**在 RAM 里保证打开。
+
+        为什么这条路不能复用 `save() + reboot()`：见 `_reinit_rtk_engine` 的说明。
+        这里只做"确保 GGA 在出"这一件事 —— 没有 GGA 就没有 VRS 的上报地址，
+        采集会一直空转到超时，而报错会是"拿不到固定解"，指向完全错误的方向。
+
+        失败一律只告警：这条路径真正的问题是"模块不归我们管"，
+        模块拒收命令（被动驱动 / 只读型号）时应当如实记录，由后面的
+        `_verify_gga_rate(strict=True)` 用实测频率给出结论。
+        """
+        self._stage('RTK_REINIT', '只测不写：不保存、不重启，仅确认采样所需输出已打开')
+        want = [n for n in ('GGA', 'RMC', 'NAV_PVT') if self._caps('msg_rate', True)]
+        if not want or self.driver.PASSIVE:
+            applied['OUTPUT_RECHECK'] = 'skipped'
+            self.result['rtk_reinit'] = {'save': 'skipped', 'restart': 'skipped',
+                                         'reconnected': True, 'readonly': True}
+            self._record_step('RTK_REINIT', True,
+                              '只测不写：本型号无命令集，直接读现有输出（不保存、不重启）',
+                              self.result['rtk_reinit'])
+            return
+
+        try:
+            ok, message, data = self.driver.enable_outputs(want, rate=1, persist=False)
+        except Exception as e:                      # noqa: BLE001 - 补救动作不能抛出
+            ok, message, data = False, f'{type(e).__name__}: {e}', {}
+
+        self.result['rtk_reinit'] = {
+            'save': 'skipped', 'restart': 'skipped', 'reconnected': True,
+            'readonly': True, 'outputs': data or {},
+        }
+        if ok:
+            applied['OUTPUT_RECHECK'] = 'ok'
+            self._record_step('RTK_REINIT', True,
+                              f'只测不写：已确认采样输出打开（{message}），未保存、未重启',
+                              self.result['rtk_reinit'])
+        elif (data or {}).get('error') == 'unsupported':
+            applied['OUTPUT_RECHECK'] = 'unsupported'
+            self._record_step('RTK_REINIT', True,
+                              f'只测不写：本型号不支持主动开输出（{message}），'
+                              f'按模块现有输出继续', self.result['rtk_reinit'])
+        else:
+            applied['OUTPUT_RECHECK'] = f'failed:{message}'
+            self._warn(f'只测不写：打开采样输出失败（{message}）。'
+                       f'不会为此写 NVM 或重启模块；若后面 GGA 实测不达标，'
+                       f'请用厂商工具手动打开 GGA 输出后重试')
+            self._record_step('RTK_REINIT', False,
+                              f'只测不写：开启输出失败（{message}）',
+                              self.result['rtk_reinit'])
 
     def _gga_zero_hint(self, count, hz):
         """GGA 不达标时给"下一步查什么"的解释。**按驱动能力位分流，不按型号**。
@@ -3590,6 +3725,168 @@ class CoordinateWriter:
                               f'但无法确认是否生效；请断电重启后重新校验', data)
         self.result['boot'] = data
         self._record_step('RESTART', True, message, {'data': data, 'attempt': attempt})
+
+    # ---------- 步骤 5.5：还原标定期间改掉的 NMEA 输出 ----------
+    def _restore_nmea_after_write(self, plan):
+        """把 CORS 标定为了"喂饱 GGA"而改掉的 NMEA/定位间隔，**在最终重启之后**还回去。
+
+        ## 为什么必须有这一步
+
+        `_step_cors_nmea_setup` 为了让注入差分后 GGA 不被饿死，做了两件事：
+
+          1) 把 `GGA`/`GSA` 开到 1，把 `GSV/GLL/VTG/RMC/ZDA` 全关（`QUIET_NMEA`）；
+          2) 把定位间隔钉到 100 ms（`FIXRATE_SAFE_MS`，因为本固件 1 Hz 会让 GGA
+             卡到 87 秒一条）。
+
+        然后 `_reinit_rtk_engine` 走 **SAVEPAR + 重启**—— 于是这批"标定专用"的
+        设置**进了 NVM**，而流程后面配报文（`_step_setup_messages`）只碰 RTCM，
+        一条 NMEA 都不管。结果是一件谁都没意识到的事：
+
+            **每标定一次，用户的模块就被永久改成"只出 GGA/GSA、定位 10 Hz"。**
+
+        真实现象：模块从基准站切回流动站后，串口里只有 GGA 和 GSA ——
+        没有 RMC、没有 VTU、没有 GSV。凡是依赖 RMC 的软件（行车记录、
+        NMEA 转发、某些飞控）会直接"收不到数据"，而模块本身是正常的。
+
+        这段没有任何报错，也不影响基准站功能，所以一直没被发现。
+
+        ## 为什么放在这里（`_step_restart` 之后、校验之前）
+
+        · 必须在 `_step_restart` **之后**：还原本身也要落盘 + 重启，顺序反了会被
+          后面那次重启用旧配置覆盖回去；
+        · 必须在 `_step_verify_rtcm` **之前**：还原只碰 NMEA，不碰 RTCM/坐标，
+          但让校验跑在最终状态上更干净（万一某个型号改 NMEA 会牵连调度）。
+
+        ## 三条约束
+
+        1. `plan.kind == 'restore'`（还原/回滚）时**不走这里**：那条路的任务是
+           按备份原样回放，再插一段"还原本流程改过的值"会把备份写的东西盖掉；
+        2. 原值 **读不到（None）就跳过**：没读到不等于当时是 0；
+        3. 失败**只告警不判死**：标定已经成功、坐标已经写进 NVM，
+           为了一条 NMEA 恢复去把整个标定判成失败，是把小事当大事。
+           告警里写清"手动改回来"的具体值，用户能自己处理。
+        """
+        orig = self._nmea_orig or {}
+        orig_rates = orig.get('rates') or {}
+        configured = orig.get('configured') or {}
+        if not configured:
+            return                      # 这条流程没有改过任何 NMEA（非 CORS 标定）
+
+        self._checkpoint()
+        self._beat()                    # 下面是一次 SAVEPAR + 一次重启，可能顶穿看门狗
+
+        # 只处理"我们真的动过"的语句：没动过的就是原样，写一遍反而多一次擦写。
+        targets, missing = {}, []
+        for name in configured:
+            if name == 'FIXRATE':
+                continue
+            want = orig_rates.get(name)
+            if want is None:
+                missing.append(name)
+                continue
+            targets[name] = want
+
+        if not targets and not configured.get('FIXRATE'):
+            self._record_step('NMEA_RESTORE', True,
+                              '没有可还原的 NMEA 配置（标定前原值未读到）',
+                              {'skipped': True, 'unread': missing})
+            return
+
+        self._stage('NMEA_RESTORE',
+                    '还原标定前被改动的 NMEA 输出与定位间隔（这些改动此前已写进 NVM）')
+        restored, failed = {}, {}
+        for name, rate in targets.items():
+            try:
+                ok, message, _data = self.driver.set_message_rate(name, rate)
+            except Exception as e:                  # noqa: BLE001 - 单条失败不炸整条
+                ok, message = False, f'{type(e).__name__}: {e}'
+            if ok:
+                restored[name] = rate
+            else:
+                failed[name] = message
+            self._beat()
+
+        want_fix = orig.get('fix_rate')
+        fix_note = 'keep'
+        if configured.get('FIXRATE'):
+            if want_fix is None:
+                want_fix = FIXRATE_DEFAULT_MS
+            try:
+                okf, _mf, _df = self.driver.set_fix_rate(want_fix)
+            except Exception as e:                  # noqa: BLE001
+                okf = False
+                _mf = f'{type(e).__name__}: {e}'
+            fix_note = 'ok' if okf else f'failed:{_mf}'
+            self._beat()
+
+        # 落盘 + 重启：这两步都不能省，理由不同。
+        #   · SAVEPAR：不落盘的话还原只活在 RAM 里，模块一断电就回到"只出 GGA"；
+        #   · 重启：定位间隔（CFGFIXRATE）在多数固件上要重建调度才真正生效，
+        #     只写 FIFXRATE 不重启，实测还是按旧的 100 ms 跑。
+        saved, rebooted = True, True
+        if restored or fix_note == 'ok':
+            ok_s, message_s, _ds = self.driver.save()
+            saved = bool(ok_s)
+            self._beat()
+            if not saved:
+                self._warn(f'NMEA 还原已下发但落盘失败（{message_s}）：'
+                           f'本次改动只存在内存，模块断电后会回到标定时的配置')
+            # 没有软重启命令的型号（`RESTART_REQUIRED=False`）配置即时生效，
+            # 这里跳过重启 —— 与 `_step_restart` 同一判据，别在收尾处另立一套。
+            if self.driver.RESTART_REQUIRED:
+                ok_r, message_r, _dr = self.driver.reboot()
+                rebooted = bool(ok_r)
+                self._beat()
+                if not rebooted:
+                    self._warn(f'NMEA 还原已下发并落盘，但重启命令返回异常'
+                               f'（{message_r}）：新输出配置要等下次断电重启才完全生效')
+                else:
+                    self._reopen_after_restore()
+            else:
+                rebooted = None
+
+        report = {'restored': restored, 'failed': sorted(failed),
+                  'fix_rate': fix_note, 'target_fix_rate': want_fix,
+                  'saved': saved, 'rebooted': rebooted, 'unread': missing}
+        self.result['nmea_restore'] = report
+        if failed:
+            self._warn(f'{len(failed)} 条 NMEA 输出还原失败：{failed}。'
+                       f'这些语句在标定时被关掉/打开过，且已经写进 NVM；'
+                       f'如需恢复请用厂商工具按上述值手动设置')
+        if fix_note.startswith('failed') and configured.get('FIXRATE'):
+            self._warn(f'定位间隔还原失败（{fix_note.split(":", 1)[-1]}）：'
+                       f'模块当前是 {FIXRATE_SAFE_MS} ms（10 Hz），'
+                       f'原本是 {want_fix} ms。不还原不影响基准站，'
+                       f'但流动站模式下的定位频率会比原来高')
+        self._record_step(
+            'NMEA_RESTORE', bool(restored or fix_note == 'ok'),
+            (f'已还原 {len(restored)} 条 NMEA 输出'
+             + (f'、定位间隔 {want_fix} ms' if fix_note == 'ok' else '')
+             + ('并已落盘' if saved and (restored or fix_note == 'ok') else '')),
+            report)
+
+    def _reopen_after_restore(self):
+        """NMEA 还原那次重启之后，把串口重新拉起来。
+
+        **这一步不能省**：`_step_verify_mode` 紧接着就要读模式与坐标，
+        串口没重连的话读命令全部超时，整条写链路会以"读不到工作模式"失败 ——
+        而模块其实已经完全配好了，只是我们自己的句柄还挂在旧设备节点上
+        （USB CDC 重启后会重新枚举）。
+
+        失败**不抛**：这里已经是收尾阶段，坐标和模式都已落盘确认，
+        为了一次串口重连把整次标定判死是倒因为果。交给后面的
+        `_step_verify_mode` 用真实的读取结果说话（它读不到会自己抛）。
+        """
+        if not self.channel:
+            return False
+        try:
+            self.channel.reopen()
+            return True
+        except Exception as exc:                 # noqa: BLE001 - 串口异常种类极杂
+            logging.warning('[NMEA_RESTORE] 还原重启后重开串口失败：%s', exc)
+            self._warn(f'NMEA 还原重启后重开串口失败（{exc}）：'
+                       f'若下一步回读超时，请断电重启模块后重新校验')
+            return False
 
     # ---------- 步骤 6：重启后回读（§8.1 第 6 步） ----------
     def _step_verify_mode(self, plan):
