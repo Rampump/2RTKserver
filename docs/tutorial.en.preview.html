@@ -1,0 +1,1402 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>tutorial.en</title><style>
+:root{--bg:#0f1115;--fg:#e6e8eb;--muted:#9aa4b2;--line:#2a2f38;--code:#1a1e26;--accent:#4b9cf5}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+     font:16px/1.75 -apple-system,"Segoe UI","Noto Sans SC",sans-serif}
+main{max-width:920px;margin:0 auto;padding:48px 24px 120px}
+h1{font-size:2.1em;border-bottom:2px solid var(--accent);padding-bottom:.3em;margin-top:0}
+h2{font-size:1.55em;margin-top:2.2em;border-bottom:1px solid var(--line);padding-bottom:.25em}
+h3{font-size:1.2em;margin-top:1.8em;color:#c9d3e0}
+h4{font-size:1.05em;margin-top:1.5em;color:#b3c0d1}
+a{color:var(--accent)}
+p,li{color:#d3d8df}
+blockquote{margin:1.2em 0;padding:.7em 1em;border-left:3px solid var(--accent);
+           background:#161b23;color:var(--muted);border-radius:0 6px 6px 0}
+blockquote p{color:var(--muted);margin:.3em 0}
+code{background:var(--code);padding:.15em .4em;border-radius:4px;
+     font:0.9em "JetBrains Mono",Consolas,monospace;color:#8ec7ff}
+pre{background:var(--code);padding:14px 16px;border-radius:8px;overflow-x:auto;
+    border:1px solid var(--line)}
+pre code{background:none;padding:0;color:#c8d4e3;font-size:.88em;line-height:1.6}
+table{border-collapse:collapse;width:100%;margin:1.2em 0;font-size:.94em}
+th,td{border:1px solid var(--line);padding:9px 12px;text-align:left;vertical-align:top}
+th{background:#1b212b;font-weight:600;color:#dfe6ef}
+tr:nth-child(even) td{background:#14181f}
+img{max-width:100%;height:auto;border-radius:8px;border:1px solid var(--line);
+    margin:10px 0;display:block}
+hr{border:none;border-top:1px solid var(--line);margin:2.5em 0}
+em{color:var(--muted)}
+</style></head>
+<body><main><h1 id="2rtkserver-complete-tutorial">2RTKserver — Complete Tutorial</h1>
+<blockquote>
+<p>Build a full-featured RTK base station from scratch on a low-cost ARM box, a Raspberry Pi, or any Linux machine.</p>
+</blockquote>
+<p><strong>Version covered:</strong> 3.1.3<br />
+<strong>Tested on:</strong> Amlogic S905L3B box running Armbian (Ubuntu 22.04, aarch64), Quectel LG290P module on a CH340 USB-serial adapter.</p>
+<hr />
+<h2 id="contents">Contents</h2>
+<ol>
+<li><a href="#1-what-2rtkserver-is">What 2RTKserver Is</a></li>
+<li><a href="#2-what-you-need">What You Need</a></li>
+<li><a href="#3-hardware-wiring">Hardware Wiring</a></li>
+<li><a href="#4-installing-on-a-fresh-system">Installing on a Fresh System</a></li>
+<li><a href="#5-first-login-and-the-status-page">First Login and the Status Page</a></li>
+<li><a href="#6-serial-port-configuration">Serial Port Configuration</a></li>
+<li><a href="#7-coordinate-calibration">Coordinate Calibration</a></li>
+<li><a href="#8-uploading-to-a-cloud-ntrip-caster">Uploading to a Cloud NTRIP Caster</a></li>
+<li><a href="#9-relay-mode">Relay Mode</a></li>
+<li><a href="#10-built-in-local-caster">Built-in Local Caster</a></li>
+<li><a href="#11-radio-telemetry-passthrough">Radio Telemetry Passthrough</a></li>
+<li><a href="#12-maintenance">Maintenance</a></li>
+<li><a href="#appendix-a--supported-modules">Appendix A — Supported Modules</a></li>
+<li><a href="#appendix-b--common-problems">Appendix B — Common Problems</a></li>
+</ol>
+<hr />
+<h2 id="1-what-2rtkserver-is">1. What 2RTKserver Is</h2>
+<p>2RTKserver turns a GNSS receiver module into a <strong>standalone RTK base station</strong>. It reads raw RTCM 3 correction data from the module over a serial port and distributes it over the network, so rovers in the field can reach centimetre-level positioning.</p>
+<p>It is more than a data pump. It also:</p>
+<ul>
+<li><strong>Calibrates the base position</strong> to centimetre accuracy by driving the module through the required command sequences automatically.</li>
+<li><strong>Restores the module</strong> to its pre-calibration state if anything fails, so a botched calibration never leaves the receiver stuck in the wrong mode.</li>
+<li><strong>Injects station metadata</strong> so rovers know where the base is and which coordinate frame it uses.</li>
+<li><strong>Serves a web interface</strong> for configuration, live monitoring, and firmware checks.</li>
+</ul>
+<h3 id="three-operating-modes">Three operating modes</h3>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>What it does</th>
+<th>When to use it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>none</code></td>
+<td>Reads the module and displays data locally. No output.</td>
+<td>Bench testing, first-time verification</td>
+</tr>
+<tr>
+<td><code>serial</code></td>
+<td>Reads the module over serial and distributes over NTRIP.</td>
+<td><strong>Normal base station operation</strong></td>
+</tr>
+<tr>
+<td><code>relay</code></td>
+<td>Pulls a stream from <em>another</em> caster and re-distributes it.</td>
+<td>Bridging networks, extending coverage</td>
+</tr>
+</tbody>
+</table>
+<h3 id="where-the-data-can-go">Where the data can go</h3>
+<p>Three outputs are available, and they are <strong>independent</strong> — enable any combination:</p>
+<ol>
+<li><strong>Cloud NTRIP Caster</strong> — push your stream to a public server.</li>
+<li><strong>Local NTRIP Caster</strong> — serve the stream directly from the box on your own LAN.</li>
+<li><strong>Radio telemetry</strong> — push corrections out a second serial port to a UHF radio.</li>
+</ol>
+<hr />
+<h2 id="2-what-you-need">2. What You Need</h2>
+<h3 id="hardware">Hardware</h3>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Linux host</td>
+<td>Any ARM SBC, mini PC, or old laptop. Tested on Amlogic S905L3B + Armbian.</td>
+</tr>
+<tr>
+<td>GNSS module</td>
+<td>Quectel LG290P (multi-band, recommended), u-blox ZED-F9P, Unicore UM980/N4, or Quectel LC29H.</td>
+</tr>
+<tr>
+<td>USB-serial adapter</td>
+<td>CH340, CP2102, FT232, or the module's own USB port.</td>
+</tr>
+<tr>
+<td>GNSS antenna</td>
+<td><strong>Must have a clear view of the sky.</strong> This matters more than any other single factor.</td>
+</tr>
+<tr>
+<td>Antenna cable</td>
+<td>Low-loss coax, kept short. Every extra metre costs signal.</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>📷 PHOTO PLACEHOLDER — hardware-overview</strong><br />
+<em>Needed: the full kit laid out on a table — the box, the GNSS module, the USB-serial adapter, the antenna, and the antenna cable.</em></p>
+</blockquote>
+<h3 id="network">Network</h3>
+<ul>
+<li>The host must be able to reach your CORS provider (for the CORS calibration method) or your cloud caster.</li>
+<li>For LAN access, you need to know the host's IP address.</li>
+</ul>
+<h3 id="accounts">Accounts</h3>
+<ul>
+<li><strong>CORS account</strong> — only for the CORS one-click calibration method. A typical provider gives you: host, port, username, password, and a mount point name.</li>
+<li><strong>Cloud caster account</strong> — only if you plan to publish your stream.</li>
+</ul>
+<hr />
+<h2 id="3-hardware-wiring">3. Hardware Wiring</h2>
+<p>There are only a few connections:</p>
+<pre><code>   ┌──────────────┐   USB    ┌───────────────┐   UART    ┌─────────────┐
+   │   Linux box  │ ───────► │ USB-serial    │ ────────► │ GNSS module │
+   │              │          │ adapter       │  (CH340)  │  (LG290P)   │
+   └──────────────┘          └───────────────┘           └──────┬──────┘
+                                                                │ SMA
+                                                                ▼
+                                                         ┌─────────────┐
+                                                         │   Antenna   │
+                                                         └─────────────┘
+</code></pre>
+<ol>
+<li>Wire the GNSS module to the USB-serial adapter: <code>TX → RX</code>, <code>RX → TX</code>, <code>GND → GND</code>. Power the module according to its datasheet.</li>
+<li>Plug the adapter into a USB port. It appears as <code>/dev/ttyUSB0</code> (CH340) or <code>/dev/ttyACM0</code> (native USB CDC).</li>
+<li>Screw the antenna onto the module's SMA connector and <strong>place it where it can see the sky.</strong> Do not put it under a metal roof or against a wall — the base station cannot calibrate itself without satellite reception.</li>
+</ol>
+<blockquote>
+<p><strong>📷 PHOTO PLACEHOLDER — wiring-closeup</strong><br />
+<em>Needed: close-up of the module wired to the USB-serial adapter showing TX/RX/GND, plus a shot of the antenna mounted outdoors.</em></p>
+</blockquote>
+<h3 id="verify-the-adapter-is-detected">Verify the adapter is detected</h3>
+<p>Before installing anything, confirm the system sees it:</p>
+<pre><code class="language-bash">ls -l /dev/ttyUSB* /dev/ttyACM* 2&gt;/dev/null
+</code></pre>
+<p>Expected output:</p>
+<pre><code>crw-rw---- 1 root dialout 188, 0 Nov 11 05:20 /dev/ttyUSB0
+</code></pre>
+<p>If nothing appears, the adapter is not being recognised. Try a different USB port or cable before going further.</p>
+<hr />
+<h2 id="4-installing-on-a-fresh-system">4. Installing on a Fresh System</h2>
+<h3 id="41-get-the-source-onto-the-host">4.1 Get the source onto the host</h3>
+<pre><code class="language-bash">cd ~
+git clone &lt;your-repository-url&gt; 2RTKserver
+cd 2RTKserver
+</code></pre>
+<p>If you have no git access, copy the project folder over with <code>scp</code> or a USB stick. The installer does a plain copy rather than a git clone, so a source tarball works fine.</p>
+<h3 id="42-run-the-installer">4.2 Run the installer</h3>
+<pre><code class="language-bash">sudo bash install.sh
+</code></pre>
+<p>The installer will:</p>
+<ol>
+<li>Install system packages (<code>python3</code>, <code>python3-venv</code>, <code>python3-pip</code>).</li>
+<li>Create a virtual environment at <code>/opt/2RTKserver/venv</code>.</li>
+<li>Install Python dependencies from <code>requirements.txt</code>.</li>
+<li>Copy the application into <code>/opt/2RTKserver</code>.</li>
+<li>Register and start the <code>2rtkserver</code> systemd service.</li>
+</ol>
+<p><img alt="Installation — dependencies being installed" src="images/tutorial/install-01-deps.png" /></p>
+<p><em>Package installation. On a slow ARM box this can take several minutes — that is normal.</em></p>
+<p><img alt="Installation — completed" src="images/tutorial/install-02-done.png" /></p>
+<p><em>Installation complete. Note the access URL reported at the end.</em></p>
+<blockquote>
+<p><strong>📷 PHOTO PLACEHOLDER — install-console</strong><br />
+<em>Needed (optional): a photograph of a real screen showing the installer output, for a "real console" feel. The screenshots above are terminal captures.</em></p>
+</blockquote>
+<h3 id="43-confirm-the-service-is-running">4.3 Confirm the service is running</h3>
+<pre><code class="language-bash">systemctl status 2rtkserver
+</code></pre>
+<p>Expect <code>active (running)</code>. If not:</p>
+<pre><code class="language-bash">journalctl -u 2rtkserver -n 50 --no-pager
+</code></pre>
+<p>The journal names the actual cause — usually a missing Python package or a permission problem under <code>/opt/2RTKserver</code>.</p>
+<h3 id="44-removing-an-existing-installation">4.4 Removing an existing installation</h3>
+<p>If you are reinstalling over an older version, uninstall first so no stale files remain:</p>
+<pre><code class="language-bash">cd /opt/2RTKserver
+sudo bash uninstall.sh
+</code></pre>
+<p>The uninstaller stops and removes the service. Your database and calibration records are preserved. Remove <code>/opt/2RTKserver</code> manually if you want a completely clean slate.</p>
+<blockquote>
+<p><strong>Upgrading rather than reinstalling?</strong> Run <code>sudo bash update.sh</code> inside <code>/opt/2RTKserver</code>. It keeps your configuration and data.</p>
+</blockquote>
+<hr />
+<h2 id="5-first-login-and-the-status-page">5. First Login and the Status Page</h2>
+<h3 id="51-open-the-web-interface">5.1 Open the web interface</h3>
+<p>From any machine on the same network, browse to:</p>
+<pre><code>http://&lt;host-ip&gt;:5757
+</code></pre>
+<p>The installer prints the exact address. On networks that support mDNS you can also use:</p>
+<pre><code>http://2rtk.local:5757
+</code></pre>
+<blockquote>
+<p><strong>Note:</strong> Android devices cannot resolve <code>.local</code> names — use the IP address. If <code>2rtk.local</code> fails on Windows or macOS, a proxy or VPN is probably intercepting it; add <code>*.local</code> to your proxy bypass list.</p>
+</blockquote>
+<h3 id="52-log-in">5.2 Log in</h3>
+<p><img alt="Login page" src="images/tutorial/web-01-login.png" /></p>
+<p><em>The login page. Default credentials are <code>admin</code> / <code>admin</code>.</em></p>
+<p><strong>Change the password immediately.</strong> Go to <strong>Change Password</strong> in the top navigation after your first login. The login page shows a warning banner while the default password is still in use.</p>
+<blockquote>
+<p><strong>Security note:</strong> this web interface is intended for a trusted LAN. Do not expose port 5757 directly to the internet. For remote access, put it behind a VPN.</p>
+</blockquote>
+<h3 id="53-the-status-page">5.3 The status page</h3>
+<p><img alt="Status page" src="images/tutorial/web-02-status-index.png" /></p>
+<p><em>The status page before configuration — no data flowing yet.</em></p>
+<p>The status page is your main operational view:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mode</td>
+<td>Current operating mode (<code>none</code> / <code>serial</code> / <code>relay</code>)</td>
+</tr>
+<tr>
+<td>Serial port</td>
+<td>Port and baud rate in use</td>
+</tr>
+<tr>
+<td>Satellites</td>
+<td>Number of satellites currently tracked</td>
+</tr>
+<tr>
+<td>Systems</td>
+<td>Which constellations are present (GPS, GLONASS, Galileo, BDS, QZSS)</td>
+</tr>
+<tr>
+<td>Position</td>
+<td>The base station's current coordinates</td>
+</tr>
+<tr>
+<td>RTCM output</td>
+<td>Which message types are being emitted</td>
+</tr>
+<tr>
+<td>Uptime</td>
+<td>How long the current session has been running</td>
+</tr>
+</tbody>
+</table>
+<p><img alt="Status page with live data" src="images/tutorial/web-06-status-live.png" /></p>
+<p><em>The status page with live data — satellites tracked, position solved, RTCM messages flowing.</em></p>
+<blockquote>
+<p>The status page updates over a WebSocket, so satellite counts and positions refresh continuously without reloading.</p>
+</blockquote>
+<hr />
+<h2 id="6-serial-port-configuration">6. Serial Port Configuration</h2>
+<p>Go to <strong>Configuration</strong> (<code>/config</code>).</p>
+<p><img alt="Configuration page — serial settings" src="images/tutorial/web-03-config-serial.png" /></p>
+<p><em>The configuration page. Mode is <code>none</code> here; we will change it to <code>serial</code>.</em></p>
+<h3 id="61-set-the-mode">6.1 Set the mode</h3>
+<p>Choose <strong>Mode → <code>serial</code></strong>. This tells the server to read the module over serial and distribute the data.</p>
+<h3 id="62-find-the-serial-port">6.2 Find the serial port</h3>
+<p>Two options:</p>
+<p><strong>Option A — Scan.</strong> Click <strong>Scan Ports</strong>. The server enumerates available serial devices and populates a dropdown.</p>
+<p><img alt="Scanning for serial ports" src="images/tutorial/web-04-scan-ports.png" /></p>
+<p><em>After scanning, the detected port is offered in the dropdown.</em></p>
+<p><strong>Option B — Type it in.</strong> If you already know the port, enter <code>/dev/ttyUSB0</code> or <code>/dev/ttyACM0</code>.</p>
+<blockquote>
+<p><strong>Telling them apart:</strong> CH340/CP2102/FT232 adapters appear as <code>/dev/ttyUSB0</code>. Modules with native USB (many u-blox boards) appear as <code>/dev/ttyACM0</code>. If several USB-serial devices are plugged in, unplug the module and re-run the scan — whichever port disappeared is the module.</p>
+</blockquote>
+<h3 id="63-set-the-baud-rate">6.3 Set the baud rate</h3>
+<p><img alt="Serial port and baud rate filled in" src="images/tutorial/web-05-serial-filled.png" /></p>
+<p><em>Port and baud rate filled in.</em></p>
+<table>
+<thead>
+<tr>
+<th>Module</th>
+<th>Typical baud rate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Quectel LG290P</td>
+<td>115200 or 460800</td>
+</tr>
+<tr>
+<td>u-blox ZED-F9P</td>
+<td>38400 (USB CDC ignores baud)</td>
+</tr>
+<tr>
+<td>Unicore UM980</td>
+<td>115200</td>
+</tr>
+<tr>
+<td>Quectel LC29H</td>
+<td>115200</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Not sure? Try 115200 first.</strong> The calibration routine probes multiple baud rates automatically, so a wrong guess there is recoverable. For normal data flow, though, the value must be correct.</p>
+<h3 id="64-verify-data-is-flowing">6.4 Verify data is flowing</h3>
+<p>Click <strong>Save &amp; Restart</strong>. The page redirects and the service restarts. Then:</p>
+<ol>
+<li>Go back to the <strong>Status</strong> page.</li>
+<li>Within 10–20 seconds the satellite count should climb and the position should resolve.</li>
+<li>The RTCM output section should list message types such as <code>1005</code>, <code>1074</code>, <code>1094</code>, <code>1114</code>, <code>1124</code>, <code>1134</code>.</li>
+</ol>
+<p>Satellites but no position means the antenna is probably indoors or obstructed. Nothing at all means the port or baud rate is wrong.</p>
+<blockquote>
+<p><strong>What the RTCM message numbers mean:</strong><br />
+<code>1005</code>/<code>1006</code> = base station position and antenna metadata · <code>1074</code>/<code>1084</code>/<code>1094</code>/<code>1114</code>/<code>1124</code>/<code>1134</code> = GPS/GLONASS/Galileo/QZSS/BDS/NavIC observations (MSM4) · <code>1230</code> = GLONASS code-phase biases.</p>
+<p>The <code>1005</code> message is what tells a rover <em>where your base is</em>. Without it, the rover receives corrections but cannot apply them.</p>
+</blockquote>
+<hr />
+<h2 id="7-coordinate-calibration">7. Coordinate Calibration</h2>
+<p>A base station only produces useful corrections if it knows <strong>its own position</strong> very precisely. One metre of error in the base position becomes one metre of error in every rover's output. Calibration is how the base learns its position.</p>
+<p>Open <strong>Calibrate</strong> in the top navigation.</p>
+<p><img alt="Calibration page — hardware check" src="images/tutorial/cal-01-hardware.png" /></p>
+<p><em>The calibration page. The first step is verifying the hardware connection.</em></p>
+<h3 id="71-the-four-methods">7.1 The Four Methods</h3>
+<p>The calibration page offers up to four methods. <strong>Which ones appear depends on what your module supports</strong> — a receiver that can only act as a rover cannot perform a self-survey, and so on.</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>What it does</th>
+<th>Accuracy</th>
+<th>Time</th>
+<th>Requires</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>CORS one-click fix</strong></td>
+<td>Streams corrections from a public CORS network into the module, waits for a fixed solution, then averages the position.</td>
+<td>Centimetre</td>
+<td>5–10 min</td>
+<td>Dual-mode module, CORS account, network</td>
+</tr>
+<tr>
+<td><strong>Measure only</strong></td>
+<td>Same principle, but the position comes from an <strong>external rover</strong> rather than the module itself.</td>
+<td>Centimetre</td>
+<td>5–10 min</td>
+<td>Dual-mode module, external rover, CORS account</td>
+</tr>
+<tr>
+<td><strong>Survey-in</strong></td>
+<td>The module averages its own single-point position over a long period.</td>
+<td>Decimetre</td>
+<td>15–60 min</td>
+<td>Single-mode module</td>
+</tr>
+<tr>
+<td><strong>Manual</strong></td>
+<td>You enter known coordinates.</td>
+<td>Depends on your survey</td>
+<td>Instant</td>
+<td>A surveyed point</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Which should you use?</strong> With a CORS account and a dual-mode module, use <strong>CORS one-click fix</strong> — it is the most accurate and the most automatic. If your module cannot switch into rover mode, use <strong>survey-in</strong>. If you already have surveyed coordinates for the point, use <strong>manual</strong>.</p>
+<h3 id="72-cors-one-click-fix">7.2 CORS One-Click Fix</h3>
+<p>This is the main event. Here is what happens under the hood, so you know what to expect:</p>
+<ol>
+<li><strong>The server asks the data plane to release the serial port.</strong> It cannot calibrate while simultaneously streaming.</li>
+<li><strong>It identifies the module</strong> by sending version queries and reading responses.</li>
+<li><strong>It backs up the current configuration</strong> so it can be restored if anything fails.</li>
+<li><strong>It switches the module into rover mode</strong> and configures the required NMEA output.</li>
+<li><strong>It connects to the CORS mount point</strong> and pipes the corrections into the module's serial port.</li>
+<li><strong>It waits for a fixed solution.</strong> This requires good sky visibility: the quality indicator must reach 4 for 30 consecutive seconds.</li>
+<li><strong>It collects samples</strong> for the configured duration (default 300 s), rejects outliers beyond 3σ, and averages the remainder.</li>
+<li><strong>It writes the averaged position</strong> to the module as the fixed base coordinates.</li>
+<li><strong>It restores the module to base mode</strong>, replays the message configuration, restarts, and verifies.</li>
+</ol>
+<h4 id="step-1-detect-the-module">Step 1 — Detect the module</h4>
+<p>Click <strong>Detect Module</strong>.</p>
+<p><img alt="Detecting the module" src="images/tutorial/cal-02-detect-running.png" /></p>
+<p><em>Detection in progress — the server is probing the serial port.</em></p>
+<p><img alt="Module detected" src="images/tutorial/cal-03-detect-done.png" /></p>
+<p><em>Module identified, with firmware version and capabilities.</em></p>
+<p>If detection fails, the usual causes are: the serial port is still held by the main data thread (wait a few seconds and retry), the baud rate is wrong, or the module is unpowered.</p>
+<h4 id="step-2-choose-the-method">Step 2 — Choose the method</h4>
+<p><img alt="Method selection — CORS" src="images/tutorial/cal-04-method-cors.png" /></p>
+<p><em>Method selection. CORS one-click fix is selected.</em></p>
+<h4 id="step-3-enter-the-cors-account">Step 3 — Enter the CORS account</h4>
+<p><img alt="CORS account entry" src="images/tutorial/cal-05-cors-account.png" /></p>
+<p><em>Entering the CORS provider details.</em></p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>What to enter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Host</td>
+<td>The provider's server address, e.g. <code>120.253.239.161</code></td>
+</tr>
+<tr>
+<td>Port</td>
+<td>The port for the coordinate system you want — see the note below</td>
+</tr>
+<tr>
+<td>Username</td>
+<td>Your CORS account name</td>
+</tr>
+<tr>
+<td>Password</td>
+<td>Your CORS account password</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>Port and coordinate system are paired.</strong> A typical provider offers the <em>same</em> mount points on multiple ports, one per datum:<br />
+- <code>8002</code> → WGS84<br />
+- <code>8001</code> → CGCS2000</p>
+<p>Pick the wrong port and you will often still connect and receive data — but the position never reaches a fixed solution, because the correction frame does not match what the module expects. <strong>If you are stuck at float forever, check this first.</strong></p>
+</blockquote>
+<h4 id="step-4-fetch-and-select-the-mount-point">Step 4 — Fetch and select the mount point</h4>
+<p>Click <strong>Fetch Mount Points</strong>.</p>
+<p><img alt="Mount points loaded" src="images/tutorial/cal-06-mounts-loaded.png" /></p>
+<p><em>The mount point list retrieved from the provider.</em></p>
+<p>Choose one that:</p>
+<ul>
+<li><strong>Covers your area</strong> — mount point names usually encode the region or network.</li>
+<li><strong>Broadcasts multi-constellation, multi-frequency data</strong> — names containing <code>RTCM33</code>, <code>5G16F</code> (five systems, sixteen frequencies) and similar indicate this.</li>
+</ul>
+<p><img alt="Mount point selected" src="images/tutorial/cal-07-mount-selected.png" /></p>
+<p><em>Mount point selected.</em></p>
+<p>Once everything is entered, the page summarises the task.</p>
+<p><img alt="Ready to start" src="images/tutorial/cal-08-ready.png" /></p>
+<p><em>All parameters entered. Review before starting.</em></p>
+<h4 id="step-5-start-and-confirm">Step 5 — Start and confirm</h4>
+<p><img alt="Confirmation dialog" src="images/tutorial/cal-09-confirm.png" /></p>
+<p><em>The confirmation dialog. Read it — it states the antenna must not move.</em></p>
+<blockquote>
+<p><strong>Before you click start:</strong> the antenna must be firmly mounted and must not move for the whole calibration. The routine discards samples showing jumps larger than 500 m, but a wobbly antenna will simply prevent a fixed solution from ever happening.</p>
+</blockquote>
+<p>Click <strong>Start</strong>.</p>
+<h4 id="step-6-let-it-run">Step 6 — Let it run</h4>
+<p><img alt="Calibration running" src="images/tutorial/cal-10-running.png" /></p>
+<p><em>Calibration running — the stage indicator shows where the routine is.</em></p>
+<p><img alt="Waiting for a fixed solution" src="images/tutorial/cal-11-fix-wait.png" /></p>
+<p><em>In <code>FIX_WAIT</code>: the live metrics panel shows quality, satellites, PDOP, and how long the fix has held.</em></p>
+<p>The <code>FIX_WAIT</code> stage is where patience is required. Two numbers in the metrics panel tell you whether it is going well:</p>
+<ul>
+<li><strong>Quality</strong> — must climb to <code>4</code>. If it sits at <code>1</code> or <code>2</code>, the corrections are not reaching the module or the sky view is poor.</li>
+<li><strong>Fixed for</strong> — must reach 30 seconds continuously. If it keeps resetting to 0, the fix is dropping out; something is unstable.</li>
+</ul>
+<p><img alt="Collecting samples" src="images/tutorial/cal-12-collect.png" /></p>
+<p><em>In <code>COLLECT</code>: samples arriving, with the running count, spread, and convergence shown.</em></p>
+<p>Collection is short compared to the wait. The routine stops early once the sample spread converges; in a good run this takes well under a minute.</p>
+<p><img alt="Calibration complete" src="images/tutorial/cal-13-done.png" /></p>
+<p><em><code>DONE</code>. The result panel appears with the final coordinates and accuracy.</em></p>
+<p><img alt="Result summary" src="images/tutorial/cal-14-summary.png" /></p>
+<p><em>The summary card: sample count, standard deviation, and the coordinates written to the module.</em></p>
+<p><img alt="Stage timeline" src="images/tutorial/cal-15-timeline.png" /></p>
+<p><em>The stage timeline — how long each phase took. Useful when a run is slow and you want to know which phase ate the time.</em></p>
+<p>Read the summary card like this:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>What it tells you</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Samples</td>
+<td>How many position samples went into the average. More is better, but 60+ is already solid.</td>
+</tr>
+<tr>
+<td>Std dev</td>
+<td>Horizontally how tightly the samples clustered. <strong>Under 5 cm is good</strong>; above 20 cm, check the antenna and CORS quality.</td>
+</tr>
+<tr>
+<td>Coordinates</td>
+<td>What was written to the module. These are what rovers will be positioned relative to.</td>
+</tr>
+</tbody>
+</table>
+<p>Compare the recorded spread to what the metrics showed live. A tight live fix that produces a wide sample spread usually means the antenna moved, or the module lost and regained the fix mid-collection.</p>
+<p>The stage indicator walks through these phases:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>What is happening</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>HOLD</code></td>
+<td>Waiting for the data thread to release the serial port</td>
+</tr>
+<tr>
+<td><code>OPEN</code></td>
+<td>Opening the serial port exclusively</td>
+</tr>
+<tr>
+<td><code>DETECT</code></td>
+<td>Identifying the module</td>
+</tr>
+<tr>
+<td><code>BACKUP</code></td>
+<td>Saving the current configuration</td>
+</tr>
+<tr>
+<td><code>ROVER_SETUP</code></td>
+<td>Switching the module to rover mode</td>
+</tr>
+<tr>
+<td><code>NMEA_SETUP</code></td>
+<td>Configuring GGA/GSA output</td>
+</tr>
+<tr>
+<td><code>RTK_REINIT</code></td>
+<td>Restarting the module to start RTK solving</td>
+</tr>
+<tr>
+<td><code>GGA_RATE_CHECK</code></td>
+<td>Measuring the actual GGA output rate</td>
+</tr>
+<tr>
+<td><code>GGA_WAIT</code></td>
+<td>Waiting for a position</td>
+</tr>
+<tr>
+<td><code>CORS_CONNECT</code></td>
+<td>Connecting to the CORS mount point</td>
+</tr>
+<tr>
+<td><code>FIX_WAIT</code></td>
+<td><strong>Waiting for a fixed solution — this is the long one</strong></td>
+</tr>
+<tr>
+<td><code>COLLECT</code></td>
+<td>Averaging the position samples</td>
+</tr>
+<tr>
+<td><code>CORS_CLOSE</code></td>
+<td>Disconnecting from CORS</td>
+</tr>
+<tr>
+<td><code>SAVE</code></td>
+<td>Writing the position to the module</td>
+</tr>
+<tr>
+<td><code>RESTART</code></td>
+<td>Restarting the module</td>
+</tr>
+<tr>
+<td><code>VERIFY_MODE</code></td>
+<td>Confirming the module is back in base mode</td>
+</tr>
+<tr>
+<td><code>VERIFY_RTCM</code></td>
+<td>Confirming RTCM output resumed</td>
+</tr>
+<tr>
+<td><code>DONE</code></td>
+<td>Complete</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Do not close the page, do not restart the server, and do not touch the antenna.</strong> The routine runs on its own; no intervention is needed.</p>
+<h4 id="what-fixed-solution-means">What "fixed solution" means</h4>
+<p>The module reports a quality indicator in its GGA sentence:</p>
+<table>
+<thead>
+<tr>
+<th>Quality</th>
+<th>Meaning</th>
+<th>Usable for a base station?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Single point</td>
+<td>No</td>
+</tr>
+<tr>
+<td>2</td>
+<td>DGPS / float</td>
+<td>No</td>
+</tr>
+<tr>
+<td>4</td>
+<td><strong>RTK fixed</strong></td>
+<td><strong>Yes</strong></td>
+</tr>
+<tr>
+<td>5</td>
+<td>RTK float</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<p>The routine requires quality 4 for 30 continuous seconds, with at least 12 satellites and PDOP ≤ 2.0. If that does not happen within 180 seconds, it attempts a fallback to a float solution — but only if the float solution is stable enough. If neither works, the calibration fails and the module is restored.</p>
+<p><strong>What a good run looks like.</strong> From a field calibration on an LG290P with a CORS mount point:</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Time to fix</td>
+<td>~48 s from entering <code>FIX_WAIT</code></td>
+</tr>
+<tr>
+<td>Fix held</td>
+<td>70 s continuous (requirement: 30 s)</td>
+</tr>
+<tr>
+<td>Quality</td>
+<td>4</td>
+</tr>
+<tr>
+<td>Satellites</td>
+<td>22–35</td>
+</tr>
+<tr>
+<td>PDOP</td>
+<td>0.9</td>
+</tr>
+<tr>
+<td>Samples collected</td>
+<td>81</td>
+</tr>
+<tr>
+<td>Standard deviation</td>
+<td>1.9 cm</td>
+</tr>
+<tr>
+<td><code>1005</code> broadcast delta</td>
+<td>0.01 cm</td>
+</tr>
+</tbody>
+</table>
+<p>That last row is worth explaining. After writing the position, the routine reads the module's <code>1005</code> message back and compares the ECEF coordinates it actually broadcasts against what was written. A delta near zero means the module accepted the position and is broadcasting it identically. A large delta means the write did not take — usually because the module rejected the command or restarted before applying it.</p>
+<h3 id="73-measure-only-external-rover">7.3 Measure Only (External Rover)</h3>
+<p><strong>Measure Only</strong> covers a specific situation: you want to fix the base position, but the base module cannot operate as a rover, or you already have a rover obtaining a fixed solution at the base's location.</p>
+<p>How it differs from CORS one-click fix:</p>
+<ul>
+<li>The base module is <strong>not</strong> switched into rover mode.</li>
+<li>The correction stream is <strong>not</strong> fed into the base module.</li>
+<li>A <strong>separate rover</strong> — on your phone, a handheld controller, or another receiver — provides the fixed position.</li>
+</ul>
+<p>Use this when your base module is rover-incapable but you still want a surveyed position rather than a survey-in average.</p>
+<blockquote>
+<p><strong>Note:</strong> for a module that can only act as a rover, <code>external_rover</code> is the <em>only</em> method offered. In that case you supply coordinates from your surveying equipment.</p>
+</blockquote>
+<h3 id="74-survey-in">7.4 Survey-In</h3>
+<p>Survey-in is the self-contained option — no CORS account, no network.</p>
+<p>The module averages its own single-point position over a long period. Configure:</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Meaning</th>
+<th>Typical value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Observation count</td>
+<td>How many fixes to average</td>
+<td>2000–5000</td>
+</tr>
+<tr>
+<td>Accuracy limit</td>
+<td>Stop early once estimated accuracy beats this</td>
+<td>2.0 m</td>
+</tr>
+<tr>
+<td>Minimum duration</td>
+<td>Minimum time before it may stop</td>
+<td>5–15 min</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Accuracy expectation:</strong> survey-in is limited by the module's single-point accuracy, typically 1–2 m. It is <em>not</em> a substitute for CORS calibration. Use it when nothing better is available, or when decimetre accuracy suffices for your application.</p>
+<p>The routine monitors convergence and stops only when the position is stable — a running 3σ spread below 2 cm held for 60 seconds.</p>
+<h3 id="75-manual-coordinates">7.5 Manual Coordinates</h3>
+<p>If you have already surveyed the point with professional equipment, enter the coordinates directly:</p>
+<table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Format</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Latitude</td>
+<td>Decimal degrees, e.g. <code>25.203523</code></td>
+</tr>
+<tr>
+<td>Longitude</td>
+<td>Decimal degrees, e.g. <code>110.277483</code></td>
+</tr>
+<tr>
+<td>Ellipsoidal height</td>
+<td>Metres, e.g. <code>138.316</code></td>
+</tr>
+</tbody>
+</table>
+<p>The server writes these to the module as the fixed base position. <strong>Make sure the coordinate frame matches</strong> what your rover expects — WGS84 is the usual choice, though CGCS2000 is used in some Chinese contexts. Getting this wrong produces a constant offset in every rover's output.</p>
+<h3 id="76-what-the-calibration-actually-writes">7.6 What the Calibration Actually Writes</h3>
+<p>After a successful calibration the module holds:</p>
+<ul>
+<li><strong>The averaged ECEF position</strong> — the arithmetic mean of the accepted samples after 3σ outlier rejection (not the module's internal Kalman output).</li>
+<li><strong>The RTCM message configuration</strong> — which message types, at what rate.</li>
+<li><strong>Base mode</strong> — the module is left operating as a base station, not a rover.</li>
+</ul>
+<p>The server also records a <strong>calibration history</strong> in its database: method used, sample count, final spread, resulting coordinates. This is what the status page displays as the base position.</p>
+<blockquote>
+<p><strong>Why the 1005 message matters:</strong> the base position is broadcast to rovers in the <code>1005</code> (or <code>1006</code>) RTCM message. A rover receiving <code>1074</code> and friends but no <code>1005</code> has no idea where the base is and cannot compute a correction. If your rovers never fix, check that <code>1005</code> appears in the RTCM output list on the status page.</p>
+</blockquote>
+<h3 id="77-troubleshooting-calibration">7.7 Troubleshooting Calibration</h3>
+<p>The routine is deliberately verbose when it fails — it reports which check failed and what it observed. Common failures:</p>
+<h4 id="module-not-responding-during-detection">"Module not responding" during detection</h4>
+<p>The serial port is held by something else, usually the main data thread finishing its previous cycle.</p>
+<ul>
+<li>Wait 20 seconds and retry.</li>
+<li>If it persists, stop the service, calibrate, then start the service again.</li>
+</ul>
+<h4 id="waiting-for-fixed-solution-timed-out-quality-stuck-at-1-or-2">"Waiting for fixed solution timed out" — quality stuck at 1 or 2</h4>
+<p>The most common calibration failure. The error message lists what to check, in order:</p>
+<ol>
+<li><strong>CORS account permissions.</strong> Some accounts only provide code-phase (DGPS) corrections, or only authorise a specific coordinate frame. You connect and receive data, but the module never applies the corrections. Verify with your provider.</li>
+<li><strong>Mount point relevance.</strong> A mount point from a distant network or a different accuracy class may not help. Prefer one advertised as base-station-grade and covering your region.</li>
+<li><strong>Port and frame pairing.</strong> As in §7.2 — <code>8002</code> is WGS84, <code>8001</code> is CGCS2000. A mismatch produces exactly this symptom.</li>
+<li><strong>Antenna obstruction.</strong> If quality hovers near 4–5 but never locks, this is the cause. Move the antenna to open sky.</li>
+</ol>
+<h4 id="glonass-observations-present-but-no-mt1230">"GLONASS observations present but no MT1230"</h4>
+<p>A warning, not a failure:</p>
+<blockquote>
+<p><em>This mount point broadcasts GLONASS observations (1084) but does not broadcast MT1230 code-phase biases. The module can track GLONASS but usually cannot include it in ambiguity resolution, which significantly reduces the fix success rate.</em></p>
+</blockquote>
+<p>Treat it as a hint about correction-stream completeness, <strong>not as a verdict on your CORS account.</strong> Here is the full picture, because the naive reading of this warning is wrong and we measured it.</p>
+<p>The audit line that triggers the warning looks like this:</p>
+<pre><code>[CORS_DOWNLINK] 976 B/s, MSM4=GPS+GLONASS+Galileo+QZSS+BDS, 1005=30帧, 1230=缺失
+</code></pre>
+<p>Five constellations, nearly a kilobyte per second, station position present — and <code>1230</code> missing. Nothing in that line looks like a fault, which is exactly why it is worth printing: the link is healthy, the byte counter climbs, the satellite count even improves. Without the audit you would never know the stream was incomplete.</p>
+<p><strong>But "incomplete" does not mean "unusable".</strong> Same module, same account, same antenna, same day — the only variable is the mount point:</p>
+<table>
+<thead>
+<tr>
+<th>Mount point</th>
+<th>MT1230</th>
+<th>Result</th>
+<th>Samples</th>
+<th>Raw σ after convergence</th>
+<th><code>verify_delta</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>RTCM33_GRCEJ</code></td>
+<td>no</td>
+<td><strong>DONE</strong></td>
+<td>60</td>
+<td><strong>5.4 / 7.9 / 1.2 cm</strong> (E/N/U)</td>
+<td>0.0001 m</td>
+</tr>
+<tr>
+<td><code>RTCM33_GRCEJ_CPB</code></td>
+<td>yes</td>
+<td><strong>DONE</strong></td>
+<td>81</td>
+<td>19.8 / 75.8 / 6.0 cm (E/N/U)</td>
+<td>0.0000 m</td>
+</tr>
+</tbody>
+</table>
+<p>Both fixed. The mount point <strong>without</strong> <code>1230</code> produced the tighter, more consistent solution — 9.6 cm overall accuracy against 78.6 cm. So <code>1230</code> is a real and desirable property of a correction stream, but it is not the thing that decides whether you get a fix.</p>
+<p>What actually decided the outcome that week was upstream of the mount point entirely:</p>
+<table>
+<thead>
+<tr>
+<th>Elapsed</th>
+<th>Quality</th>
+<th>Satellites</th>
+<th>PDOP</th>
+<th>Stage message</th>
+<th>Note</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0 s</td>
+<td>1</td>
+<td>11</td>
+<td>99.99</td>
+<td>waiting for 0/300 s</td>
+<td>module freshly started</td>
+</tr>
+<tr>
+<td>60 s</td>
+<td>1</td>
+<td>13</td>
+<td>4.44</td>
+<td>waiting for 29/300 s</td>
+<td></td>
+</tr>
+<tr>
+<td>180 s</td>
+<td>1</td>
+<td>14</td>
+<td>3.58</td>
+<td>waiting for 117/300 s</td>
+<td></td>
+</tr>
+<tr>
+<td>250 s</td>
+<td>2</td>
+<td>18</td>
+<td>1.96</td>
+<td>waiting for 242/300 s</td>
+<td></td>
+</tr>
+<tr>
+<td>370 s</td>
+<td>2</td>
+<td>20</td>
+<td>2.7</td>
+<td>timeout</td>
+<td>float hit rate 0/560</td>
+</tr>
+</tbody>
+</table>
+<p>Quality climbed <code>1 → 2</code> during that run, so the corrections <em>were</em> being applied — the link worked. But quality never reached <code>4</code>. Re-running the identical mount point after an explicit module restart, with the antenna left in the same place, gave quality <code>4</code> within a minute and completed normally (record #1 above).</p>
+<p>Four things worth carrying away:</p>
+<ol>
+<li><strong><code>1230</code> is a quality signal, not a gate.</strong> If you have a choice, prefer a mount point that broadcasts it. If you do not, calibrate anyway — you will very likely still fix. Do not burn hours hunting for a <code>1230</code> mount point when the real problem is that your module has been running for six hours.</li>
+<li><strong>Restart the module before you diagnose the CORS account.</strong> A module that has been powered up for a long time accumulates a stale almanac, a drifted clock model, or a stuck tracking channel, and its quality indicator will sit at <code>2</code> no matter how good the corrections are. Power-cycle, wait for a full re-acquisition, then try again. This one habit resolves most "CORS is broken" reports.</li>
+<li><strong>The failure diagnostic lists causes; it does not rank them.</strong> The routine points at account permissions, mount point relevance, and module state. All three were "correct" in the failed run above — and none of them was the cause.</li>
+<li><strong>A high satellite count is not evidence of anything.</strong> Twenty satellites at PDOP 1.96 with quality stuck at <code>2</code> is a receiver-tracking problem, not a sky-view problem.</li>
+</ol>
+<h4 id="float-solution-unstable">"Float solution unstable"</h4>
+<p>The routine attempted a float fallback but could not get a stable one — only 7 of 349 candidate epochs met the admission criteria. Same causes as above: frame mismatch, account permissions, or antenna obstruction.</p>
+<h4 id="quality-stuck-at-1-and-float-solution-unstable-check-the-modules-msm-output-first">Quality stuck at 1 and "float solution unstable" — check the module's MSM output first</h4>
+<p>This one is worth its own section, because every outward sign points at the CORS account and none of them is the actual cause.</p>
+<p>Symptom, in order:</p>
+<ol>
+<li>The module reaches <code>FIX_WAIT</code> and sits there. Quality stays at <code>1</code> (single point) the whole time.</li>
+<li>The routine reports <code>[FLOAT-DOWNGRADE]</code> but the float hit rate is terrible — the log shows something like <code>292/344</code> on a <em>good</em> run versus <code>7/349</code> on a bad one.</li>
+<li>Calibration ends <code>FAILED</code> with "float solution unstable".</li>
+<li>Meanwhile the status page shows a healthy stream at several hundred bytes per second.</li>
+</ol>
+<p>The trap: hundreds of bytes per second does not mean the stream is usable. A base station emitting only <code>1005</code> is a perfectly valid, perfectly useless stream — it carries the antenna position and nothing else. No satellite observations means no rover anywhere can fix against it.</p>
+<p><strong>Verify it from the module, not from the UI.</strong> Ask the module what it is actually configured to emit:</p>
+<pre><code>$PQTMCFGMSGRATE,W,RTCM3-107X,1,0        # GPS MSM4   }
+$PQTMCFGMSGRATE,W,RTCM3-108X,1,0        # GLONASS     }
+$PQTMCFGMSGRATE,W,RTCM3-109X,1,0        # Galileo     } one shared rate
+$PQTMCFGMSGRATE,W,RTCM3-111X,1,0        # QZSS        } for all systems
+$PQTMCFGMSGRATE,W,RTCM3-112X,1,0        # BeiDou      }
+$PQTMCFGMSGRATE,W,RTCM3-113X,1,0        # NavIC       }
+$PQTMCFGMSGRATE,W,RTCM3-1005,1          # station position
+</code></pre>
+<p>Read back and look at the second field. A broken module answers <code>...,0,0</code> — rate zero — for every MSM entry while <code>1005</code> stays at <code>1</code>:</p>
+<pre><code>$PQTMCFGMSGRATE,OK,RTCM3-107X,0,0*7D     ← 0 = disabled
+$PQTMCFGMSGRATE,OK,RTCM3-112X,0,0*79     ← 0 = disabled
+$PQTMCFGMSGRATE,OK,RTCM3-1005,1*0A       ← 1 = enabled
+</code></pre>
+<p><strong>How it happens.</strong> A calibration that fails partway restores the module from the backup taken at <code>BACKUP</code>, which is the state the module was in <em>before</em> calibration started. If MSM rates were already zero at that point — because of an earlier interrupted run, a factory reset, or a module that shipped in a rover profile — the rollback faithfully puts back a module that emits <code>1005</code> only. <code>MSG_SETUP</code> is supposed to configure MSM4, but rollback runs before it, and on the next attempt the module cannot help the calibration either: as a rover it receives the CORS corrections but has no observations of its own to combine them with, so quality never leaves <code>1</code>.</p>
+<p>It is a self-reinforcing state. Every failed run restores the broken configuration.</p>
+<p><strong>The fix.</strong> Write the rates back and persist them:</p>
+<ol>
+<li>Set <code>RTCM3-1005</code> to <code>0</code> first. This silences the serial line — at 10 Hz, <code>1005</code> alone fills the receive buffer and swallows the replies to your own commands.</li>
+<li>Write <code>1,0</code> to all six MSM entries.</li>
+<li>Read each one back to confirm.</li>
+<li>Restore <code>RTCM3-1005</code> to <code>1</code>.</li>
+<li>Send <code>$PQTMSAVEPAR</code> to write to NVM, then <code>$PQTMSRR</code> to reboot.</li>
+</ol>
+<p>Afterwards the serial stream should show the full set:</p>
+<pre><code>1005 x15   1074 x14   1094 x15   1114 x3   1124 x15
+</code></pre>
+<p>Re-run calibration. On our test unit the float hit rate went from <code>7/349</code> to <code>292/344</code> and the run completed <code>DONE</code> instead of <code>FAILED</code>, with the broadcast <code>1005</code> coordinate matching the written coordinate to within 0.1 mm.</p>
+<blockquote>
+<p><strong>A note on the two <code>PQTMCFGMSGRATE</code> quirks.</strong> The statement name for MSM is always <code>RTCM3-107X</code> — one bucket shared by <em>all</em> constellations. Writing a per-constellation name such as <code>RTCM3-1074</code> returns <code>ERROR,1</code>. And the <code>&lt;Offset&gt;</code> field is mandatory: <code>PQTMCFGMSGRATE,W,{name},{rate},{offset}</code>. Omit it and you get <code>ERROR,1</code> as well.</p>
+</blockquote>
+<h4 id="everything-looks-fine-but-quality-still-will-not-reach-4">Everything looks fine but quality still will not reach 4</h4>
+<p>Separate problem, physical rather than logical. Read what the routine reports at <code>FIX_WAIT</code>:</p>
+<pre><code>quality=1  sats=9  pdop=99.99
+</code></pre>
+<p><code>FIX_MIN_SATS</code> is <strong>12</strong> and <code>FIX_MAX_PDOP</code> is <strong>2.0</strong>. Nine satellites and an infinite PDOP will never qualify, no matter how good your account is. That is sky view, not software:</p>
+<ul>
+<li>Move the antenna to clear sky, ideally with no wall, roof edge, or tree above 30° elevation.</li>
+<li>Give the module 2–3 minutes after boot before calibrating; a cold almanac inflates PDOP.</li>
+<li>Raise "wait for fixed solution" to 300 seconds or more. <code>FIX_WAIT_TIMEOUT</code> defaults to 180.</li>
+<li>If you genuinely cannot get 12 satellites, the routine falls back to a float solution when <code>allow_float_collect</code> is set, and writes the coordinate with its real precision recorded. That is a legitimate outcome — a float coordinate converged to a few centimetres beats no base station at all — but the log will say so, and you should not present it as a centimetre-grade site.</li>
+</ul>
+<h4 id="the-module-was-left-in-rover-mode">The module was left in rover mode</h4>
+<p>If a calibration is interrupted between the rover-mode switch and the restore step — power loss, service killed — the module may be left as a rover. Symptoms: the main service fails to start the data plane, and the module emits no base-station RTCM.</p>
+<p>The server restores from its backup on every handled failure, including restarts. A hard power cut during the write window is the one case it cannot cover. In that case re-run calibration — the routine detects rover mode and returns the module to base mode as part of the restore path.</p>
+<hr />
+<h2 id="8-uploading-to-a-cloud-ntrip-caster">8. Uploading to a Cloud NTRIP Caster</h2>
+<p>Once the base is calibrated and streaming, publishing the stream lets rovers anywhere use it.</p>
+<h3 id="81-set-up-the-caster-side">8.1 Set up the caster side</h3>
+<p>On your NTRIP caster server, create:</p>
+<ul>
+<li>A <strong>mount point</strong> — a name for your stream, e.g. <code>2RTK</code>.</li>
+<li>A <strong>password</strong> for that mount point, which uploading clients must supply.</li>
+<li>An <strong>upload account</strong> — username and password.</li>
+</ul>
+<p>Note the caster's <strong>host</strong> and the <strong>port</strong> it accepts uploads on (commonly <code>2101</code>).</p>
+<h3 id="82-configure-the-upload-in-2rtkserver">8.2 Configure the upload in 2RTKserver</h3>
+<p>Go to <strong>Configuration</strong> and, under <strong>Data Outputs</strong>, tick <strong>① Upload to cloud NTRIP Caster</strong>.</p>
+<p><img alt="Caster upload configuration" src="images/tutorial/web-07-caster-upload.png" /></p>
+<p><em>Cloud caster upload enabled and filled in.</em></p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>What to enter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Caster address</td>
+<td>Your caster's hostname or IP</td>
+</tr>
+<tr>
+<td>Caster port</td>
+<td>The upload port, usually <code>2101</code></td>
+</tr>
+<tr>
+<td>Mount point</td>
+<td>The mount point name you created</td>
+</tr>
+<tr>
+<td>Password</td>
+<td>The mount point password</td>
+</tr>
+</tbody>
+</table>
+<p>Note there is <strong>no username field</strong> for uploads. NTRIP uploaders identify themselves by mount point and password; the upload account credentials are enforced by the caster itself or are not required for a source connection.</p>
+<h3 id="83-save-and-verify">8.3 Save and verify</h3>
+<p>Click <strong>Save &amp; Restart</strong>, then confirm in three places:</p>
+<ol>
+<li><strong>Status page</strong> — the output card shows <code>Authenticated · streaming</code> and a growing byte counter.</li>
+<li><strong>Caster side</strong> — the mount point appears in the caster's source table.</li>
+<li><strong>Log</strong> — the server logs an authenticated upload connection.</li>
+</ol>
+<p><img alt="Caster upload configured" src="images/tutorial/web-13-caster-filled.png" /></p>
+<p><em>The four fields filled in, ready to save.</em></p>
+<p><img alt="Upload output running" src="images/tutorial/web-15-outlets.png" /></p>
+<p><em>After saving: the output card reports the caster as authenticated, with bytes and frames counting up.</em></p>
+<p>Here is what a successful start looks like in <code>/opt/2RTKserver/server.log</code>:</p>
+<pre><code class="language-text">上传出口已启动：43.142.126.162:2101/2RTK（独立线程，断线自动重连）
+成功连接到43.142.126.162:2101
+上传出口认证通过，开始推送：43.142.126.162:2101/2RTK
+</code></pre>
+<p>The third line is the one that matters. If you see the first two but never the third, the caster rejected the handshake — wrong mount point name or wrong password.</p>
+<p><strong>Verify from the caster side too.</strong> A TCP connection staying open only proves the handshake succeeded; querying the source table proves the stream is actually registered. On any NTRIP 1.0 caster:</p>
+<pre><code class="language-bash"># Raw socket — caster port 2101 speaks a custom TCP protocol, not HTTP,
+# so curl/browser will fail with &quot;HTTP/0.9 when not allowed&quot;.
+python3 - &lt;&lt;'EOF'
+import socket
+s = socket.create_connection((&quot;43.142.126.162&quot;, 2101), timeout=10)
+s.sendall(b&quot;GET / HTTP/1.0\r\nUser-Agent: NTRIP check\r\n\r\n&quot;)
+buf = b&quot;&quot;
+while b&quot;ENDSOURCETABLE&quot; not in buf:
+    d = s.recv(4096)
+    if not d: break
+    buf += d
+print(buf.decode(errors=&quot;ignore&quot;))
+EOF
+</code></pre>
+<p>A live mount point appears as a <code>STR;</code> line. From the field test:</p>
+<pre><code class="language-text">STR;2RTK;Guilin;RTCM3.x;1084(2),1094(2),1114(2),1134(2),1005(2),1124(3),1074(2);
+    B2I+E5a+G3+L1+L5;BDS+GAL+GLO+GPS+IRNSS;2rtk;CHN;25.2035;110.2775;0;0;...
+</code></pre>
+<p>Three things to check in that line: the mount point name, the message list (it must include <code>1005</code>), and the coordinates (they must match your surveyed position, not <code>0.0</code>).</p>
+<blockquote>
+<p><strong>Test with a rover, not just a client.</strong> A plain NTRIP client connects and shows bytes flowing even if the stream is unusable. Real RTK performance requires the <code>1005</code> message to be present and the correction frame to match.</p>
+</blockquote>
+<hr />
+<h2 id="9-relay-mode">9. Relay Mode</h2>
+<p>Relay mode makes 2RTKserver a <strong>re-distributor</strong>: it pulls a stream from an upstream caster and re-publishes it.</p>
+<p><strong>Why use it?</strong></p>
+<ul>
+<li><strong>Bridging networks.</strong> Your rovers sit on a private network that cannot reach the provider directly, but this box can reach both.</li>
+<li><strong>Extending a stream's reach.</strong> You have one good mount point and several consumers that need it.</li>
+<li><strong>Testing.</strong> Verify an upstream stream is healthy before pointing production traffic at it.</li>
+</ul>
+<h3 id="91-configure-the-relay-source">9.1 Configure the relay source</h3>
+<p>Go to <strong>Configuration</strong> and set <strong>Mode → <code>relay</code></strong>.</p>
+<p><img alt="Relay mode selected" src="images/tutorial/web-16-relay-mode.png" /></p>
+<p><em>Mode set to <code>relay</code>. The source fields appear; the serial fields disappear.</em></p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>What to enter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Relay address</td>
+<td>The upstream caster's host</td>
+</tr>
+<tr>
+<td>Relay port</td>
+<td>The upstream caster's port, usually <code>2101</code></td>
+</tr>
+<tr>
+<td>Username</td>
+<td>Your account on the upstream caster</td>
+</tr>
+<tr>
+<td>Password</td>
+<td>That account's password</td>
+</tr>
+</tbody>
+</table>
+<h3 id="92-fetch-the-mount-point-list">9.2 Fetch the mount point list</h3>
+<p>Click <strong>Fetch Mount Points</strong>. The box connects to the upstream caster on your behalf and parses its source table — the browser cannot do this itself, because port 2101 is a custom TCP protocol rather than HTTP.</p>
+<p>This step is also a credential test: if the fetch succeeds, the host, port, and account are all correct.</p>
+<p><img alt="Relay mount points fetched" src="images/tutorial/web-17-relay-mounts-loaded.png" /></p>
+<p><em>The upstream source table retrieved — 1323 mount points in this case.</em></p>
+<p>Pick one and enter it in the mount point field:</p>
+<p><img alt="Relay mount point selected" src="images/tutorial/web-18-relay-filled.png" /></p>
+<p><em>Upstream credentials filled in and a mount point selected.</em></p>
+<blockquote>
+<p><strong>Example — CRTK.net:</strong> a public caster reachable at <code>CRTK.net:2101</code> with username <code>C</code> and password <code>C</code>. Its source table listed <strong>1323 mount points</strong> during testing, nearly all carrying <code>1005,1006,...,1230</code> — a full RTCM 3.x set. Any of them works for a relay demo. The example here uses <code>NONO</code> (Amou, France).</p>
+</blockquote>
+<h3 id="93-verify-the-pull">9.3 Verify the pull</h3>
+<p>Save and restart. The relay connection is logged as:</p>
+<pre><code class="language-text">进入中继模式
+收到realy caster服务器响应: ['HTTP/1.1 200 OK', 'Server: NTRIP Millipede Server 0.8.1', ...]
+Relay NTRIP server authentication passed, receiving RTCM data
+</code></pre>
+<p>The status page then reports the relay as the data source:</p>
+<p><img alt="Relay running" src="images/tutorial/web-19-relay-live.png" /></p>
+<p><em>Relay mode active: source <code>CRTK.net:2101/NONO</code>, forwarded to the cloud caster, bytes accumulating.</em></p>
+<p>Notice the source line reads <code>CRTK.net:2101/NONO</code> — the upstream host <em>and</em> mount point, so you can always tell which stream is being redistributed.</p>
+<h3 id="94-where-the-relayed-data-goes">9.4 Where the relayed data goes</h3>
+<p>Relay output is governed by the same <strong>Data Outputs</strong> checkboxes as serial mode. All three can run at once:</p>
+<ul>
+<li>Pull from the upstream caster and push to your own cloud caster.</li>
+<li>Pull and serve on the built-in local caster.</li>
+<li>Pull and output to a radio.</li>
+</ul>
+<blockquote>
+<p><strong>Bandwidth note:</strong> relay mode uses bandwidth for both the incoming and outgoing stream. On a metered or slow link, watch for dropped frames — the status page byte counters show throughput.</p>
+</blockquote>
+<hr />
+<h2 id="10-built-in-local-caster">10. Built-in Local Caster</h2>
+<p>Rather than pushing to an external server, 2RTKserver can serve NTRIP <strong>directly</strong> on your LAN. For a private base station this is often the better choice: no public server, no internet dependency, lower latency.</p>
+<h3 id="101-enable-it">10.1 Enable it</h3>
+<p>In <strong>Configuration</strong>, under <strong>Data Outputs</strong>, tick <strong>② Local NTRIP Caster</strong>.</p>
+<p><img alt="Local caster configuration" src="images/tutorial/web-10-local-caster.png" /></p>
+<p><em>The built-in local caster enabled.</em></p>
+<p><img alt="Local caster switched on" src="images/tutorial/web-21-local-caster-on.png" /></p>
+<p><em>Ticked and saved — the listen address and port are set below.</em></p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>What to enter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Listen address</td>
+<td>Bind address, e.g. <code>0.0.0.0</code> for all interfaces, or a specific LAN IP</td>
+</tr>
+<tr>
+<td>Listen port</td>
+<td>TCP port to serve on, e.g. <code>2102</code></td>
+</tr>
+</tbody>
+</table>
+<p>Once enabled and saved, the status page shows the mount point, credentials, and current client count:</p>
+<p><img alt="Local caster running" src="images/tutorial/web-22-lc-live.png" /></p>
+<p><em><code>Running</code>, <code>1 / 16</code> clients connected. That count is live — it goes up as rovers connect.</em></p>
+<h3 id="102-connect-a-rover">10.2 Connect a rover</h3>
+<p>Point your rover or NTRIP client at:</p>
+<pre><code>Host:         &lt;box-ip&gt;   (or 2rtk.local on mDNS-capable networks)
+Port:         &lt;listen port&gt;
+Mount point:  2RTK       (shown on the configuration page)
+Credentials:  as displayed on the configuration page
+</code></pre>
+<p>The default credentials are fixed: username <code>2RTK</code>, password <code>2RTK</code>. Change them only if you need to.</p>
+<h3 id="103-verify-it-like-a-real-client">10.3 Verify it like a real client</h3>
+<p>The built-in caster follows the NTRIP spec closely enough that any client works. You can confirm this without one, using two raw sockets:</p>
+<pre><code class="language-bash"># 1) Source table — served without credentials, so clients can discover the mount point
+python3 - &lt;&lt;'EOF'
+import socket
+s = socket.create_connection((&quot;192.168.1.71&quot;, 2102), timeout=8)
+s.sendall(b&quot;GET / HTTP/1.0\r\nUser-Agent: NTRIP probe\r\n\r\n&quot;)
+print(s.recv(4096).decode(errors=&quot;ignore&quot;))
+EOF
+</code></pre>
+<pre><code class="language-text">SOURCETABLE 200 OK
+CAS;192.168.1.71;2102;2RTK NTRIP Caster;2RTK;0;CHN;43.578903011;-0.739368313;0.0.0.0;0;none
+NET;2RTK;2RTK;B;N;none;none;none;none
+STR;2RTK;2RTK-Base;RTCM 3.2;1004(1),1005(1),1008(1),1012(1),1019(1),1033(1),1077(1),1087(1),1097(1),1107(1),1127(1);2;GPS+GLO+GAL+SBAS+BDS;;;43.578903011;-0.739368313;0;0;2RTK;none;B;N;0;
+ENDSOURCETABLE
+</code></pre>
+<p>Two details worth reading out of that table. The <strong>mount point is <code>2RTK</code></strong> and the <strong>credentials are <code>2RTK</code>/<code>2RTK</code></strong>, both fixed. And the coordinates <code>43.578903011, -0.739368313</code> are the relayed station's position — proof that the data being served is genuinely the upstream stream, passed through unchanged.</p>
+<pre><code class="language-bash"># 2) Stream — correct password gets 200 + data, wrong password gets 401
+python3 - &lt;&lt;'EOF'
+import base64, socket
+def probe(pw):
+    s = socket.create_connection((&quot;192.168.1.71&quot;, 2102), timeout=8)
+    auth = base64.b64encode(f&quot;2RTK:{pw}&quot;.encode()).decode()
+    s.sendall((f&quot;GET /2RTK HTTP/1.0\r\nUser-Agent: NTRIP probe\r\n&quot;
+               f&quot;Authorization: Basic {auth}\r\nNtrip-Version: Ntrip/2.0\r\n\r\n&quot;).encode())
+    head = s.recv(256).split(b&quot;\r\n&quot;)[0].decode()
+    s.settimeout(3)
+    total = 0
+    try:
+        while total &lt; 60000:
+            d = s.recv(8192)
+            if not d: break
+            total += len(d)
+    except socket.timeout:
+        pass
+    print(f&quot;password={pw!r:8} -&gt; {head}  {total} bytes&quot;)
+probe(&quot;2RTK&quot;)
+probe(&quot;bad&quot;)
+EOF
+</code></pre>
+<pre><code class="language-text">password='2RTK'   -&gt; HTTP/1.1 200 OK  60828 bytes
+password='bad'    -&gt; HTTP/1.1 401 Unauthorized  0 bytes
+</code></pre>
+<p>That <code>401</code> matters: it means the caster enforces credentials rather than serving everyone. A rover that shows "connected but no fixed solution" against an open caster is usually the opposite problem, so knowing which you have saves a lot of debugging.</p>
+<h3 id="104-port-conflicts">10.4 Port conflicts</h3>
+<p>A detail worth understanding: the <strong>listen port</strong> genuinely occupies that TCP port on the box. The <strong>relay port</strong> and <strong>caster port</strong> are <em>outbound</em> destinations — the box connects to them from an ephemeral source port. So you can have the local caster on <code>2102</code> while also relaying from an upstream caster on <code>2101</code>; they do not conflict.</p>
+<p>What <em>does</em> conflict is two local processes binding the same port — including a previous instance that has not fully exited. If the local caster fails to start, check for a stale process.</p>
+<hr />
+<h2 id="11-radio-telemetry-passthrough">11. Radio Telemetry Passthrough</h2>
+<p>Where rovers are out of network range, corrections can go out over a UHF radio instead. The box sends the RTCM stream to a second serial port, which drives a radio modem.</p>
+<h3 id="111-enable-it">11.1 Enable it</h3>
+<p>In <strong>Configuration</strong>, under <strong>Data Outputs</strong>, tick <strong>③ Radio telemetry passthrough</strong>.</p>
+<p><img alt="Radio configuration" src="images/tutorial/web-23-radio-config.png" /></p>
+<p><em>Radio telemetry passthrough enabled: port and baud rate fields appear.</em></p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>What to enter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Radio port</td>
+<td>The serial device your radio's data cable is connected to, e.g. <code>/dev/ttyUSB1</code></td>
+</tr>
+<tr>
+<td>Baud rate</td>
+<td><strong>Must match the radio's configured rate.</strong> Default <code>115200</code>.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="112-how-it-behaves">11.2 How it behaves</h3>
+<ul>
+<li><strong>Direction is one-way: transmit only.</strong> The box broadcasts corrections and does not read anything back from the radio. This suits standard broadcast-RTK setups where rovers only listen.</li>
+<li><strong>The radio is a second serial device.</strong> If it is also a CH340-class adapter, it will appear as the next available <code>/dev/ttyUSB*</code> — typically <code>ttyUSB1</code> if the GNSS module took <code>ttyUSB0</code>. Use <strong>Scan Ports</strong> next to the radio field to enumerate them.</li>
+<li><strong>Baud rate must match hardware.</strong> Unlike the GNSS side, there is no auto-probing here. Configure the radio itself (via its own utility or DIP switches) and enter the same rate here.</li>
+<li><strong>It needs its own port.</strong> If the box has only one USB serial adapter and it is taken by the GNSS module, there is nothing to send to. The setting saves, but the output will report that it is enabled and not running.</li>
+</ul>
+<p>Check what you actually have before configuring:</p>
+<pre><code class="language-bash">ls -l /dev/ttyUSB* /dev/ttyACM*
+</code></pre>
+<pre><code class="language-text">crw-rw---- 1 root dialout 188, 0 Nov 11 07:54 /dev/ttyUSB0
+</code></pre>
+<p>One device means one port. With the GNSS module on <code>ttyUSB0</code>, a radio needs a second adapter — usually a second CH340 or a USB-to-RS232 cable.</p>
+<h3 id="113-choosing-a-radio-and-rate">11.3 Choosing a radio and rate</h3>
+<p>RTCM MSM4 from a multi-constellation receiver runs at roughly <strong>2–4 kbit/s</strong>, but transient peaks are higher. A 9600 baud link is usually too narrow and will drop messages, which degrades rover accuracy. Practical minimums:</p>
+<table>
+<thead>
+<tr>
+<th>Link rate</th>
+<th>Suitability</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>9600 baud</td>
+<td>Marginal — expect dropped messages</td>
+</tr>
+<tr>
+<td>19200 baud</td>
+<td>Workable for MSM4 with reduced message set</td>
+</tr>
+<tr>
+<td>38400 baud and above</td>
+<td>Comfortable</td>
+</tr>
+</tbody>
+</table>
+<p>If your rovers fix slowly or intermittently over radio, the link rate is the first thing to check.</p>
+<h3 id="114-range-and-why-the-base-height-matters">11.4 Range, and why the base height matters</h3>
+<p>A radio link is line-of-sight in practice. A 1 W UHF modem gives a few kilometres in open terrain and considerably less in hilly or built-up areas. Two things compensate:</p>
+<ul>
+<li><strong>Antenna height.</strong> A base antenna 10 m up reaches substantially further than one at 2 m. This is the single biggest range improvement.</li>
+<li><strong>A second radio at a repeater site</strong>, if you need to cover a valley.</li>
+</ul>
+<p>Because RTCM is a one-way broadcast, you cannot retransmit lost messages. Rovers simply wait for the next epoch, so a marginal link shows up as slow fixes rather than disconnection.</p>
+<blockquote>
+<p><strong>📷 PHOTO PLACEHOLDER — radio-setup</strong><br />
+<em>Needed: the radio modem cabled to the box, showing the data port and the antenna.</em></p>
+</blockquote>
+<hr />
+<h2 id="12-maintenance">12. Maintenance</h2>
+<h3 id="checking-service-health">Checking service health</h3>
+<pre><code class="language-bash">systemctl status 2rtkserver          # is it running?
+journalctl -u 2rtkserver -n 100      # recent log
+journalctl -u 2rtkserver -f          # follow live
+</code></pre>
+<h3 id="restarting">Restarting</h3>
+<pre><code class="language-bash">sudo systemctl restart 2rtkserver
+</code></pre>
+<p>You can also restart from the web UI — the <strong>Save &amp; Restart</strong> button on the configuration page does this automatically after saving.</p>
+<h3 id="updating">Updating</h3>
+<pre><code class="language-bash">cd /opt/2RTKserver
+sudo bash update.sh
+</code></pre>
+<p>The updater preserves your configuration and calibration history.</p>
+<h3 id="uninstalling">Uninstalling</h3>
+<pre><code class="language-bash">cd /opt/2RTKserver
+sudo bash uninstall.sh
+</code></pre>
+<h3 id="backing-up">Backing up</h3>
+<p>Two things matter:</p>
+<table>
+<thead>
+<tr>
+<th>What</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Configuration and calibration history</td>
+<td><code>/opt/2RTKserver/2RTKserver.db</code> and <code>calibration.db</code></td>
+</tr>
+<tr>
+<td>Calibration working data</td>
+<td><code>/opt/2RTKserver/.calibration/</code></td>
+</tr>
+</tbody>
+</table>
+<p>Copy these off the box periodically. Restoring them into a fresh installation brings back your calibration without re-running it — useful if the hardware dies but the antenna position is unchanged.</p>
+<h3 id="a-note-on-uptime">A note on uptime</h3>
+<p>The service is registered with <code>Restart=always</code>. If it crashes, systemd restarts it automatically. A base station that must stay up should also be on a UPS — a power cut during a calibration write window is the one scenario the restore logic cannot handle (see §7.7).</p>
+<hr />
+<h2 id="appendix-a-supported-modules">Appendix A — Supported Modules</h2>
+<table>
+<thead>
+<tr>
+<th>Module</th>
+<th>Constellations</th>
+<th>Bands</th>
+<th>Roles</th>
+<th>Calibration methods</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Quectel LG290P</td>
+<td>GPS, GLONASS, Galileo, BDS, QZSS, NavIC</td>
+<td>Multi-band</td>
+<td>Base + Rover (dual)</td>
+<td>All four</td>
+</tr>
+<tr>
+<td>u-blox ZED-F9P</td>
+<td>GPS, GLONASS, Galileo, BDS</td>
+<td>L1/L2</td>
+<td>Base + Rover (dual)</td>
+<td>All four</td>
+</tr>
+<tr>
+<td>Unicore UM980 / N4</td>
+<td>GPS, GLONASS, Galileo, BDS, QZSS</td>
+<td>Multi-band</td>
+<td>Base + Rover (dual)</td>
+<td>All four</td>
+</tr>
+<tr>
+<td>Quectel LC29H</td>
+<td>GPS, GLONASS, Galileo, BDS</td>
+<td>L1/L5</td>
+<td>Limited</td>
+<td>Depends on variant</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Dual-mode</strong> means the module can act as either a base or a rover. This matters for calibration: the CORS one-click method needs the module to temporarily become a rover, receive corrections, and lock a fixed solution — a base-only receiver cannot do that, and must use survey-in instead.</p>
+<p>The calibration page detects the module and only offers the methods it can actually perform. If you expected to see CORS one-click but it is not there, the module either is not reporting dual-mode capability or was not detected correctly.</p>
+<hr />
+<h2 id="appendix-b-common-problems">Appendix B — Common Problems</h2>
+<h3 id="the-web-page-does-not-open">The web page does not open</h3>
+<table>
+<thead>
+<tr>
+<th>Check</th>
+<th>Command / action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Is the service running?</td>
+<td><code>systemctl status 2rtkserver</code></td>
+</tr>
+<tr>
+<td>Is it listening?</td>
+<td><code>ss -lntp \| grep 5757</code></td>
+</tr>
+<tr>
+<td>Firewall blocking?</td>
+<td><code>sudo ufw status</code> — allow 5757 from your LAN</td>
+</tr>
+<tr>
+<td>Wrong IP?</td>
+<td>Check the installer output, or <code>ip addr</code></td>
+</tr>
+<tr>
+<td>Proxying <code>.local</code>?</td>
+<td>Use the IP address instead; add <code>*.local</code> to proxy bypass</td>
+</tr>
+</tbody>
+</table>
+<h3 id="no-satellites-on-the-status-page">No satellites on the status page</h3>
+<p>The module is talking but not tracking. Almost always the antenna:</p>
+<ul>
+<li>Is it connected? SMA connectors are fragile — check the centre pin.</li>
+<li>Does it have sky view? Indoors you will get zero or a handful of satellites.</li>
+<li>Is the antenna powered? Active antennas need bias-T power. Most modules supply it, but some carrier boards need a jumper.</li>
+</ul>
+<h3 id="satellites-tracked-but-position-never-resolves">Satellites tracked but position never resolves</h3>
+<p>The receiver has satellites but no fix. Usually:</p>
+<ul>
+<li>Too few satellites for a fix — needs 4 minimum, realistically 6+ for a stable position.</li>
+<li>Very high PDOP — poor geometry, often caused by a restricted sky view.</li>
+<li>The module is in a mode that suppresses position output.</li>
+</ul>
+<h3 id="data-flows-but-rovers-do-not-fix">Data flows but rovers do not fix</h3>
+<p>This is the classic <code>1005</code> problem. Check the status page RTCM output list:</p>
+<ul>
+<li><strong>Is <code>1005</code> (or <code>1006</code>) present?</strong> Without it, the rover has no base position and cannot apply corrections.</li>
+<li><strong>Is the calibration actually complete?</strong> An uncalibrated base may emit <code>1005</code> with a coarse single-point position, which gives metre-level results at best.</li>
+<li><strong>Does the frame match?</strong> WGS84 versus CGCS2000 mismatch produces a constant offset.</li>
+</ul>
+<h3 id="the-calibration-keeps-timing-out-at-fix_wait">The calibration keeps timing out at FIX_WAIT</h3>
+<p>Work through §7.7 in order. The most frequently overlooked causes are the port/frame pairing and the CORS account's permission scope — both let you connect successfully and receive data while never permitting a fixed solution.</p>
+<h3 id="after-a-failed-calibration-the-main-service-will-not-start-the-data-plane">After a failed calibration, the main service will not start the data plane</h3>
+<p>The module was probably left in rover mode. Re-run calibration: the routine detects rover mode and restores base mode as part of its restore path. If the service cannot reach the module at all, verify the port still exists (<code>ls /dev/ttyUSB*</code>) and that nothing else is holding it (<code>sudo fuser -v /dev/ttyUSB0</code>).</p>
+<h3 id="local-caster-will-not-start">Local caster will not start</h3>
+<p>The listen port is occupied:</p>
+<pre><code class="language-bash">sudo ss -lntp | grep 2101
+</code></pre>
+<p>If a stale process from a previous run holds it, restart the service. If another application needs that port, choose a different listen port in the configuration.</p>
+<hr />
+<h2 id="credits">Credits</h2>
+<p>2RTKserver is built on Flask, pyserial, and the NTRIP protocol. Calibration command sequences are derived from each module's public protocol documentation.</p>
+<p>Feedback and issue reports are welcome.</p></main></body></html>

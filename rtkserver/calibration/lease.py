@@ -40,7 +40,13 @@ from . import workspace
 from .drivers.base import Channel
 
 # ==================== 时序常量（方案 §3.2 / §3.3） ====================
-YIELD_TIMEOUT = 8.0          # 等数据源线程退出的上限：read timeout 1s + join 5s + 2s 余量
+YIELD_TIMEOUT = 20.0         # 等数据面整轮让出的上限
+# 为什么从 8 秒放宽到 20 秒：让位要等的不只是 `join(5)`，而是**整轮 run_once 走完**，
+# 其中 `detect_serial()` 里的 `test_serial()` 单次就占 2 秒，还带
+# `@retry(max_retries=2, delay=1)` —— 配置端口试探失败一次就是 2+1+2+1+2 = 8 秒，
+# 直接吃光原来那个 8 秒上限，标定还没等到让位就先超时报错。
+# 自动扫描端口时更久（每档 2 秒 × 多个串口 × 多档波特率），但它每轮都会检查
+# `thread_exit_event` 并抛 ThreadExitRequested 提前退出，20 秒足够覆盖。
 YIELD_POLL = 0.1
 OPEN_ATTEMPTS = 10           # 打开串口重试次数（每次 200ms，合计 2s）
 OPEN_INTERVAL = 0.2
@@ -216,7 +222,7 @@ class SerialLease:
         if not self._wait_dataplane_yield():
             self._drop_gate()
             self._write_terminal('FAILED', '数据面未能让出串口')
-            return False, ('数据源线程仍在读取串口，8 秒内没有退出。'
+            return False, (f'数据源线程仍在读取串口，{YIELD_TIMEOUT:.0f} 秒内没有退出。'
                            '请稍后重试；若反复出现请重启服务（此时模块可能正在做波特率扫描）')
 
         self.stage = 'HOLD'
@@ -253,17 +259,25 @@ class SerialLease:
                 f'标定结果会被打断。请先在配置页把数传口改掉或关掉数传')
 
     def _wait_dataplane_yield(self):
-        """§3.2 第 5 步：等 `run_once` 的 finally 把数据源线程 join 掉。
+        """§3.2 第 5 步：等 `run_once` 把数据源线程 join 掉。
 
         注意 `worker_thread` 被置 None 之后，run_once 还要走完"停出口、关 ser"，
         所以 open() 那边必须有重试，不能只看这一个信号。
+
+        **还要看 `run_once_active`**（真机踩过，2026-11-11 05:51）：
+        `run_once()` 在起数据源线程**之前**就先 `detect_serial()` 打开了串口，
+        那几秒 `worker_thread` 仍是 None。只判 `worker_thread` 的话守卫会放行，
+        两边同时 open 同一个口，标定的 `$PQTMVERNO` 被主程序的探测读走，
+        报"模块无应答（串口收到了 224 字节）"——看起来像硬件问题，其实是抢口。
         """
         deadline = time.time() + YIELD_TIMEOUT
         while time.time() < deadline:
             if state.shutdown_event.is_set():
                 return False
             worker = state.worker_thread
-            if worker is None or not worker.is_alive():
+            if (worker is None or not worker.is_alive()) and not state.run_once_active:
+                # 双条件都空才动手：`run_once_active` 覆盖了"还没起线程但在探测串口"
+                # 这段窗口，`worker_thread` 覆盖了"线程已起、正在跑数据面"。
                 return True
             self.beat()                              # 让位期间也要喂心跳，否则 30 秒被误杀
             time.sleep(YIELD_POLL)

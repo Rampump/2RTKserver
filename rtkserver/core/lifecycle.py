@@ -134,6 +134,25 @@ def run_once():
         time.sleep(1)
         return
 
+    # 从这一行开始，本轮就算"数据面占用中"：`detect_serial()` 会在起线程之前
+    # 打开串口探测，标定方必须能看到这个标志才不会在同一时刻抢同一个口。
+    state.run_once_active = True
+    try:
+        _run_once_body()
+    finally:
+        state.run_once_active = False
+
+
+def _run_once_body():
+    """`run_once()` 的实际内容。拆出来只为让 `run_once_active` 覆盖整轮。"""
+    # 标定租约已置 gate：这一轮本来就不该起数据面。
+    # 主循环入口已经判过 `_calibration_gate()`，但标定方是**在两次循环之间**
+    # 才置位的，那时主循环可能已经过了那个判断正往这里走。进来再判一次，
+    # 否则会让位窗口里又起一轮、又去 open 串口（05:51 那次就是这么撞上的）。
+    if state.calibration_hold.is_set():
+        logging.info("标定租约已持有串口，本轮不启动数据面")
+        return
+
     # 退出信号只在新一轮开始时清除（原先是放在 finally 里，会把还没退出的老线程"复活"）
     state.thread_exit_event.clear()
     # 换数据源后，上一轮的消息类型不能带进来，否则源列表会描述已不存在的数据
@@ -383,6 +402,7 @@ def main():
             if (cfg.get('mode') or 'none') == 'none':
                 # 让状态页能明确显示"等待配置"，而不是一片空白
                 state.run_status['mode'] = '等待配置'
+                state.run_status['mode_key'] = 'unconfigured'
                 state.run_status['data_source'] = '尚未选择数据源（串口 / 中继）'
                 state.run_status['target_caster'] = '尚未选择数据出口'
                 # 首次使用也必须能看到本机 IP（安卓只能靠它访问）

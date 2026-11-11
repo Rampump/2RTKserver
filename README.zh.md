@@ -30,6 +30,8 @@ sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone 
 
 完整说明见 [INSTALL.md](INSTALL.md) · [English](INSTALL.en.md)。
 
+**完整使用教程（安装 → 标定 → 发布）：** [完整使用教程（中文）](docs/tutorial.zh.md) · [tutorial.en.md](docs/tutorial.en.md)
+
 > **从 Windows 复制粘贴的坑**：直接粘贴，不要手打。这一行是纯 ASCII、没有换行，
 > 能完整黏贴过去；但 `CR LF` 换行、全角标点（，；：）、以及窗口太窄导致命令折行，
 > 这三种情况都会让它失败。

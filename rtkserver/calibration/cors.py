@@ -381,7 +381,15 @@ class CorsClient:
                             f'无法连接 {self.host}:{self.port}，请检查网络与端口',
                             {'error': str(e)})
         except Exception as e:                       # noqa: BLE001 - connect 异常种类杂
-            raise CorsError(ERR_NETWORK, f'连接失败：{e}', {'error': str(e)})
+            # 异常自带空消息的情况真实存在：`ThreadExitRequested()`、
+            # `ConnectionResetError()` 之类不带参数的异常 `str(e)` 就是空串，
+            # 拼出来是"连接失败："——冒号后什么都没有，现场完全无法定位。
+            # 这种情况至少把类型名留下，别让用户对着一行没有信息量的红字发呆。
+            # 注意不能写 `{e or type(e).__name__}`：异常对象本身是 truthy，
+            # `or` 永远不会回退到类型名，必须显式比 `str(e)`。
+            text = str(e) or type(e).__name__
+            raise CorsError(ERR_NETWORK, f'连接失败：{text}',
+                            {'error': str(e), 'type': type(e).__name__})
 
         try:
             sock.settimeout(NTRIP_HANDSHAKE_TIMEOUT)

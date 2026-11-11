@@ -364,20 +364,32 @@ def api_calibration_start():
             'methods': list(_METHOD_LABEL),
         }), 400
 
-    # 型号能力闸门。未知型号（module 为空 / 认不出来）按流动站处理，
-    # 只允许「仅测量」—— 这是需求里定的默认，也是最保守的假设。
-    allowed = driver_manager.methods_of(module)
-    if method not in allowed:
-        driver = driver_manager.get_driver_by_id(module)
-        name = driver.DISPLAY_NAME if driver else '未知模块'
-        role = driver.role_label() if driver else '流动站（仅测量）'
-        return jsonify({
-            'ok': False,
-            'error': (f'{name} 是「{role}」，不支持「{_METHOD_LABEL.get(method, method)}」。'
-                      f'可用的方式：{" / ".join(_METHOD_LABEL.get(m, m) for m in allowed)}'),
-            'role': driver_manager.role_of(module),
-            'methods': list(allowed),
-        }), 400
+    # 型号能力闸门。**只在用户亲手指定了型号时生效。**
+    #
+    # `module` 为空有两种情况，语义完全不同，不能混为一谈：
+    #   1. 用户选了「自动识别」—— 型号得占住串口读出来才知道，**此刻就是未知**；
+    #   2. 用户指定了一个我们没注册的型号 —— 那确实该按最保守处理。
+    # 原实现一律按 role='rover' 拒掉 cors，真机上就直接踩了：页面留着默认的
+    # 「自动识别」，点「读取模块信息」明明认出了 `Quectel LG290P`，接着点
+    # 「CORS 一键固定」却被 400 顶回来「未知模块是「流动站（仅测量）」」。
+    #
+    # 与 `_reject_without_caps` / `_reject_write_without_fixed` 保持同一约定：
+    # **未指定型号时放行，运行时拿到真实驱动再判一次**。那两道闸门本来就这么写
+    # （见 service.py 里 "未指定型号时放行（运行时再判）" 的注释），只有这里漏了。
+    # 前端也在 `computeLocks()` 里同步改成"真正未知才全放开"。
+    if module:
+        allowed = driver_manager.methods_of(module)
+        if method not in allowed:
+            driver = driver_manager.get_driver_by_id(module)
+            name = driver.DISPLAY_NAME if driver else '未知模块'
+            role = driver.role_label() if driver else '流动站（仅测量）'
+            return jsonify({
+                'ok': False,
+                'error': (f'{name} 是「{role}」，不支持「{_METHOD_LABEL.get(method, method)}」。'
+                          f'可用的方式：{" / ".join(_METHOD_LABEL.get(m, m) for m in allowed)}'),
+                'role': driver_manager.role_of(module),
+                'methods': list(allowed),
+            }), 400
 
     if method in ('cors', 'external_rover'):
         cors = body.get('cors') or {}

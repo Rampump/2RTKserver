@@ -1240,6 +1240,10 @@ class CoordinateWriter:
                     raise
                 terminated = True
                 break
+            # 自收敛最长可能跑 7200 秒，而看门狗 30 秒没心跳就收租约。
+            # 这一段全程停在 SVIN_WAIT 一个阶段，`_set_stage` 只在阶段变化时喂心跳，
+            # 所以不显式喂的话，**任何**走自收敛的标定都会在 30 秒时被误杀。
+            self._beat()
             # 必须主动读串口：`survey_status()` 读的是 channel.cache['svin']，
             # 而 cache 靠 read_line 消费 `$PQTMSVINSTATUS` 行来填充。
             self._drain_svin(time.time() - started)
@@ -1411,6 +1415,9 @@ class CoordinateWriter:
                     raise
                 terminated = True
                 break
+            # 同 _step_svin_wait：这一段可能跑满整个档位时长（数十分钟），
+            # 全程停在 SVIN_WAIT，必须显式喂心跳，否则 30 秒就被看门狗收租约。
+            self._beat()
 
             # 必须持续消费串口：GGA 是这条路唯一的位置来源，
             # 不读串口 `channel.cache['gga']` 永远是空的。
@@ -2117,6 +2124,8 @@ class CoordinateWriter:
         nudged = False
         while time.time() < deadline:
             self._checkpoint()
+            # 这个窗口是 30 秒，正好等于看门狗的容忍上限，临界值不能赌。
+            self._beat()
             self._drain_gga(0.2)
             gga = channel.cache.get('gga') if channel else None
             if gga and gga.get('valid') and gga.get('lat') is not None:
@@ -2217,6 +2226,12 @@ class CoordinateWriter:
         first_q = None
         while time.time() < deadline:
             self._checkpoint()
+            # 这个循环最长等 POSITION_FIX_TIMEOUT（90 秒），而看门狗只容忍 30 秒
+            # 无心跳。`_checkpoint()` 只**检查**租约有没有被回收，它不喂心跳；
+            # 心跳只由 `_set_stage()` 在**阶段名变化**时推进。所以冷启动、或者
+            # 天线刚接上还在搜星的模块，必然在第 30 秒被判"标定线程已死"——
+            # 真机日志：GGA_WAIT 等 20 秒后直接 FAILED，报"30 秒无心跳"。
+            self._beat()
             self._drain_gga(0.2)
             gga = channel.cache.get('gga') or {}
             quality = gga.get('quality')
@@ -2287,6 +2302,11 @@ class CoordinateWriter:
 
         while True:
             self._checkpoint()
+            # 采集阶段最长 600 秒且**阶段名不变**（一直是 FIX_WAIT/COLLECT），
+            # `_set_stage` 的心跳在这里一次都不会触发。不显式喂就会被看门狗
+            # 在第 30 秒收走租约——真机表现是"等固定解等到一半突然 FAILED，
+            # 报 30 秒无心跳"，看起来像网络问题，实际是心跳没喂。
+            self._beat()
             # 周期性复核模式：base 模式下注入的 RTCM 不产生差分，
             # 不查就会一直跑到超时，最后误判成"信号差"。
             # **只在采集阶段查**：FIX_WAIT 是模糊度搜索期，此时往串口里插

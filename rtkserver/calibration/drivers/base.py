@@ -136,7 +136,17 @@ _IDENTIFY_NAMES = ('PQTMVERNO', 'PQTMSN', 'PQTMUNIQID')
 #   SRR → 仍继续输出约 5.6 s 的旧 NMEA → 5.67 s 出现 `$PQTMVER` 开机首帧。
 # 所以 20 s 是"约 3.5 倍余量"：既不会白等，也不会因固件冷启动慢一点就误判失败。
 REBOOT_REOPEN_DELAY = 0.8      # 关串口后等多久再重开（避开复位瞬间的残帧）
-REBOOT_BOOT_TIMEOUT = 20.0     # 等开机首帧的上限（首帧是哪条语句由驱动声明）
+# 等开机首帧 / 等串口恢复出数据的上限。
+# 真机取 20 s 时踩过坑：LG290P 首帧本身 5.67 s，但在 S905L3B 这类低性能
+# SBC 上，reopen 后再叠上 CH340 的读延迟，20 s 窗口会被吃光，于是"模块明明
+# 重启成功"被判成"没重启"。放宽到 45 s —— 代价只是真失败时多等 25 s，
+# 而误判的代价是整个标定流程作废、用户还得重来一轮。
+REBOOT_BOOT_TIMEOUT = 45.0
+
+# `wait_for()` 的单次读切片长度。
+# 只是"读一小段再回头看总期限到了没"，不代表等待上限；切片越小，
+# 心跳回调（续租约）越密，租约在长时间等待里才不会被判过期。
+WAIT_FOR_SLICE = 0.5
 
 # 回读不一致的重试次数（方案 §14 #6）。
 # 为什么是 1 而不是 3：偶发的"回读还是旧值"（刚重启完参数还没加载、串口里残留
@@ -863,20 +873,32 @@ class Channel:
         return 'timeout', ''
 
     def wait_for(self, name, timeout=15.0):
-        """等某个语句名出现（重启后等开机首帧用）。返回 `(found, line)`。"""
+        """等某个语句名出现（重启后等开机首帧用）。返回 `(found, line)`。
+
+        **不能把 `read_line()` 返回 None 当成"等不到"**：那只是这一小段
+        切片（`WAIT_FOR_SLICE`）内没凑出完整一行，模块重启期间本来就存在
+        整秒不发数据的空档。早先直接 `return False`，于是"等 20 秒开机首帧"
+        实际只等了 0.5 秒就判失败，报错文案还写着"20 秒内完全静默"——
+        LG290P 真机首帧在 5.67 s 才出现，这个 bug 让 CORS 标定必失败。
+        正确的提前退出条件只有两个：串口被关掉，或读链路报错（拔线/断电）。
+        无论有没有读到目标帧，期间收到的语句都照常进缓存，不改原有语义。
+        """
         deadline = time.time() + max(0.0, timeout)
         while True:
             remaining = deadline - time.time()
             if remaining <= 0:
                 return False, ''
-            line = self.read_line(min(remaining, 0.5))
+            line = self.read_line(min(remaining, WAIT_FOR_SLICE))
             if self.on_beat is not None:
                 try:
                     self.on_beat()
                 except Exception:
                     pass
             if line is None:
-                return False, ''
+                # 串口关闭 / 拔线断电：这两种再等下去也不会来数据
+                if not self.is_open or self.link_error:
+                    return False, ''
+                continue
             if message_name(line) == name.upper():
                 return True, line
             self.absorb(line)
@@ -1336,12 +1358,20 @@ class BaseDriver:
             if remaining <= 0:
                 return False, ''
             line = self.channel.read_line(min(remaining, 1.0))
+            if self.on_beat is not None:
+                try:
+                    self.on_beat()
+                except Exception:
+                    pass
             if line:
                 return True, line
             # 整帧 RTCM 不进 `_next_line` 的返回值，但它确实是"活着"的证据：
             # 基站模式下模块只播 RTCM，这时一行 NMEA 都等不到。
             if (self.channel.counters.get('frames') or 0) > 0:
                 return True, ''
+            # 串口被关 / 拔线断电：再等也不会来数据
+            if not self.channel.is_open or self.channel.link_error:
+                return False, ''
 
     # ---------- 必须由子类实现的能力（方案 §5.1） ----------
     def detect(self):

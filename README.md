@@ -34,6 +34,8 @@ Already running an older version? Use [`update.sh`](#upgrading) instead, or clic
 
 Full walkthrough: [INSTALL.en.md](INSTALL.en.md) · [中文安装指南](INSTALL.md).
 
+**Complete tutorial (installation → calibration → publishing):** [tutorial.en.md](docs/tutorial.en.md) · [完整使用教程（中文）](docs/tutorial.zh.md)
+
 > **Copying from a Windows browser:** paste it directly, don't retype. The line is plain
 > ASCII with no line breaks, so it survives copy/paste — but `CR LF` line endings,
 > full-width punctuation and window-wrap mid-command will all break it.

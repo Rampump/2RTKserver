@@ -35,6 +35,12 @@
 
       // ---- 登录页 ----
       'login.title': '管理员登录',
+      'doc.title.login': '2RTK NTRIP server · 登录',
+      'doc.title.index': '2RTK NTRIP server · 基准站状态',
+      'doc.title.config': '2RTK NTRIP server · 运行设置',
+      'doc.title.calibration': '2RTK NTRIP server · 一键标定',
+      'doc.title.upgrade': '2RTK NTRIP server · 检查更新',
+      'doc.title.password': '2RTK NTRIP server · 修改密码',
       'login.username': '用户名',
       'login.password': '密码',
       'login.submit': '登录',
@@ -79,6 +85,12 @@
       'rs.mdns.hint': '固定地址打不开、用 IP 却正常？多半是本机代理 / VPN 软件拦了 .local（表现为 502），把 *.local 加入直连即可。',
       'rs.android_hint': '安卓手机 / 平板不支持 .local 名字解析，请用上面的「本机 IP」访问。',
       'rs.waiting': '等待数据…',
+      'rs.target.none': '仅本地监控（未启用任何出口）',
+      'rs.target.caster': '上传 {host}:{port}/{mount}',
+      'rs.target.local': '本地 Caster {host}:{port}',
+      'rs.target.local_failed': '本地 Caster 启动失败（端口 {port} 不可用）',
+      'rs.target.radio': '数传 {port}',
+      'rs.target.radio_unconfigured': '数传 未配置串口',
 
       // 卫星星座字段
       'sat.sys_count': '观测星座数量',
@@ -154,6 +166,7 @@
       'mode.relay': '中继模式',
       'mode.none': '未配置',
       'mode.auto': '自动检测',
+      'mode.unconfigured': '等待配置',
 
       'up.unconfigured': '未启用上传出口',
       'up.unconfigured_hint': '未勾选「上传到云端 Caster」，本机不会向任何上游服务器发送数据。需要上传请在配置页勾选该出口。',
@@ -163,6 +176,13 @@
       'up.retrying_hint_noerr': '连接中断，正在重试。',
       'up.error_hint': '认证失败，请检查密码与挂载点配置。',
       'up.frames': '帧',
+      // 状态文案必须由前端按 state 取键：后端 state_text 是中文兜底，
+      // 直接渲染会让英文界面漏出中文。
+      'up.state.idle': '未配置',
+      'up.state.connecting': '连接中…',
+      'up.state.authed': '已认证 · 正在推送',
+      'up.state.retrying': '连接中断 · 重试中',
+      'up.state.error': '认证失败',
 
       'lc.disabled': '未启用',
       'lc.disabled_hint': '需要在「运行设置」里勾选启用本地 Caster 并保存。',
@@ -188,6 +208,7 @@
       // ---- 日志 / websocket ----
       'ws.connected': 'WebSocket连接成功，开始接收数据',
       'ws.received': '收到数据',
+      'ws.frame_run_status': '已收到基站运行状态',
       'ws.error': '连接错误',
       'ws.closed': '连接关闭 (代码: {code}): {reason}',
       'ws.data_error': '数据处理错误',
@@ -460,6 +481,8 @@
       'cal.interrupted.title': '上次标定被中断',
       'cal.interrupted.body': '上次标定在「{stage}」阶段被强制中断（端口 {port}，模块 {module}）。模块可能停在中间配置上：如果想继续用这块模块，请先重新标定，或点「读取模块信息」看一眼当前模式与坐标再决定。',
       'cal.stage.idle': '未开始',
+      // 后端 STAGE_TEXT 里 IDLE 是大写，缺这个键会回退成中文
+      'cal.stage.IDLE': '未开始',
       'cal.stage.PREPARE': '校验参数',
       'cal.stage.HOLD': '等待数据面让出串口',
       'cal.stage.OPEN': '打开串口',
@@ -703,6 +726,12 @@
 
       // ---- Login ----
       'login.title': 'Administrator Login',
+      'doc.title.login': '2RTK NTRIP server · Login',
+      'doc.title.index': '2RTK NTRIP server · Base Station Status',
+      'doc.title.config': '2RTK NTRIP server · Settings',
+      'doc.title.calibration': '2RTK NTRIP server · One-Click Calibration',
+      'doc.title.upgrade': '2RTK NTRIP server · Update',
+      'doc.title.password': '2RTK NTRIP server · Change Password',
       'login.username': 'Username',
       'login.password': 'Password',
       'login.submit': 'Login',
@@ -747,6 +776,12 @@
       'rs.mdns.hint': 'Fixed address fails but the IP works? A local proxy / VPN is intercepting .local (usually a 502) — add *.local to the proxy bypass list.',
       'rs.android_hint': 'Android phones/tablets cannot resolve .local names — use the Local IP above.',
       'rs.waiting': 'Waiting for data…',
+      'rs.target.none': 'Local monitoring only (no output enabled)',
+      'rs.target.caster': 'Upload {host}:{port}/{mount}',
+      'rs.target.local': 'Local caster {host}:{port}',
+      'rs.target.local_failed': 'Local caster failed to start (port {port} unavailable)',
+      'rs.target.radio': 'Radio {port}',
+      'rs.target.radio_unconfigured': 'Radio — serial port not configured',
 
       // Satellites fields
       'sat.sys_count': 'Systems Observed',
@@ -822,6 +857,7 @@
       'mode.relay': 'Relay Mode',
       'mode.none': 'Not Configured',
       'mode.auto': 'Auto-detect',
+      'mode.unconfigured': 'Waiting for configuration',
 
       'up.unconfigured': 'Upload output disabled',
       'up.unconfigured_hint': 'The "Upload to upstream Caster" output is not ticked, so nothing is sent upstream. Enable it on the settings page if you need uploading.',
@@ -831,6 +867,11 @@
       'up.retrying_hint_noerr': 'Connection lost, retrying.',
       'up.error_hint': 'Authentication failed. Check the password and mount point.',
       'up.frames': 'frames',
+      'up.state.idle': 'Not configured',
+      'up.state.connecting': 'Connecting…',
+      'up.state.authed': 'Authenticated · streaming',
+      'up.state.retrying': 'Disconnected · retrying',
+      'up.state.error': 'Authentication failed',
 
       'lc.disabled': 'Disabled',
       'lc.disabled_hint': 'Enable the local caster in Settings and save.',
@@ -856,6 +897,7 @@
       // ---- Logs / websocket ----
       'ws.connected': 'WebSocket connected, receiving data',
       'ws.received': 'Received data',
+      'ws.frame_run_status': 'Base station run status received',
       'ws.error': 'Connection error',
       'ws.closed': 'Connection closed (code {code}): {reason}',
       'ws.data_error': 'Data processing error',
@@ -1127,6 +1169,7 @@
       'cal.interrupted.title': 'Last calibration was interrupted',
       'cal.interrupted.body': 'The previous run was killed during stage "{stage}" (port {port}, module {module}). The module may be left in a half-written state: recalibrate before using it as a base station, or press "Read module info" to check its current mode and coordinates first.',
       'cal.stage.idle': 'Not started',
+      'cal.stage.IDLE': 'Not started',
       'cal.stage.PREPARE': 'Validating',
       'cal.stage.HOLD': 'Waiting for the data plane to release the port',
       'cal.stage.OPEN': 'Opening port',
@@ -1416,6 +1459,13 @@
 
     // 更新 <html lang>
     document.documentElement.setAttribute('lang', currentLang === 'zh' ? 'zh-CN' : 'en');
+
+    // 浏览器标签页标题：模板里的 <title> 是服务端渲染的死字符串，
+    // 切到英文时它不会跟着变，截图和别人分享链接时看到的仍是中文。
+    // 由 body[data-doc-title] 声明键名，这里统一替换。
+    var body = document.body;
+    var docKey = body && body.getAttribute('data-doc-title');
+    if (docKey) document.title = t(docKey);
   }
 
   function setLang(lang) {

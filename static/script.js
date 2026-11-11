@@ -143,6 +143,7 @@ let reconnectInterval;
 const MAX_RECONNECT_ATTEMPTS = 10;
 let reconnectAttempts = 0;
 const RECONNECT_DELAY = 3000; 
+let wsLoggedFirstFrame = false;   // 日志区只在首帧记一条，避免刷屏
 
 // 状态变量
 let systemCount = 0;
@@ -689,6 +690,7 @@ function initWebSocket() {
     console.log("WebSocket连接成功");
     reconnectAttempts = 0; // 重置重连计数
     clearInterval(reconnectInterval);
+    wsLoggedFirstFrame = false;   // 每轮重连后重新记录一次首帧
     
     addLog(I18N.t('ws.connected'), 'system');
     // 更新加载指示器
@@ -738,7 +740,13 @@ function initWebSocket() {
       const data = JSON.parse(event.data);
       console.log("收到WebSocket数据：", data);
 
-      addLog(`${I18N.t('ws.received')}: ${JSON.stringify(data, null, 2).substring(0, 100)}...`, 'info');
+      // 日志区给用户看，不应该打印原始 JSON：里面的 mode 是后端拼的中文串，
+      // 英文界面会漏出中文，而且整段 JSON 对使用者没有任何信息量。
+      // 只描述"这一帧带来了什么"，调试细节留在 console。
+      if (data.run_status && !wsLoggedFirstFrame) {
+        wsLoggedFirstFrame = true;
+        addLog(I18N.t('ws.frame_run_status'), 'info');
+      }
 
       // 隐藏加载指示器
       if (loadingIndicator && !loadingIndicator.classList.contains('hidden')) {
@@ -941,12 +949,49 @@ function updateStaticRunStatus(config) {
   }
 }
 
+// 把后端 describe_target_parts() 的结构化出口列表，按当前语言拼成一句话。
+// 后端给的是 {kind, host, port, mountpoint}，这里只负责取词，不做业务判断。
+function formatTargetParts(parts) {
+  if (!parts.length) return I18N.t('rs.target.none');
+  const out = parts.map(p => {
+    switch (p.kind) {
+      case 'caster':
+        return I18N.t('rs.target.caster')
+          .replace('{host}', p.host).replace('{port}', p.port)
+          .replace('{mount}', p.mountpoint);
+      case 'local_caster':
+        return I18N.t('rs.target.local')
+          .replace('{host}', p.host).replace('{port}', p.port);
+      case 'local_caster_failed':
+        return I18N.t('rs.target.local_failed').replace('{port}', p.port);
+      case 'radio':
+        return I18N.t('rs.target.radio').replace('{port}', p.port);
+      case 'radio_unconfigured':
+        return I18N.t('rs.target.radio_unconfigured');
+      default:
+        return p.text || '';
+    }
+  });
+  return out.filter(Boolean).join(' + ');
+}
+
 // 更新运行状态
 function updateRunStatus(status) {
   _lastRunStatus = status;
-  if (status.mode) runModeEl.textContent = status.mode;
+  // mode 是后端拼好的中文串（日志/控制台也用），英文界面会漏出中文。
+  // 后端另给 mode_key（serial / relay / unconfigured），这里优先查 i18n 表。
+  if (status.mode_key) {
+    runModeEl.textContent = I18N.t('mode.' + status.mode_key);
+  } else if (status.mode) {
+    runModeEl.textContent = status.mode;
+  }
   if (status.data_source) dataSourceEl.textContent = status.data_source;
-  if (status.target_caster) targetCasterEl.textContent = status.target_caster;
+  // target_caster 同样是后端拼的中文串；有 target_parts 时按当前语言重拼
+  if (Array.isArray(status.target_parts)) {
+    targetCasterEl.textContent = formatTargetParts(status.target_parts);
+  } else if (status.target_caster) {
+    targetCasterEl.textContent = status.target_caster;
+  }
   if (status.data_sent) dataSentEl.textContent = status.data_sent;
   if (status.run_time) runTimeEl.textContent = status.run_time;
   if (status.local_caster) updateLocalCaster(status.local_caster);
@@ -998,7 +1043,10 @@ function updateUploadStatus(info) {
   upSessionEl.textContent = info.session_time || '0h 0m 0s';
 
   const state = info.state || 'idle';
-  const stateText = info.state_text || state;
+  // 状态文案走 i18n 键；后端 state_text 只是中文兜底，直接用它会让英文界面漏出中文。
+  const stateKey = 'up.state.' + state;
+  const stateTr = I18N.t(stateKey);
+  const stateText = (stateTr && stateTr !== stateKey) ? stateTr : (info.state_text || state);
 
   if (!info.enabled) {
     setValue(upStatusEl, I18N.t('up.unconfigured'), 'warning');

@@ -911,14 +911,20 @@ class TestCalibrationIsolation(unittest.TestCase):
         self.assertIn('calibration_available', source)
 
     def test_core_touches_only_the_gate_slots(self):
-        """core 层与标定的唯一接触面是两个 gate 槽位 + 一个看门狗函数。
+        """core 层与标定的唯一接触面是两个 gate 槽位 + 一个看门狗函数 + 租约判据。
 
         允许清单之外任何 `calibration*` 符号出现在 core 里都要红：
         例如有人图省事在 `main()` 里直接 `service.start_diagnose()`，
         那就把"删掉标定包主程序照跑"这条彻底破坏了。
+
+        `calibration_owns_serial` 是刻意放行的第三个槽位：数据面（串口读循环）
+        必须知道"串口现在被标定占着，我该让出去"。它和 gate 槽位一样是**被动标志**
+        —— 置位的是标定包自己，数据面只读、不反调标定里的任何函数。
+        没有它，标定一占串口，读循环就会和它抢同一个 fd，两边都收到半截报文。
         """
         allowed = {'calibration_hold', 'calibration_beat',
-                   '_calibration_gate', 'CALIBRATION_BEAT_TIMEOUT'}
+                   '_calibration_gate', 'CALIBRATION_BEAT_TIMEOUT',
+                   'calibration_owns_serial'}
         offenders = []
         for subdir in ('core', 'outlets', 'sources', 'utils'):
             for path in self._py_files(subdir):

@@ -11,7 +11,7 @@ import time
 from ..core import state
 from ..core.constants import ART_LOGO, RELAY_IDLE_RECONNECT, RELAY_READ_TIMEOUT
 from ..core.distributor import distribute
-from ..core.status import describe_targets, push_run_status
+from ..core.status import describe_target_parts, describe_targets, push_run_status
 from ..utils.common import (ThreadExitRequested, clear_screen, format_bytes,
                             format_duration, interruptible_sleep)
 from .ntrip import connect_to_host, handshake_ntrip_client
@@ -36,8 +36,11 @@ def forward_relay(relay, cfg, thread_exit_event):
     total_bytes = 0
 
     state.run_status["mode"] = "中继模式"
+    state.run_status["mode_key"] = "relay"
     state.run_status["data_source"] = f"{cfg['relay_host']}:{cfg['relay_port']}/{cfg['relay_mountpoint']}"
     state.run_status["target_caster"] = describe_targets(cfg)
+    # 结构化版本：英文界面靠它重新拼，避免直接显示中文
+    state.run_status["target_parts"] = describe_target_parts(cfg)
     push_run_status()
 
     while not thread_exit_event.is_set():

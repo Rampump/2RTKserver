@@ -40,6 +40,9 @@
     external_rover: 'cal.method.measure'
   };
 
+  // 模块下拉框里代表「自动识别」的那一项（fillModules() 里也是这个值）
+  var AUTO_ID = '__auto__';
+
   // 会写模块 NVM 的方式。external_rover 是唯一一个"一个字节都不写"的，
   // 它决定了 RTCM 配置块要不要出现、完成后要不要显示「设为数据源」。
   function writesModule(method) {
@@ -53,6 +56,10 @@
     lastStage: '',
     lastTaskId: '',
     method: 'cors',
+    // 「读取模块信息」识别出来的型号 id（driver id，如 'lg290p'）。
+    // 下拉框停在「自动识别」时，它就是"按什么型号办事"的依据；
+    // 手动改型号或切换串口时清空，避免拿着上一块模块的身份去跑标定。
+    detectedModuleId: '',
     // cors 方式下的坐标来源：'measure'（正常走 CORS 测）或 'history'（复用）
     corsSource: 'measure',
     // manual 方式下的坐标来源：typing / history / measure_first
@@ -117,10 +124,18 @@
 
   function stageLabel(stage, fallback) {
     if (!stage) return t('cal.stage.idle');
-    var key = 'cal.stage.' + stage;
-    var text = t(key);
-    // I18N.t 找不到 key 时会原样返回 key，这里据此回退到后端文案
-    return (text && text !== key) ? text : (fallback || stage);
+    // 翻译表里的阶段键是**大写**（`cal.stage.FIX_WAIT`），后端枚举也是大写，
+    // 所以先按原样查。只有 `idle` 那种小写键才需要二次尝试 —— 之前这里
+    // 一律转小写去查，结果 25 个阶段只命中 IDLE 一个，其余 24 个全部
+    // 回退到后端的 `stage_text`（中文）。英文界面下状态行一直是中文，
+    // 根因就在这一行。
+    var raw = 'cal.stage.' + stage;
+    var text = t(raw);
+    if (text && text !== raw) return text;
+    var lower = 'cal.stage.' + String(stage).toLowerCase();
+    var alt = t(lower);
+    if (alt && alt !== lower) return alt;
+    return fallback || stage;
   }
 
   // 波特率：留空/'auto' → null（后端按型号官方档位逐档探测）。
@@ -286,6 +301,11 @@
         refreshBaudOptions();
         refreshModuleHint();
         if (data.running) startPolling();
+        // 没有在跑也要先探一次：上一轮可能已经结束，而后端还留着它的
+        // result / summary / logs。不探的话页面就是一片空白，用户只能
+        // 靠记忆回想"上次标到底成没成"。poll() 拿到终态会自己补摘要，
+        // 拿到"从没跑过"会安静地什么都不做。
+        else if (!STATE.timer) poll();
         return data;
       })
       .catch(function (err) {
@@ -338,12 +358,33 @@
     select.value = previous || '__auto__';
   }
 
+  // 下拉框选「自动识别」时返回这块型号的元数据，前提是「读取模块信息」
+  // 已经把真实型号认出来了（STATE.detectedModuleId）。
+  //
+  // 这里曾经直接 `return null`，真机上踩得很惨：用户留着默认的「自动识别」，
+  // 点了「读取模块信息」，页面明明显示出 `Quectel LG290P`，接着选「CORS 一键固定」
+  // 点开始 —— 后端 400「未知模块是「流动站（仅测量）」，不支持 CORS 一键固定」。
+  // 原因是 buildPayload() 发出的是 `module: null`，后端按最保守的 role='rover'
+  // 处理，直接把 cors 拒了。**识别结果只拿去渲染了，没有回写给请求用。**
+  //
+  // 自动识别的语义是"别让我选，你自己认"，那认出来之后就该按认出来的型号办事。
   function selectedModule() {
     var el = $('cal-module');
-    var id = el ? el.value : '__auto__';
+    var id = el ? el.value : AUTO_ID;
+    if (id === AUTO_ID && STATE.detectedModuleId) id = STATE.detectedModuleId;
     var all = (STATE.options && STATE.options.modules && STATE.options.modules.all) || [];
     for (var i = 0; i < all.length; i++) { if (all[i].id === id) return all[i]; }
     return null;
+  }
+
+  // 下拉框当前**真实**选中的值（'__auto__' 或具体型号 id）。
+  // 请求体里要发的是这个，不是 selectedModule()：自动识别时后者已经是
+  // 识别出来的型号，把它当"用户手选的型号"发出去，就丢掉了"按实测再认一次"
+  // 这层意思 —— 换了模块但没重读信息时，反而会用旧型号去卡新一轮识别。
+  function pickedModuleId() {
+    var el = $('cal-module');
+    var id = el ? el.value : AUTO_ID;
+    return id === AUTO_ID ? null : id;
   }
 
   // 当前型号的能力表。自动识别（__auto__）时返回 null，
@@ -423,7 +464,10 @@
     var caps = selectedCaps() || {};
     var writable = canWrite();
     var locks = { cors: '', survey_in: '', manual: '', external_rover: '' };
-    if (!mod) return locks;   // 自动识别：全部放开，后端按实际识别到的型号再拦
+    // 真的不知道是什么模块（自动识别 + 还没点过「读取模块信息」）：全部放开，
+    // 后端按实际识别到的型号再拦一次。识别出来了就走下面完整的角色/能力闸门 ——
+    // 否则「自动识别 + CORS」这条路前端一片绿灯、后端点下去就 400。
+    if (!mod) return locks;
 
     var name = mod.name || mod.id;
     var allowed = selectedMethods() || [];
@@ -830,6 +874,9 @@
     var hw = $('cal-hw');
     if (hw) hw.innerHTML = '';
     STATE.hwTaskId = null;
+    // 识别出的型号同理：新口上接的很可能是另一块板子，
+    // 拿着旧型号去卡能力锁 / 拼请求体，比"不知道"更糟。
+    STATE.detectedModuleId = '';
   }
 
   // 内部调用（扫描预填、点击结果行）时 `changed` 由这里自己判：值真变了才重置，
@@ -1515,7 +1562,6 @@
     var port = $('cal-port').value.trim();
     if (!port) { showError(t('cal.err.need_port')); return; }
     var baud = baudValue();
-    var module = selectedModule();
     var btn = $('cal-detect');
     if (btn) btn.disabled = true;
     showError('');
@@ -1535,7 +1581,8 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         port: port, baud: baud,
-        module: (module || {}).id || null
+        // 同理只发手选型号：自动识别就让后端自己去认
+        module: pickedModuleId()
       })
     })
       .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
@@ -1569,8 +1616,14 @@
     var box = $('cal-hw');
     if (!box) return;
     var mod = (report && report.module) || {};
+    // 把识别到的型号记下来，供 selectedModule() 在「自动识别」分支回退使用。
+    // 没有 `model_key` 说明这次没读通（模块不应答），保留上一次的值不动 ——
+    // 别因为一次超时就把"我是谁"抹掉，接着点开始反而又被后端按 rover 拒。
+    if (mod.model_key) {
+      STATE.detectedModuleId = String(mod.model_key);
+      applyCapabilities();
+    }
     var mode = (report && (report.mode || {}).text) || 'unknown';
-    // i18n 里没有这个键时 t() 会原样返回键名，这时退回模块报的原始模式串
     var modeLabel = t('cal.hw.mode.' + mode);
     if (modeLabel === 'cal.hw.mode.' + mode) modeLabel = String(mode);
     // 模块自报的串口参数（LG290P 是 PQTMCFGUART,R，N4 是 CONFIG）。
@@ -1673,7 +1726,18 @@
         return res.json();
       })
       .then(function (data) { if (data && data.ok) render(data); })
-      .catch(function () { /* 网络抖动忽略，下一轮再试 */ });
+      .catch(function () { /* 网络抖动忽略，下一轮再试 */ })
+      .then(function () {
+        // 首轮拿到"任务已结束"的快照时，也要把结果摘要拉回来。
+        // render() 里只在 running 由真变假那一刻调 fetchSummary()，那是给
+        // "本次会话从头看到尾"准备的；用户关掉页面再打开、或者直接刷新，
+        // 首轮快照的 wasRunning 就是 false，摘要区会一直是空的 —— 而后端
+        // 明明还留着上一轮完整的 result 和 summary。
+        if (!STATE.running && STATE.lastSnap && STATE.lastSnap.task_id
+            && TERMINAL[STATE.lastSnap.stage]) {
+          fetchSummary(STATE.lastSnap.task_id);
+        }
+      });
   }
 
   function render(snap) {
@@ -1870,6 +1934,7 @@
 
   function renderMetrics(live) {
     var guardBox = $('cal-freeze');
+    var metricsBox = $('cal-metrics');
     if (!live) {
       ['m-sats', 'm-pdop', 'm-fix', 'm-samples', 'm-sigma', 'm-gga'].forEach(function (id) {
         var el = $(id); if (el) { el.textContent = '—'; el.className = 'v'; }
@@ -1877,6 +1942,10 @@
       if (guardBox) guardBox.classList.add('is-hidden');
       return;
     }
+    // 指标卡在模板里带 `is-hidden`，而全文件只有这里能把它打开 ——
+    // 少了这一行，六张卡就永远是 display:none，标定跑完也看不到
+    // 卫星数 / PDOP / 固定状态。有 live 快照就一定该显示。
+    if (metricsBox) metricsBox.classList.remove('is-hidden');
     // 防抖护栏：标定阶段 GGA 原样透传，这里只告诉用户"护栏开着"以及"拦下过几条"。
     // 一旦有跳变被丢弃，说明过程中位置出现过异常（天线被碰、模块被切成基准站、
     // 掉星后单点解乱跳），文案必须跟着变——否则用户会以为一切正常。
@@ -2048,13 +2117,16 @@
       port: $('cal-port').value.trim(),
       baud: baudValue(),
       method: method,
-      // 选了型号就只让后端问这一个驱动：省 1~2 秒，选错型号也能立刻报出来
-      module: mod.id || null,
+      // 只发**用户手选**的型号；「自动识别」发 null，让后端按实测再认一遍。
+      // 这里不能发 `selectedModule().id`：自动识别时它已被识别结果填充，
+      // 发出去等于把"按实测认"降级成"按上次认的结果认"，换了模块就认错。
+      module: pickedModuleId(),
       remark: t('cal.remark.auto')
     };
 
     // RTCM 输出只在"会写模块 且 模块能配报文"时才下发。
     // 块被藏起来时不能顺手把 DOM 里那份值发出去 —— 那等于用户没做选择却被写了一份配置。
+    // `mod.id` 现在是"当前按哪块型号办事"（含自动识别出的型号），为空才是真的未知。
     var wantsRtcm = writesModule(method) && (mod.id ? !!caps.rtcm_out : true);
     if (wantsRtcm) {
       payload.msm = $('cal-msm').value;
@@ -2308,6 +2380,10 @@
     bindScanTable();
     on($('cal-load-mounts'), 'click', loadMountpoints);
     on($('cal-module'), 'change', function () {
+      // 用户亲手选了型号 → 以他的选择为准，识别结果让位（不再回退到识别值）。
+      // 选回「自动识别」时识别结果照旧可用，所以只在选了具体型号时清。
+      var picked = $('cal-module') ? $('cal-module').value : AUTO_ID;
+      if (picked && picked !== AUTO_ID) STATE.detectedModuleId = '';
       applyCapabilities();
       refreshBaudOptions();
       refreshModuleHint();

@@ -54,6 +54,35 @@ announcer = None             # ZeroconfAnnouncer，未启用/依赖缺失时为 
 calibration_hold = threading.Event()
 calibration_beat = 0.0
 
+# 标定租约专用：`run_once()` 这一轮是否正在执行。
+#
+# 为什么单靠 `worker_thread` 不够（真机踩到过，2026-11-11 05:51）：
+# `run_once()` 在**起数据源之前**就要先打开串口做探测（`detect_serial()`），
+# 那几秒里 `worker_thread` 还是 None，标定方看到 None 就以为"数据面已让位"，
+# 于是两个进程同时 open("/dev/ttyUSB0")——标定的 `$PQTMVERNO` 被主程序读走，
+# 表现为"模块无应答（已串口收到 224 字节）"，20 秒后判失败。
+# 前几次标定能成功、偏偏这次失败，差别就在这里：那几次 `worker_thread` 非空，
+# 等待逻辑生效；这一次正好落在探测窗口内，守卫直接放行了。
+run_once_active = False
+
+# 标定线程专用：这一时刻 `thread_exit_event` 的置位属于"数据面自己的重启"，
+# 与标定任务无关，标定侧的重试循环不得据此提前退出。
+#
+# 为什么必须分开（真机踩到过，2026-11-11 06:03）：
+#   `run_once()` 在"上一轮工作线程尚未退出"时会 `thread_exit_event.set()`。
+#   而 `lease.acquire()` 为了唤醒来 `restart_event.set()`，主循环醒来后如果
+#   恰好已过 `_calibration_gate()` 那个判断才走到 `run_once()`，就会命中这条分支。
+#   于是标定线程（同一进程！）在 `CORS_CONNECT` 调 `connect_to_host()` 时，
+#   `@retry` 包装器第一行看到 `thread_exit_event` 已置位，立刻抛
+#   `ThreadExitRequested()`——它不带参数，`str(e)` 是空串，最终显示成
+#   "连接失败："（冒号后什么都没有），socket 一次都没发出去。
+#   现场表现是"裸 socket 和手工调 connect() 都正常，偏偏标定时连不上"，
+#   因为手工调用在另一个进程里，那个进程的事件是空的。
+#
+# 语义：`calibration_owns_serial` 置位期间，退出信号由标定自己判断
+# （`calibration_hold` + `shutdown_event`），不看 `thread_exit_event`。
+calibration_owns_serial = False
+
 # ==================== 运行状态（首页卡片） ====================
 run_status = {
     "mode": "",

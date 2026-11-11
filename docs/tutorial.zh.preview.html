@@ -1,0 +1,1408 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>tutorial.zh</title><style>
+:root{--bg:#0f1115;--fg:#e6e8eb;--muted:#9aa4b2;--line:#2a2f38;--code:#1a1e26;--accent:#4b9cf5}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+     font:16px/1.75 -apple-system,"Segoe UI","Noto Sans SC",sans-serif}
+main{max-width:920px;margin:0 auto;padding:48px 24px 120px}
+h1{font-size:2.1em;border-bottom:2px solid var(--accent);padding-bottom:.3em;margin-top:0}
+h2{font-size:1.55em;margin-top:2.2em;border-bottom:1px solid var(--line);padding-bottom:.25em}
+h3{font-size:1.2em;margin-top:1.8em;color:#c9d3e0}
+h4{font-size:1.05em;margin-top:1.5em;color:#b3c0d1}
+a{color:var(--accent)}
+p,li{color:#d3d8df}
+blockquote{margin:1.2em 0;padding:.7em 1em;border-left:3px solid var(--accent);
+           background:#161b23;color:var(--muted);border-radius:0 6px 6px 0}
+blockquote p{color:var(--muted);margin:.3em 0}
+code{background:var(--code);padding:.15em .4em;border-radius:4px;
+     font:0.9em "JetBrains Mono",Consolas,monospace;color:#8ec7ff}
+pre{background:var(--code);padding:14px 16px;border-radius:8px;overflow-x:auto;
+    border:1px solid var(--line)}
+pre code{background:none;padding:0;color:#c8d4e3;font-size:.88em;line-height:1.6}
+table{border-collapse:collapse;width:100%;margin:1.2em 0;font-size:.94em}
+th,td{border:1px solid var(--line);padding:9px 12px;text-align:left;vertical-align:top}
+th{background:#1b212b;font-weight:600;color:#dfe6ef}
+tr:nth-child(even) td{background:#14181f}
+img{max-width:100%;height:auto;border-radius:8px;border:1px solid var(--line);
+    margin:10px 0;display:block}
+hr{border:none;border-top:1px solid var(--line);margin:2.5em 0}
+em{color:var(--muted)}
+</style></head>
+<body><main><h1 id="2rtkserver">2RTKserver 完整使用教程</h1>
+<blockquote>
+<p>从零开始，在廉价 ARM 盒子、树莓派或任意 Linux 主机上搭一台完整的 RTK 基准站。</p>
+</blockquote>
+<p><strong>适用版本：</strong> 3.1.3<br />
+<strong>实测环境：</strong> Amlogic S905L3B 电视盒子运行 Armbian（Ubuntu 22.04，aarch64），Quectel LG290P 模块经 CH340 USB 转串口连接。</p>
+<hr />
+<h2 id="_1">目录</h2>
+<ol>
+<li><a href="#1-这个程序是做什么的">这个程序是做什么的</a></li>
+<li><a href="#2-需要准备什么">需要准备什么</a></li>
+<li><a href="#3-硬件接线">硬件接线</a></li>
+<li><a href="#4-全新安装">全新安装</a></li>
+<li><a href="#5-首次登录与状态页">首次登录与状态页</a></li>
+<li><a href="#6-串口配置">串口配置</a></li>
+<li><a href="#7-坐标标定">坐标标定</a></li>
+<li><a href="#8-上传到云端-ntrip-caster">上传到云端 NTRIP Caster</a></li>
+<li><a href="#9-中继模式relay">中继模式（Relay）</a></li>
+<li><a href="#10-内置本地-caster">内置本地 Caster</a></li>
+<li><a href="#11-数传电台透传">数传电台透传</a></li>
+<li><a href="#12-日常维护">日常维护</a></li>
+<li><a href="#附录-a--支持的模块">附录 A — 支持的模块</a></li>
+<li><a href="#附录-b--常见问题">附录 B — 常见问题</a></li>
+</ol>
+<hr />
+<h2 id="1">1. 这个程序是做什么的</h2>
+<p>2RTKserver 把一个 GNSS 接收模块变成<strong>独立运行的 RTK 基准站</strong>。它从串口读取模块输出的 RTCM 3 差分数据，通过网络分发出去，让野外的流动站获得厘米级定位。</p>
+<p>它不只是个数据搬运工，还会：</p>
+<ul>
+<li><strong>自动标定基站坐标</strong>到厘米级——自动驱动模块走完所需的命令序列。</li>
+<li><strong>失败自动回滚</strong>——任何一步出问题都会把模块恢复到标定前的状态，不会把接收机留在半残模式下。</li>
+<li><strong>注入基站元信息</strong>，让流动站知道基站在哪、用的是哪个坐标系。</li>
+<li><strong>提供 Web 界面</strong>，用于配置、实时监控和固件检查。</li>
+</ul>
+<h3 id="_2">三种运行模式</h3>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>作用</th>
+<th>使用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>none</code></td>
+<td>读取模块，只在本地显示，不对外输出</td>
+<td>台面测试、首次验证</td>
+</tr>
+<tr>
+<td><code>serial</code></td>
+<td>从串口读模块数据并通过 NTRIP 分发</td>
+<td><strong>基站正常运行状态</strong></td>
+</tr>
+<tr>
+<td><code>relay</code></td>
+<td>从另一个 Caster 拉流后重新分发</td>
+<td>打通网络、扩展覆盖</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_3">数据可以往哪里去</h3>
+<p>三个出口互相独立，可以任意组合启用：</p>
+<ol>
+<li><strong>云端 NTRIP Caster</strong> —— 把数据流推到公网服务器。</li>
+<li><strong>本地 NTRIP Caster</strong> —— 直接在盒子上对局域网提供服务。</li>
+<li><strong>无线电数传</strong> —— 通过第二个串口把差分推给 UHF 电台。</li>
+</ol>
+<hr />
+<h2 id="2">2. 需要准备什么</h2>
+<h3 id="_4">硬件</h3>
+<table>
+<thead>
+<tr>
+<th>物品</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Linux 主机</td>
+<td>任意 ARM 开发板、迷你主机或旧笔记本。实测 Amlogic S905L3B + Armbian。</td>
+</tr>
+<tr>
+<td>GNSS 模块</td>
+<td>Quectel LG290P（多频，推荐）、u-blox ZED-F9P、Unicore UM980/N4、Quectel LC29H。</td>
+</tr>
+<tr>
+<td>USB 转串口</td>
+<td>CH340、CP2102、FT232，或模块自带的 USB 口。</td>
+</tr>
+<tr>
+<td>GNSS 天线</td>
+<td><strong>必须能看见天空。</strong> 这一项比其他任何因素都关键。</td>
+</tr>
+<tr>
+<td>天线馈线</td>
+<td>低损耗同轴线，越短越好。每多一米都在损失信号。</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>📷 实物照片占位 — hardware-overview</strong><br />
+<em>需要：全套设备摆在桌面上的照片——盒子、GNSS 模块、USB 转串口、天线、馈线。</em></p>
+</blockquote>
+<h3 id="_5">网络</h3>
+<ul>
+<li>主机需要能访问你的 CORS 服务商（用 CORS 标定时）或你的云端 Caster。</li>
+<li>局域网内访问需要知道主机的 IP 地址。</li>
+</ul>
+<h3 id="_6">账号</h3>
+<ul>
+<li><strong>CORS 账号</strong> —— 只有用 CORS 一键固定标定才需要。服务商一般会给你：服务器地址、端口、用户名、密码、挂载点名称。</li>
+<li><strong>云端 Caster 账号</strong> —— 只有要发布数据流时才需要。</li>
+</ul>
+<hr />
+<h2 id="3">3. 硬件接线</h2>
+<p>接线就这么几根：</p>
+<pre><code>   ┌──────────────┐   USB    ┌───────────────┐   UART    ┌─────────────┐
+   │   Linux 盒   │ ───────► │ USB 转串口    │ ────────► │ GNSS 模块   │
+   │              │          │ (CH340 等)    │           │  (LG290P)   │
+   └──────────────┘          └───────────────┘           └──────┬──────┘
+                                                                │ SMA
+                                                                ▼
+                                                         ┌─────────────┐
+                                                         │    天线     │
+                                                         └─────────────┘
+</code></pre>
+<ol>
+<li>把 GNSS 模块接到 USB 转串口：<code>TX → RX</code>、<code>RX → TX</code>、<code>GND → GND</code>。供电按模块数据手册来。</li>
+<li>把转接头插到主机的 USB 口，系统里会出现 <code>/dev/ttyUSB0</code>（CH340）或 <code>/dev/ttyACM0</code>（原生 USB CDC）。</li>
+<li>天线拧到模块的 SMA 座上，<strong>放到能看见天空的地方</strong>。别放铁皮屋顶下、别贴墙——收不到卫星，基站没法自己标定。</li>
+</ol>
+<blockquote>
+<p><strong>📷 实物照片占位 — wiring-closeup</strong><br />
+<em>需要：模块接到 USB 转串口的特写，能看清 TX/RX/GND；以及天线室外安装的照片。</em></p>
+</blockquote>
+<h3 id="_7">确认系统认到了转接头</h3>
+<p>装程序之前，先确认系统能看到设备：</p>
+<pre><code class="language-bash">ls -l /dev/ttyUSB* /dev/ttyACM* 2&gt;/dev/null
+</code></pre>
+<p>正常会看到类似这样的输出：</p>
+<pre><code>crw-rw---- 1 root dialout 188, 0 Nov 11 05:20 /dev/ttyUSB0
+</code></pre>
+<p>如果什么都没有，说明转接头没被识别。先换个 USB 口或换根线，再往下走。</p>
+<hr />
+<h2 id="4">4. 全新安装</h2>
+<h3 id="41">4.1 把源码放到主机上</h3>
+<pre><code class="language-bash">cd ~
+git clone &lt;你的仓库地址&gt; 2RTKserver
+cd 2RTKserver
+</code></pre>
+<p>没有 git 访问权限的话，用 <code>scp</code> 或 U 盘把整个项目文件夹拷过去即可。安装脚本做的是纯复制、不是 git clone，所以源码压缩包也能用。</p>
+<h3 id="42">4.2 运行安装脚本</h3>
+<pre><code class="language-bash">sudo bash install.sh
+</code></pre>
+<p>安装脚本会依次做这几件事：</p>
+<ol>
+<li>安装系统依赖（<code>python3</code>、<code>python3-venv</code>、<code>python3-pip</code>）。</li>
+<li>在 <code>/opt/2RTKserver/venv</code> 创建虚拟环境。</li>
+<li>按 <code>requirements.txt</code> 安装 Python 依赖。</li>
+<li>把程序复制到 <code>/opt/2RTKserver</code>。</li>
+<li>注册并启动 <code>2rtkserver</code> 的 systemd 服务。</li>
+</ol>
+<p><img alt="安装 — 正在安装依赖" src="images/tutorial/install-01-deps.png" /></p>
+<p><em>安装依赖包。在性能弱的 ARM 盒子上这一步可能要几分钟，属正常现象。</em></p>
+<p><img alt="安装 — 完成" src="images/tutorial/install-02-done.png" /></p>
+<p><em>安装完成。注意末尾输出的访问地址。</em></p>
+<blockquote>
+<p><strong>📷 实物照片占位 — install-console</strong><br />
+<em>需要（可选）：直接拍摄显示器上安装输出的照片，用于"真实控制台"的感觉。上面两张是终端截图。</em></p>
+</blockquote>
+<h3 id="43">4.3 确认服务已启动</h3>
+<pre><code class="language-bash">systemctl status 2rtkserver
+</code></pre>
+<p>应该显示 <code>active (running)</code>。如果不是：</p>
+<pre><code class="language-bash">journalctl -u 2rtkserver -n 50 --no-pager
+</code></pre>
+<p>日志会直接说明原因——一般是缺 Python 包，或者 <code>/opt/2RTKserver</code> 的权限问题。</p>
+<h3 id="44">4.4 需要先卸载旧版本</h3>
+<p>如果要在旧版本上重装，先卸载干净，免得残留文件捣乱：</p>
+<pre><code class="language-bash">cd /opt/2RTKserver
+sudo bash uninstall.sh
+</code></pre>
+<p>卸载脚本会停止并移除服务。数据库和标定记录会保留；想要彻底清空，再手动删掉 <code>/opt/2RTKserver</code> 目录。</p>
+<blockquote>
+<p><strong>只是升级而不是重装？</strong> 在 <code>/opt/2RTKserver</code> 里执行 <code>sudo bash update.sh</code>。它会保留你的配置和数据。</p>
+</blockquote>
+<hr />
+<h2 id="5">5. 首次登录与状态页</h2>
+<h3 id="51-web">5.1 打开 Web 界面</h3>
+<p>在同一网络的任意设备上，浏览器访问：</p>
+<pre><code>http://&lt;主机IP&gt;:5757
+</code></pre>
+<p>安装脚本会把确切的地址打印出来。支持 mDNS 的网络还可以用：</p>
+<pre><code>http://2rtk.local:5757
+</code></pre>
+<blockquote>
+<p><strong>注意：</strong> 安卓设备解析不了 <code>.local</code> 名字，请直接用 IP。Windows 或 macOS 上 <code>2rtk.local</code> 打不开，多半是代理或 VPN 拦截了——把 <code>*.local</code> 加进代理的直连（绕过）列表即可。</p>
+</blockquote>
+<h3 id="52">5.2 登录</h3>
+<p><img alt="登录页" src="images/tutorial/web-01-login.png" /></p>
+<p><em>登录页。默认账号密码都是 <code>admin</code>。</em></p>
+<p><strong>登录后立刻改密码。</strong> 首次登录完成后，点顶部导航的「修改密码」。只要还在用默认密码，登录页就会一直显示警示条。</p>
+<blockquote>
+<p><strong>安全提示：</strong> 这个 Web 界面是给可信局域网用的，不要把 5757 端口直接暴露到公网。需要远程访问请走 VPN。</p>
+</blockquote>
+<h3 id="53">5.3 状态页</h3>
+<p><img alt="状态页" src="images/tutorial/web-02-status-index.png" /></p>
+<p><em>还没配置时的状态页——没有数据在流动。</em></p>
+<p>状态页是日常运维的主要视图：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>模式</td>
+<td>当前运行模式（<code>none</code> / <code>serial</code> / <code>relay</code>）</td>
+</tr>
+<tr>
+<td>串口</td>
+<td>正在使用的端口与波特率</td>
+</tr>
+<tr>
+<td>卫星数</td>
+<td>当前跟踪到的卫星数量</td>
+</tr>
+<tr>
+<td>系统</td>
+<td>有哪些星座在位（GPS、GLONASS、Galileo、BDS、QZSS）</td>
+</tr>
+<tr>
+<td>位置</td>
+<td>基站当前坐标</td>
+</tr>
+<tr>
+<td>RTCM 输出</td>
+<td>正在播发哪些报文类型</td>
+</tr>
+<tr>
+<td>运行时长</td>
+<td>本次会话已运行的时长</td>
+</tr>
+</tbody>
+</table>
+<p><img alt="状态页 — 实时数据" src="images/tutorial/web-06-status-live.png" /></p>
+<p><em>状态页有实时数据了——卫星在跟踪、位置已解算、RTCM 报文在流动。</em></p>
+<blockquote>
+<p>状态页走 WebSocket 推送，卫星数和位置会持续刷新，不需要手动刷新页面。</p>
+</blockquote>
+<hr />
+<h2 id="6">6. 串口配置</h2>
+<p>进入「运行设置」（<code>/config</code>）。</p>
+<p><img alt="配置页 — 串口设置" src="images/tutorial/web-03-config-serial.png" /></p>
+<p><em>配置页。此时模式还是 <code>none</code>，接下来要改成 <code>serial</code>。</em></p>
+<h3 id="61">6.1 设置模式</h3>
+<p>选 <strong>Mode → <code>serial</code></strong>。这告诉程序：从串口读模块数据并分发出去。</p>
+<h3 id="62">6.2 找到串口</h3>
+<p>两种方式：</p>
+<p><strong>方式一 —— 扫描。</strong> 点「扫描串口」，程序会枚举系统里的串口设备并填进下拉框。</p>
+<p><img alt="扫描串口" src="images/tutorial/web-04-scan-ports.png" /></p>
+<p><em>扫描后，识别到的端口出现在下拉框里。</em></p>
+<p><strong>方式二 —— 手填。</strong> 已经知道端口就直接填 <code>/dev/ttyUSB0</code> 或 <code>/dev/ttyACM0</code>。</p>
+<blockquote>
+<p><strong>怎么区分两种端口：</strong> CH340/CP2102/FT232 这类转接芯片走 <code>/dev/ttyUSB0</code>；带原生 USB 的模块（不少 u-blox 板子）走 <code>/dev/ttyACM0</code>。如果同时插了好几个 USB 串口设备，拔掉模块再扫一次——消失的那个就是模块。</p>
+</blockquote>
+<h3 id="63">6.3 设置波特率</h3>
+<p><img alt="串口与波特率已填写" src="images/tutorial/web-05-serial-filled.png" /></p>
+<p><em>端口和波特率填好。</em></p>
+<table>
+<thead>
+<tr>
+<th>模块</th>
+<th>常见波特率</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Quectel LG290P</td>
+<td>115200 或 460800</td>
+</tr>
+<tr>
+<td>u-blox ZED-F9P</td>
+<td>38400（原生 USB 口不看波特率）</td>
+</tr>
+<tr>
+<td>Unicore UM980</td>
+<td>115200</td>
+</tr>
+<tr>
+<td>Quectel LC29H</td>
+<td>115200</td>
+</tr>
+</tbody>
+</table>
+<p><strong>不确定就先试 115200。</strong> 标定程序会自动试探多个波特率，所以标定环节猜错还能救；但正常出数据时，这个值必须对。</p>
+<h3 id="64">6.4 验证数据在流动</h3>
+<p>点「保存并重启」。页面会跳转，服务重启。然后：</p>
+<ol>
+<li>回到<strong>状态页</strong>。</li>
+<li>10~20 秒内，卫星数应该往上涨，位置应该解算出来。</li>
+<li>RTCM 输出区应该列出 <code>1005</code>、<code>1074</code>、<code>1094</code>、<code>1114</code>、<code>1124</code>、<code>1134</code> 等报文类型。</li>
+</ol>
+<p>有卫星但没位置，天线多半在室内或被遮挡。什么都没有，先回头核对端口和波特率。</p>
+<blockquote>
+<p><strong>RTCM 报文编号的含义：</strong><br />
+<code>1005</code>/<code>1006</code> = 基站位置与天线元信息 · <code>1074</code>/<code>1084</code>/<code>1094</code>/<code>1114</code>/<code>1124</code>/<code>1134</code> = GPS/GLONASS/Galileo/QZSS/BDS/NavIC 观测数据（MSM4） · <code>1230</code> = GLONASS 码相位偏差。</p>
+<p><code>1005</code> 这条是告诉流动站<em>你的基站在哪</em>的。没有它，流动站收得到差分却用不上。</p>
+</blockquote>
+<hr />
+<h2 id="7">7. 坐标标定</h2>
+<p>基站只有<strong>非常精确地知道自己的位置</strong>，才能产出有用的差分数据。基站坐标差一米，每个流动站的输出就差一米。标定就是让基站学会自己的位置。</p>
+<p>点顶部导航的「一键标定」。</p>
+<p><img alt="标定页 — 硬件检查" src="images/tutorial/cal-01-hardware.png" /></p>
+<p><em>标定页。第一步是确认硬件连接。</em></p>
+<h3 id="71">7.1 四种标定方式</h3>
+<p>标定页最多提供四种方式。<strong>能看到哪几种取决于你的模块支持什么</strong>——只能当流动站的接收机做不了自收敛，依此类推。</p>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>做什么</th>
+<th>精度</th>
+<th>耗时</th>
+<th>前提条件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>CORS 一键固定</strong></td>
+<td>从公共 CORS 网络把差分注入模块，等固定解，再对位置取平均</td>
+<td>厘米级</td>
+<td>5~10 分钟</td>
+<td>双模模块、CORS 账号、网络</td>
+</tr>
+<tr>
+<td><strong>仅测量</strong></td>
+<td>原理同上，但位置取自<strong>外部流动站</strong>而不是模块自己</td>
+<td>厘米级</td>
+<td>5~10 分钟</td>
+<td>双模模块、外部流动站、CORS 账号</td>
+</tr>
+<tr>
+<td><strong>自收敛（Survey-in）</strong></td>
+<td>模块对自己的单点位置做长时间平均</td>
+<td>分米级</td>
+<td>15~60 分钟</td>
+<td>单模模块</td>
+</tr>
+<tr>
+<td><strong>手动写入</strong></td>
+<td>你自己填已知坐标</td>
+<td>取决于你的测量</td>
+<td>立即</td>
+<td>一个已测定的点</td>
+</tr>
+</tbody>
+</table>
+<p><strong>该用哪个？</strong> 有 CORS 账号又有双模模块，就用 <strong>CORS 一键固定</strong>——它最准、也最自动。模块切不了流动站模式，用<strong>自收敛</strong>。点位坐标已经测过了，用<strong>手动写入</strong>。</p>
+<h3 id="72-cors">7.2 CORS 一键固定</h3>
+<p>这是主菜。先讲清程序内部在干什么，你就知道该期待什么：</p>
+<ol>
+<li><strong>让数据面让出串口。</strong> 一边推流一边标定是做不到的。</li>
+<li><strong>识别模块</strong>——发版本查询、读回应答。</li>
+<li><strong>备份当前配置</strong>，出问题好回滚。</li>
+<li><strong>把模块切到流动站模式</strong>，配置所需的 NMEA 输出。</li>
+<li><strong>连上 CORS 挂载点</strong>，把差分数据灌进模块串口。</li>
+<li><strong>等固定解。</strong> 这要求良好的天空视野：质量位必须连续 30 秒达到 4。</li>
+<li><strong>采集样本</strong>——按设定的时长（默认 300 秒），3σ 剔除异常值后对剩下的取平均。</li>
+<li><strong>把平均后的坐标写进模块</strong>，作为固定基站坐标。</li>
+<li><strong>把模块恢复成基站模式</strong>，回放报文配置，重启并核验。</li>
+</ol>
+<h4 id="_8">第一步 —— 识别模块</h4>
+<p>点「识别模块」。</p>
+<p><img alt="正在识别模块" src="images/tutorial/cal-02-detect-running.png" /></p>
+<p><em>识别进行中——程序正在探测串口。</em></p>
+<p><img alt="模块已识别" src="images/tutorial/cal-03-detect-done.png" /></p>
+<p><em>模块识别出来了，连同固件版本和能力位。</em></p>
+<p>识别失败最常见的原因：串口还攥在主程序的数据线程手里（等几秒重试）、波特率不对、或者模块没供电。</p>
+<h4 id="_9">第二步 —— 选择方式</h4>
+<p><img alt="选择方式 — CORS" src="images/tutorial/cal-04-method-cors.png" /></p>
+<p><em>方式选择。已选中 CORS 一键固定。</em></p>
+<h4 id="cors">第三步 —— 填写 CORS 账号</h4>
+<p><img alt="填写 CORS 账号" src="images/tutorial/cal-05-cors-account.png" /></p>
+<p><em>填写 CORS 服务商信息。</em></p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>填什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>服务器地址</td>
+<td>服务商给的地址，例如 <code>120.253.239.161</code></td>
+</tr>
+<tr>
+<td>端口</td>
+<td>你要用的坐标系对应的端口——见下面说明</td>
+</tr>
+<tr>
+<td>用户名</td>
+<td>CORS 账号</td>
+</tr>
+<tr>
+<td>密码</td>
+<td>CORS 密码</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>端口和坐标系是配对的。</strong> 常见的国内 CORS 服务商会在多个端口上提供<em>同一批</em>挂载点，一个基准对应一个端口：<br />
+- <code>8002</code> → WGS84<br />
+- <code>8001</code> → CGCS2000</p>
+<p>端口选错时，你往往照样能连上、照样能收到数据——但位置永远到不了固定解，因为差分基准和模块预期的不一致。<strong>如果一直卡在浮动解，先查这一项。</strong></p>
+</blockquote>
+<h4 id="_10">第四步 —— 获取并选择挂载点</h4>
+<p>点「获取挂载点」。</p>
+<p><img alt="挂载点已加载" src="images/tutorial/cal-06-mounts-loaded.png" /></p>
+<p><em>从服务商拉回来的挂载点列表。</em></p>
+<p>挑挂载点时看两点：</p>
+<ul>
+<li><strong>覆盖你的区域</strong>——挂载点名字一般带地区或网络标识。</li>
+<li><strong>播发多星座多频数据</strong>——名字里带 <code>RTCM33</code>、<code>5G16F</code>（五星十六频）之类的就是这个意思。</li>
+</ul>
+<p><img alt="已选择挂载点" src="images/tutorial/cal-07-mount-selected.png" /></p>
+<p><em>挂载点选好。</em></p>
+<p>信息填完，页面会把任务汇总出来。</p>
+<p><img alt="可以开始" src="images/tutorial/cal-08-ready.png" /></p>
+<p><em>参数都填好了，开始前再核对一遍。</em></p>
+<h4 id="_11">第五步 —— 启动并确认</h4>
+<p><img alt="确认对话框" src="images/tutorial/cal-09-confirm.png" /></p>
+<p><em>确认对话框。请认真读——它明确要求天线不能动。</em></p>
+<blockquote>
+<p><strong>点开始之前：</strong> 天线必须固定牢靠，整个标定期间不能动。程序会丢弃跳变超过 500 米的样本，但天线要是本身在晃，固定解压根出不来。</p>
+</blockquote>
+<p>点「开始」。</p>
+<h4 id="_12">第六步 —— 让它自己跑</h4>
+<p><img alt="标定进行中" src="images/tutorial/cal-10-running.png" /></p>
+<p><em>标定进行中——阶段指示器显示程序走到哪一步了。</em></p>
+<p><img alt="等待固定解" src="images/tutorial/cal-11-fix-wait.png" /></p>
+<p><em>在 <code>FIX_WAIT</code>：实时指标面板显示质量、卫星数、PDOP，以及固定解已经稳住多久。</em></p>
+<p><code>FIX_WAIT</code> 是最需要耐心的阶段。面板里两个数字告诉你顺不顺：</p>
+<ul>
+<li><strong>质量（Quality）</strong> —— 必须爬到 <code>4</code>。停在 <code>1</code> 或 <code>2</code>，说明差分没送进模块，或者天空视野太差。</li>
+<li><strong>已固定（Fixed for）</strong> —— 必须连续到 30 秒。如果一直清零，说明固定解在反复掉；有东西不稳定。</li>
+</ul>
+<p><img alt="采集样本" src="images/tutorial/cal-12-collect.png" /></p>
+<p><em>在 <code>COLLECT</code>：样本不断进来，实时显示已采集数、离散度、收敛情况。</em></p>
+<p>采集比等待短得多。样本离散度收敛后程序会提前结束；顺利时远不到一分钟。</p>
+<p><img alt="标定完成" src="images/tutorial/cal-13-done.png" /></p>
+<p><em><code>DONE</code>。结果面板出现，给出最终坐标与精度。</em></p>
+<p><img alt="结果摘要" src="images/tutorial/cal-14-summary.png" /></p>
+<p><em>摘要卡片：样本数、标准差，以及写进模块的坐标。</em></p>
+<p><img alt="阶段时间线" src="images/tutorial/cal-15-timeline.png" /></p>
+<p><em>阶段时间线——每个阶段耗时多少。某次跑得慢时，用它判断时间花在哪。</em></p>
+<p>摘要卡片这样读：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>说明什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>样本数</td>
+<td>参与平均的定位样本数。越多越好，但 60 以上已经很扎实。</td>
+</tr>
+<tr>
+<td>标准差</td>
+<td>水平方向上样本聚得有多紧。<strong>5 cm 以内算好</strong>；超过 20 cm 就该查天线和 CORS 质量。</td>
+</tr>
+<tr>
+<td>坐标</td>
+<td>写进模块的值。流动站就是相对这个位置定位的。</td>
+</tr>
+</tbody>
+</table>
+<p>把记录下来的离散度和实时指标对比一下：实时固定解很紧、但最终样本离散度很大，通常是天线动了，或者模块在采集期间掉过固定解又重新固定。</p>
+<p>阶段指示器会依次走过这些：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>正在做什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>HOLD</code></td>
+<td>等待数据线程让出串口</td>
+</tr>
+<tr>
+<td><code>OPEN</code></td>
+<td>独占打开串口</td>
+</tr>
+<tr>
+<td><code>DETECT</code></td>
+<td>识别模块</td>
+</tr>
+<tr>
+<td><code>BACKUP</code></td>
+<td>保存当前配置</td>
+</tr>
+<tr>
+<td><code>ROVER_SETUP</code></td>
+<td>把模块切成流动站</td>
+</tr>
+<tr>
+<td><code>NMEA_SETUP</code></td>
+<td>配置 GGA/GSA 输出</td>
+</tr>
+<tr>
+<td><code>RTK_REINIT</code></td>
+<td>重启模块，启动 RTK 解算</td>
+</tr>
+<tr>
+<td><code>GGA_RATE_CHECK</code></td>
+<td>实测 GGA 输出频率</td>
+</tr>
+<tr>
+<td><code>GGA_WAIT</code></td>
+<td>等定位输出</td>
+</tr>
+<tr>
+<td><code>CORS_CONNECT</code></td>
+<td>连接 CORS 挂载点</td>
+</tr>
+<tr>
+<td><code>FIX_WAIT</code></td>
+<td><strong>等固定解——这一步最久</strong></td>
+</tr>
+<tr>
+<td><code>COLLECT</code></td>
+<td>对位置样本取平均</td>
+</tr>
+<tr>
+<td><code>CORS_CLOSE</code></td>
+<td>断开 CORS</td>
+</tr>
+<tr>
+<td><code>SAVE</code></td>
+<td>把坐标写入模块</td>
+</tr>
+<tr>
+<td><code>RESTART</code></td>
+<td>重启模块</td>
+</tr>
+<tr>
+<td><code>VERIFY_MODE</code></td>
+<td>确认模块回到基站模式</td>
+</tr>
+<tr>
+<td><code>VERIFY_RTCM</code></td>
+<td>确认 RTCM 恢复输出</td>
+</tr>
+<tr>
+<td><code>DONE</code></td>
+<td>完成</td>
+</tr>
+</tbody>
+</table>
+<p><strong>不要关页面、不要重启服务、不要碰天线。</strong> 程序自己会跑完，不需要任何干预。</p>
+<h4 id="_13">"固定解"是什么意思</h4>
+<p>模块在 GGA 语句里报一个质量位：</p>
+<table>
+<thead>
+<tr>
+<th>质量位</th>
+<th>含义</th>
+<th>能当基站用吗</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>单点解</td>
+<td>不能</td>
+</tr>
+<tr>
+<td>2</td>
+<td>差分/浮动解</td>
+<td>不能</td>
+</tr>
+<tr>
+<td>4</td>
+<td><strong>RTK 固定解</strong></td>
+<td><strong>能</strong></td>
+</tr>
+<tr>
+<td>5</td>
+<td>RTK 浮动解</td>
+<td>不能</td>
+</tr>
+</tbody>
+</table>
+<p>程序要求质量位连续 30 秒为 4，同时卫星数至少 12 颗、PDOP ≤ 2.0。180 秒内没达成，会尝试降级用浮动解——但前提是浮动解足够稳。两者都不行，标定判失败，模块按备份回滚。</p>
+<p><strong>一次顺利的标定长什么样。</strong> 下面是 LG290P 接 CORS 挂载点的实测数据：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>数值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>进入 <code>FIX_WAIT</code> 到固定成功</td>
+<td>约 48 秒</td>
+</tr>
+<tr>
+<td>固定解保持</td>
+<td>连续 70 秒（要求 30 秒）</td>
+</tr>
+<tr>
+<td>质量位</td>
+<td>4</td>
+</tr>
+<tr>
+<td>卫星数</td>
+<td>22–35</td>
+</tr>
+<tr>
+<td>PDOP</td>
+<td>0.9</td>
+</tr>
+<tr>
+<td>采集样本数</td>
+<td>81</td>
+</tr>
+<tr>
+<td>标准差</td>
+<td>1.9 cm</td>
+</tr>
+<tr>
+<td><code>1005</code> 广播偏差</td>
+<td>0.01 cm</td>
+</tr>
+</tbody>
+</table>
+<p>最后一行值得解释一下。写完坐标之后，程序会把模块实际广播的 <code>1005</code> 读回来，拿里面的 ECEF 坐标和写进去的值比对。偏差接近零，说明模块接受了这个位置并且在原样广播。偏差很大，说明没写进去——通常是模块拒绝执行命令，或者还没应用就重启了。</p>
+<h3 id="73">7.3 仅测量（外部流动站）</h3>
+<p><strong>仅测量</strong>针对一种特定情形：你想测定基站坐标，但基站模块本身当不了流动站；或者你手头已经有一台在基站位置拿到固定解的流动站。</p>
+<p>和 CORS 一键固定的区别在于：</p>
+<ul>
+<li>基站模块<strong>不会</strong>被切成流动站模式。</li>
+<li>差分数据<strong>不会</strong>灌进基站模块。</li>
+<li>位置由<strong>另一台流动站</strong>提供——手机、手簿，或者另一台接收机。</li>
+</ul>
+<p>适用于模块不具备流动站能力、但你又不想只做自收敛的情况。</p>
+<blockquote>
+<p><strong>说明：</strong> 对于只能当流动站的模块，<code>external_rover</code> 是<em>唯一</em>被提供的方式。这种情况下坐标由你的测量设备提供。</p>
+</blockquote>
+<h3 id="74-survey-in">7.4 自收敛（Survey-in）</h3>
+<p>自收敛是不依赖外部条件的选项——不用 CORS 账号，不用网络。</p>
+<p>模块对自己的单点位置做长时间平均。需要配置：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>含义</th>
+<th>常见取值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>观测次数</td>
+<td>平均多少个定位结果</td>
+<td>2000~5000</td>
+</tr>
+<tr>
+<td>精度限值</td>
+<td>估计精度优于这个值就提前结束</td>
+<td>2.0 米</td>
+</tr>
+<tr>
+<td>最短时长</td>
+<td>至少跑多久才允许结束</td>
+<td>5~15 分钟</td>
+</tr>
+</tbody>
+</table>
+<p><strong>精度预期：</strong> 自收敛受限于模块的单点精度，一般是 1~2 米。它<strong>不是</strong> CORS 标定的替代品。没有更好办法时用它，或者你的应用只需要分米级。</p>
+<p>程序会持续监控收敛情况，只在位置稳定时才收尾——滚动 3σ 离散度低于 2 厘米并保持 60 秒。</p>
+<h3 id="75">7.5 手动写入坐标</h3>
+<p>如果你已经用专业设备测过这个点位，直接填坐标：</p>
+<table>
+<thead>
+<tr>
+<th>输入</th>
+<th>格式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>纬度</td>
+<td>十进制度，例如 <code>25.203523</code></td>
+</tr>
+<tr>
+<td>经度</td>
+<td>十进制度，例如 <code>110.277483</code></td>
+</tr>
+<tr>
+<td>椭球高</td>
+<td>米，例如 <code>138.316</code></td>
+</tr>
+</tbody>
+</table>
+<p>程序会把它们写进模块作为固定基站坐标。<strong>务必确认坐标系和你的流动站一致</strong>——常用的是 WGS84，国内某些场景用 CGCS2000。弄错了，每个流动站的输出都会带一个固定偏移。</p>
+<h3 id="76">7.6 标定到底写了什么</h3>
+<p>标定成功后，模块里保存的是：</p>
+<ul>
+<li><strong>平均后的 ECEF 坐标</strong>——经过 3σ 剔除后，被采纳样本的算术平均（不是模块内部卡尔曼滤波的输出）。</li>
+<li><strong>RTCM 报文配置</strong>——播哪些报文类型、什么频率。</li>
+<li><strong>基站模式</strong>——模块留在基站状态，不会停在流动站。</li>
+</ul>
+<p>程序还会在数据库里记一条<strong>标定历史</strong>：用的哪种方式、采了多少样本、最终离散度、得到的坐标。状态页显示的基站位置就来自这里。</p>
+<blockquote>
+<p><strong>为什么 1005 这条报文很关键：</strong> 基站坐标是通过 <code>1005</code>（或 <code>1006</code>）这条 RTCM 报文播发给流动站的。流动站收得到 <code>1074</code> 之类却收不到 <code>1005</code>，就完全不知道基站在哪，差分没法用。如果流动站死活不固定，先看状态页的 RTCM 输出列表里有没有 <code>1005</code>。</p>
+</blockquote>
+<h3 id="77">7.7 标定失败怎么排查</h3>
+<p>程序失败时话很多——它会告诉你哪一项检查没过、观测到了什么。常见失败如下。</p>
+<h4 id="_14">识别阶段报"模块无应答"</h4>
+<p>串口被别人攥着了，通常是主程序的数据线程还在收上一轮的尾。</p>
+<ul>
+<li>等 20 秒再重试。</li>
+<li>还是不行，就先停服务、标定、再启服务。</li>
+</ul>
+<h4 id="1-2">"等待固定解超时"——质量位卡在 1 或 2</h4>
+<p>最常见的标定失败。错误信息里按顺序列了要查的项：</p>
+<ol>
+<li><strong>CORS 账号权限。</strong> 有些账号只给伪距（DGPS）差分，或者只授权某个坐标系。你能连上、能收到数据，但模块就是不采用这些差分。跟服务商确认。</li>
+<li><strong>挂载点是否对口。</strong> 距离太远的网络、或者精度等级不同的挂载点可能没用。优先选标明基站级、且覆盖你所在区域的。</li>
+<li><strong>端口与坐标系配对。</strong> 见 §7.2——<code>8002</code> 是 WGS84，<code>8001</code> 是 CGCS2000。对不上就是这个症状。</li>
+<li><strong>天线遮挡。</strong> 质量位在 4~5 附近徘徊却始终锁不住，就是这个原因。把天线挪到天顶开阔处。</li>
+</ol>
+<h4 id="glonass-mt1230">"有 GLONASS 观测但没有 MT1230"</h4>
+<p>这是警告，不是失败：</p>
+<blockquote>
+<p><em>该挂载点播发了 GLONASS 观测（1084）却没有播 MT1230 码相位偏差。模块虽然能跟踪 GLONASS，但通常无法把它们纳入模糊度固定，会明显降低固定成功率。</em></p>
+</blockquote>
+<p>把它当成<strong>对差分流完整度的提示</strong>，而不是对你 CORS 账号的判决。下面把话说全，因为这行警告最容易被误读——我们实测过。</p>
+<p>触发这条警告的体检行长这样：</p>
+<pre><code>[CORS_DOWNLINK] 976 B/s，MSM4=GPS+GLONASS+Galileo+QZSS+BDS，1005=30帧，1230=缺失
+</code></pre>
+<p>五个星座、接近 1 KB/s、基站位置也在——唯独 <code>1230</code> 缺失。这一行里没有任何一项像故障，所以它值得被打印出来：链路是健康的，字节数一直在涨，卫星数甚至还在变好。没有这道体检，你根本不会发现这条流是不完整的。</p>
+<p><strong>但"不完整"不等于"不能用"。</strong> 同一块模块、同一个账号、同一根天线、同一天，唯一变量是挂载点：</p>
+<table>
+<thead>
+<tr>
+<th>挂载点</th>
+<th>MT1230</th>
+<th>结果</th>
+<th>样本数</th>
+<th>收敛后原始标准差（E/N/U）</th>
+<th><code>verify_delta</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>RTCM33_GRCEJ</code></td>
+<td>无</td>
+<td><strong>DONE</strong></td>
+<td>60</td>
+<td><strong>5.4 / 7.9 / 1.2 cm</strong></td>
+<td>0.0001 m</td>
+</tr>
+<tr>
+<td><code>RTCM33_GRCEJ_CPB</code></td>
+<td>有</td>
+<td><strong>DONE</strong></td>
+<td>81</td>
+<td>19.8 / 75.8 / 6.0 cm</td>
+<td>0.0000 m</td>
+</tr>
+</tbody>
+</table>
+<p>两次都固定成功了。<strong>不带</strong> <code>1230</code> 的那个挂载点反而给出了更紧、更一致的解：整体精度 9.6 cm，而带 <code>1230</code> 的那个是 78.6 cm。所以 <code>1230</code> 确实是差分流一个真实且值得追求的属性，但它并不是决定你能不能固定的那件事。</p>
+<p>那一周真正决定结果的，完全在挂载点的上游：</p>
+<table>
+<thead>
+<tr>
+<th>已用时</th>
+<th>质量位</th>
+<th>卫星</th>
+<th>PDOP</th>
+<th>阶段提示</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0 s</td>
+<td>1</td>
+<td>11</td>
+<td>99.99</td>
+<td>等待 0/300 秒</td>
+<td>模块刚上电</td>
+</tr>
+<tr>
+<td>60 s</td>
+<td>1</td>
+<td>13</td>
+<td>4.44</td>
+<td>等待 29/300 秒</td>
+<td></td>
+</tr>
+<tr>
+<td>180 s</td>
+<td>1</td>
+<td>14</td>
+<td>3.58</td>
+<td>等待 117/300 秒</td>
+<td></td>
+</tr>
+<tr>
+<td>250 s</td>
+<td>2</td>
+<td>18</td>
+<td>1.96</td>
+<td>等待 242/300 秒</td>
+<td></td>
+</tr>
+<tr>
+<td>370 s</td>
+<td>2</td>
+<td>20</td>
+<td>2.7</td>
+<td>超时</td>
+<td>浮动解命中率 0/560</td>
+</tr>
+</tbody>
+</table>
+<p>那一次里质量位从 <code>1</code> 爬到了 <code>2</code>，说明差分<strong>确实</strong>被采用了——链路没问题。但质量位始终没到 <code>4</code>。<strong>把模块显式重启一次</strong>，天线原地不动、挂载点也用同一个，再跑一遍，一分钟内质量位就到 <code>4</code>，正常完成（就是上表里的记录 #1）。</p>
+<p>四点值得记住：</p>
+<ol>
+<li><strong><code>1230</code> 是质量信号，不是准入门。</strong> 有得选就优先选播发它的挂载点；没得选也照常标定，多半照样能固定。别为了找一个带 <code>1230</code> 的挂载点耗掉几个小时——真正的问题往往是你的模块已经连续跑了六个钟头。</li>
+<li><strong>先重启模块，再去怀疑 CORS 账号。</strong> 长时间上电的模块会攒下过期的星历、漂掉的钟模型、或者卡住的跟踪通道，质量位会稳稳停在 <code>2</code>，不管差分有多好。断电重上电，等它完整重新捕获一遍，再试。这一个习惯能解决绝大多数"CORS 坏了"的报告。</li>
+<li><strong>失败诊断列的是原因清单，不是优先级排序。</strong> 程序会指向账号权限、挂载点匹配度、模块状态。上面那次失败里这三项都"正确"——而真正的原因一个都不在里头。</li>
+<li><strong>卫星多不能当证据。</strong> 20 颗卫星、PDOP 1.96、质量位却卡在 <code>2</code>，那是接收机跟踪的问题，不是视野的问题。</li>
+</ol>
+<h4 id="_15">"浮动解不稳定"</h4>
+<p>程序尝试降级用浮动解，但拿不到稳的——349 个候选历元里只有 7 个满足准入。原因同上：坐标系不匹配、账号权限、或者天线遮挡。</p>
+<h4 id="1-msm">质量位卡在 1 且"浮动解不稳定"——先查模块的 MSM 输出</h4>
+<p>这一条值得单独讲，因为所有外在迹象都指向 CORS 账号，而没有一条是真正的原因。</p>
+<p>按出现顺序看症状：</p>
+<ol>
+<li>模块走到 <code>FIX_WAIT</code> 就不动了，质量位从头到尾停在 <code>1</code>（单点解）。</li>
+<li>程序报 <code>[FLOAT-DOWNGRADE]</code>，但浮动解命中率极差——好的一轮能看到 <code>292/344</code>，坏的一轮只有 <code>7/349</code>。</li>
+<li>标定以 <code>FAILED</code> 结束，理由是"浮动解不稳定"。</li>
+<li>与此同时状态页显示数据流很健康，每秒几百字节。</li>
+</ol>
+<p>陷阱在这里：<strong>每秒几百字节不等于这条流能用</strong>。只播 <code>1005</code> 的基站是一条完全合法、也完全没用的流——它只携带天线位置，别的什么都没有。没有卫星观测数据，任何地方的流动站都不可能对着它固定。</p>
+<p><strong>从模块侧验证，别看界面。</strong> 直接问模块它到底被配置成播什么：</p>
+<pre><code>$PQTMCFGMSGRATE,W,RTCM3-107X,1,0        # GPS MSM4   }
+$PQTMCFGMSGRATE,W,RTCM3-108X,1,0        # GLONASS    }
+$PQTMCFGMSGRATE,W,RTCM3-109X,1,0        # Galileo    } 六个星座共用
+$PQTMCFGMSGRATE,W,RTCM3-111X,1,0        # QZSS       } 同一个速率档
+$PQTMCFGMSGRATE,W,RTCM3-112X,1,0        # 北斗        }
+$PQTMCFGMSGRATE,W,RTCM3-113X,1,0        # NavIC      }
+$PQTMCFGMSGRATE,W,RTCM3-1005,1          # 基站坐标
+</code></pre>
+<p>回读，看第二个字段。坏掉的模块对每一条 MSM 都回 <code>...,0,0</code>（速率 0），而 <code>1005</code> 仍然是 <code>1</code>：</p>
+<pre><code>$PQTMCFGMSGRATE,OK,RTCM3-107X,0,0*7D     ← 0 = 关闭
+$PQTMCFGMSGRATE,OK,RTCM3-112X,0,0*79     ← 0 = 关闭
+$PQTMCFGMSGRATE,OK,RTCM3-1005,1*0A       ← 1 = 开启
+</code></pre>
+<p><strong>这是怎么发生的。</strong> 一次中途失败的标定会按 <code>BACKUP</code> 阶段留下的备份回滚，而那份备份是标定<strong>开始前</strong>的模块状态。如果那一刻 MSM 速率本来就是 0——因为更早一次被中断的运行、一次恢复出厂、或者模块出厂就是流动站配置——回滚就会忠实地还原成一个只播 <code>1005</code> 的模块。<code>MSG_SETUP</code> 本该配置 MSM4，但回滚发生在它之前；而下一轮标定时模块也帮不上忙：它作为流动站收到了 CORS 差分，却没有自己的观测数据去和差分合成，于是质量位永远离不开 <code>1</code>。</p>
+<p>这是个自我强化的状态。每一次失败都在把坏配置再还原一遍。</p>
+<p><strong>修复办法。</strong> 把速率写回去并落盘：</p>
+<ol>
+<li>先把 <code>RTCM3-1005</code> 设成 <code>0</code>。这一步是为了让串口静下来——<code>1005</code> 以 10 Hz 单独输出就能填满接收缓冲，把你自己的命令回复挤掉。</li>
+<li>给六条 MSM 全部写 <code>1,0</code>。</li>
+<li>逐条回读确认。</li>
+<li>把 <code>RTCM3-1005</code> 恢复成 <code>1</code>。</li>
+<li>发 <code>$PQTMSAVEPAR</code> 写进 NVM，再发 <code>$PQTMSRR</code> 重启。</li>
+</ol>
+<p>之后串口上应该能看到完整的一套：</p>
+<pre><code>1005 x15   1074 x14   1094 x15   1114 x3   1124 x15
+</code></pre>
+<p>重跑标定。在我们的测试机上，浮动解命中率从 <code>7/349</code> 变成 <code>292/344</code>，结果从 <code>FAILED</code> 变成 <code>DONE</code>，播发的 <code>1005</code> 坐标与写入坐标相差不到 0.1 毫米。</p>
+<blockquote>
+<p><strong><code>PQTMCFGMSGRATE</code> 的两个坑。</strong> MSM 的语句名固定是 <code>RTCM3-107X</code>——所有星座共用一档。按星座名写（例如 <code>RTCM3-1074</code>）会回 <code>ERROR,1</code>。另外 <code>&lt;Offset&gt;</code> 字段是必填的：<code>PQTMCFGMSGRATE,W,{name},{rate},{offset}</code>，少写这一项同样回 <code>ERROR,1</code>。</p>
+</blockquote>
+<h4 id="4_1">一切看起来都正常，但质量位就是到不了 4</h4>
+<p>这是另一个问题，属于物理层面而不是逻辑层面。看程序在 <code>FIX_WAIT</code> 时报的数：</p>
+<pre><code>quality=1  sats=9  pdop=99.99
+</code></pre>
+<p><code>FIX_MIN_SATS</code> 是 <strong>12</strong>，<code>FIX_MAX_PDOP</code> 是 <strong>2.0</strong>。九颗星加一个无穷大的 PDOP 永远不会达标，账号再好也没用。这是天空视野问题，不是软件问题：</p>
+<ul>
+<li>把天线移到开阔处，理想情况是 30° 仰角以上没有墙、屋檐或树。</li>
+<li>开机后给模块 2~3 分钟再标定；冷启动的星历会把 PDOP 撑得很大。</li>
+<li>把"等待固定解上限"提到 300 秒以上。<code>FIX_WAIT_TIMEOUT</code> 默认是 180。</li>
+<li>如果确实凑不到 12 颗星，在设置了 <code>allow_float_collect</code> 的情况下程序会降级用浮动解，并如实记录精度写入坐标。这是一个正当的结果——收敛到几厘米的浮动坐标，胜过没有基站——但日志会写明，你不该把它当作厘米级站点来宣传。</li>
+</ul>
+<h4 id="_16">模块被留在了流动站模式</h4>
+<p>如果标定在切流动站之后、回滚之前被打断（断电、杀进程），模块可能停在流动站。症状：主程序起不了数据面，模块也不输出基站 RTCM。</p>
+<p>程序在所有它能捕获的失败（包括重启）上都会按备份回滚。硬断电正好落在写入窗口里，是唯一覆盖不到的情况。这时重跑一次标定——程序会检测到模块处于流动站模式，并在回滚路径里把它恢复成基站模式。</p>
+<hr />
+<h2 id="8-ntrip-caster">8. 上传到云端 NTRIP Caster</h2>
+<p>基站标定完、数据在流了，把它发布出去，别处的流动站就能用。</p>
+<h3 id="81-caster">8.1 在 Caster 那边建好</h3>
+<p>在你的 NTRIP Caster 服务器上创建：</p>
+<ul>
+<li>一个<strong>挂载点</strong>——给你的数据流起个名字，例如 <code>2RTK</code>。</li>
+<li>该挂载点的<strong>密码</strong>，上传端必须提供。</li>
+<li>一个<strong>上传账号</strong>——用户名和密码。</li>
+</ul>
+<p>记下 Caster 的<strong>地址</strong>和接收上传的<strong>端口</strong>（通常是 <code>2101</code>）。</p>
+<h3 id="82-2rtkserver">8.2 在 2RTKserver 里配置上传</h3>
+<p>进入「运行设置」，在<strong>数据出口</strong>里勾选 <strong>① 上传到云端 NTRIP Caster</strong>。</p>
+<p><img alt="Caster 上传配置" src="images/tutorial/web-07-caster-upload.png" /></p>
+<p><em>云端 Caster 上传已启用并填好。</em></p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>填什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>上传地址</td>
+<td>Caster 的域名或 IP</td>
+</tr>
+<tr>
+<td>上传端口</td>
+<td>接收上传的端口，通常 <code>2101</code></td>
+</tr>
+<tr>
+<td>挂载点</td>
+<td>你创建的那个挂载点名</td>
+</tr>
+<tr>
+<td>上传密码</td>
+<td>挂载点密码</td>
+</tr>
+</tbody>
+</table>
+<p>注意上传这里<strong>没有用户名字段</strong>。NTRIP 的上传端只靠挂载点+密码标识自己；上传账号的凭据由 Caster 侧校验，或者在源连接上并不要求。</p>
+<h3 id="83">8.3 保存并验证</h3>
+<p>点 <strong>保存并重启</strong>，然后到三个地方确认：</p>
+<ol>
+<li><strong>状态页</strong> —— 出口卡片显示 <code>已认证 · 正在推送</code>，字节数持续增长。</li>
+<li><strong>Caster 那边</strong> —— 挂载点出现在源表里。</li>
+<li><strong>日志</strong> —— 服务记录了上传认证通过的连接。</li>
+</ol>
+<p>上例填完后的样子：</p>
+<p><img alt="四项填写完成，待保存" src="images/tutorial/web-13-caster-filled.png" /></p>
+<p><em>四项填写完成，待保存</em></p>
+<blockquote>
+<p><img alt="保存后：出口卡片显示已认证，字节与帧数在累加" src="images/tutorial/web-15-outlets.png" /></p>
+</blockquote>
+<p><em>保存后：出口卡片显示已认证，字节与帧数在累加</em></p>
+<p><code>/opt/2RTKserver/server.log</code> 里成功的启动长这样：</p>
+<pre><code class="language-text">上传出口已启动：43.142.126.162:2101/2RTK（独立线程，断线自动重连）
+成功连接到43.142.126.162:2101
+上传出口认证通过，开始推送：43.142.126.162:2101/2RTK
+</code></pre>
+<p>关键是第三行。只出现前两行、始终没有第三行，说明 Caster 拒绝了握手 —— 挂载点名写错或密码不对。</p>
+<p><strong>从 Caster 那边再确认一次。</strong> TCP 连接保持打开只能证明握手成功，查到源表才能证明流真的注册上了。任何 NTRIP 1.0 Caster 都可以这样查：</p>
+<pre><code class="language-bash"># 裸 socket —— Caster 的 2101 端口是自定义 TCP 协议，不是 HTTP，
+# 用 curl 或浏览器会报 &quot;HTTP/0.9 when not allowed&quot;。
+python3 - &lt;&lt;'EOF'
+import socket
+s = socket.create_connection((&quot;43.142.126.162&quot;, 2101), timeout=10)
+s.sendall(b&quot;GET / HTTP/1.0\r\nUser-Agent: NTRIP check\r\n\r\n&quot;)
+buf = b&quot;&quot;
+while b&quot;ENDSOURCETABLE&quot; not in buf:
+    d = s.recv(4096)
+    if not d: break
+    buf += d
+print(buf.decode(errors=&quot;ignore&quot;))
+EOF
+</code></pre>
+<p>在线的挂载点会呈现为一行 <code>STR;</code>。实测拿到的是：</p>
+<pre><code class="language-text">STR;2RTK;Guilin;RTCM3.x;1084(2),1094(2),1114(2),1134(2),1005(2),1124(3),1074(2);
+    B2I+E5a+G3+L1+L5;BDS+GAL+GLO+GPS+IRNSS;2rtk;CHN;25.2035;110.2775;0;0;...
+</code></pre>
+<p>这一行要看三件事：挂载点名对不对、消息列表里有没有 <code>1005</code>、坐标是不是你测出来的位置（而不是 <code>0.0</code>）。</p>
+<blockquote>
+<p><strong>用流动站试，不要只用普通客户端。</strong> 普通 NTRIP 客户端即使收到的是不能用的流，也照样连接成功、字节数照涨。真正能不能定位，取决于 <code>1005</code> 在不在、差分帧对不对。</p>
+</blockquote>
+<hr />
+<h2 id="9-relay">9. 中继模式（Relay）</h2>
+<p>中继模式让 2RTKserver 变成<strong>再分发器</strong>：从上游 Caster 拉一路流，再转发出去。</p>
+<p><strong>什么时候用它？</strong></p>
+<ul>
+<li><strong>跨网络桥接。</strong> 流动站在一个到不了服务商的内网里，而这台盒子两边都能通。</li>
+<li><strong>扩大覆盖。</strong> 手上只有一个好用的挂载点，但有好几个消费方需要它。</li>
+<li><strong>测流。</strong> 把生产流量切过去之前，先验证上游那路流是健康的。</li>
+</ul>
+<h3 id="91">9.1 配置中继源</h3>
+<p>进 <strong>配置</strong> 页，把 <strong>运行模式</strong> 改成 <code>relay</code>。</p>
+<p><img alt="模式选为 relay，源字段出现、串口字段消失" src="images/tutorial/web-16-relay-mode.png" /></p>
+<p><em>模式选为 relay，源字段出现、串口字段消失</em></p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>填什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>中继地址</td>
+<td>上游 Caster 的主机名或 IP</td>
+</tr>
+<tr>
+<td>中继端口</td>
+<td>上游端口，通常是 <code>2101</code></td>
+</tr>
+<tr>
+<td>用户名</td>
+<td>你在上游 Caster 的账号</td>
+</tr>
+<tr>
+<td>密码</td>
+<td>该账号的密码</td>
+</tr>
+</tbody>
+</table>
+<h3 id="92">9.2 获取挂载点列表</h3>
+<p>点 <strong>获取挂载点</strong>。盒子会代替浏览器去连上游并解析源表 —— 浏览器自己做不到，因为 2101 是自定义 TCP 协议而不是 HTTP。</p>
+<p>这一步同时也是凭据测试：能拉下来，就说明主机、端口、账号全对。</p>
+<p><img alt="源表已取回，本例 **1323** 个挂载点" src="images/tutorial/web-17-relay-mounts-loaded.png" /></p>
+<p><em>源表已取回，本例 <strong>1323</strong> 个挂载点</em></p>
+<p>选中一个填进挂载点字段：</p>
+<p><img alt="上游凭据填好，挂载点已选" src="images/tutorial/web-18-relay-filled.png" /></p>
+<p><em>上游凭据填好，挂载点已选</em></p>
+<blockquote>
+<p><strong>实战例子 —— CRTK.net：</strong> 公共 Caster，<code>CRTK.net:2101</code>，用户名密码都是 <code>C</code>。实测源表列出 <strong>1323 个挂载点</strong>，几乎每个都带 <code>1005,1006,...,1230</code> 全套 RTCM 3.x。随便挑一个都能做中继演示，本例用的是 <code>NONO</code>（法国 Amou）。</p>
+</blockquote>
+<h3 id="93">9.3 验证拉流</h3>
+<p>保存重启。中继连接会在日志里留下：</p>
+<pre><code class="language-text">进入中继模式
+收到realy caster服务器响应: ['HTTP/1.1 200 OK', 'Server: NTRIP Millipede Server 0.8.1', ...]
+Relay NTRIP server authentication passed, receiving RTCM data
+</code></pre>
+<p>状态页随后把中继报告为数据源：</p>
+<p><img alt="中继运行中：源 CRTK.net:2101/NONO，转发到云端 Caster，字节在增长" src="images/tutorial/web-19-relay-live.png" /></p>
+<p><em>中继运行中：源 <code>CRTK.net:2101/NONO</code>，转发到云端 Caster，字节在增长</em></p>
+<p>注意数据源那行读作 <code>CRTK.net:2101/NONO</code> —— 上游主机<strong>和</strong>挂载点都在，任何时候都能看出正在转发哪一路。</p>
+<h3 id="94">9.4 中继的数据往哪去</h3>
+<p>中继输出和串口模式共用同一组 <strong>数据出口</strong> 勾选框，三个可以同时开：</p>
+<ul>
+<li>从上游拉流，推到你自己的云端 Caster。</li>
+<li>拉流并在内置本地 Caster 上发布。</li>
+<li>拉流并输出到数传电台。</li>
+</ul>
+<blockquote>
+<p><strong>带宽提醒：</strong> 中继模式进出两个方向都占带宽。在计费链路或慢链路上要注意丢帧 —— 状态页的字节计数能看出吞吐。</p>
+</blockquote>
+<hr />
+<h2 id="10-caster">10. 内置本地 Caster</h2>
+<p>不必推到外部服务器，2RTKserver 可以直接在局域网里提供 NTRIP 服务。对私有基准站来说这往往更合适：不需要公网服务器、不依赖外网、延迟更低。</p>
+<h3 id="101">10.1 启用</h3>
+<p>在 <strong>配置</strong> 页的 <strong>数据出口</strong> 里勾选 <strong>② 本地 NTRIP Caster</strong>。</p>
+<p><img alt="本地 Caster 已启用" src="images/tutorial/web-10-local-caster.png" /></p>
+<p><em>本地 Caster 已启用</em></p>
+<blockquote>
+<p><img alt="已勾选并保存，下面可设监听地址与端口" src="images/tutorial/web-21-local-caster-on.png" /></p>
+</blockquote>
+<p><em>已勾选并保存，下面可设监听地址与端口</em></p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>填什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>监听地址</td>
+<td>绑定地址，<code>0.0.0.0</code> 表示所有网卡，也可以指定某个内网 IP</td>
+</tr>
+<tr>
+<td>监听端口</td>
+<td>提供服务的 TCP 端口，例如 <code>2102</code></td>
+</tr>
+</tbody>
+</table>
+<p>启用保存后，状态页会给出挂载点、凭据和当前客户端数：</p>
+<p><img alt="运行中，1 / 16 个客户端已连接。这个计数是实时的，流动站一接就涨。" src="images/tutorial/web-22-lc-live.png" /></p>
+<p><em><code>运行中</code>，<code>1 / 16</code> 个客户端已连接。这个计数是实时的，流动站一接就涨。</em></p>
+<h3 id="102">10.2 连接流动站</h3>
+<p>把流动站或 NTRIP 客户端指向：</p>
+<pre><code>主机:    &lt;盒子 IP&gt;   （支持 mDNS 的网络可用 2rtk.local）
+端口:    &lt;监听端口&gt;
+挂载点:  2RTK       （配置页上有显示）
+账号:    以配置页显示为准
+</code></pre>
+<p>默认凭据是固定的：用户名 <code>2RTK</code>，密码 <code>2RTK</code>。没有特殊需要不必改。</p>
+<h3 id="103">10.3 当真实客户端验证它</h3>
+<p>内置 Caster 严格按 NTRIP 规范实现，任何客户端都能用。不用客户端也能确认 —— 两个裸 socket 就够：</p>
+<pre><code class="language-bash"># 1) 源表 —— 不需要账号就能取，客户端靠它发现挂载点
+python3 - &lt;&lt;'EOF'
+import socket
+s = socket.create_connection((&quot;192.168.1.71&quot;, 2102), timeout=8)
+s.sendall(b&quot;GET / HTTP/1.0\r\nUser-Agent: NTRIP probe\r\n\r\n&quot;)
+print(s.recv(4096).decode(errors=&quot;ignore&quot;))
+EOF
+</code></pre>
+<pre><code class="language-text">SOURCETABLE 200 OK
+CAS;192.168.1.71;2102;2RTK NTRIP Caster;2RTK;0;CHN;43.578903011;-0.739368313;0.0.0.0;0;none
+NET;2RTK;2RTK;B;N;none;none;none;none
+STR;2RTK;2RTK-Base;RTCM 3.2;1004(1),1005(1),1008(1),1012(1),1019(1),1033(1),1077(1),1087(1),1097(1),1107(1),1127(1);2;GPS+GLO+GAL+SBAS+BDS;;;43.578903011;-0.739368313;0;0;2RTK;none;B;N;0;
+ENDSOURCETABLE
+</code></pre>
+<p>这张表里有两处值得读出来：<strong>挂载点是 <code>2RTK</code></strong>、<strong>凭据是 <code>2RTK</code>/<code>2RTK</code></strong>，两者都是固定的。而坐标 <code>43.578903011, -0.739368313</code> 正是被中继的那个站的坐标 —— 这证明对外发布的确实是上游那路流，原样透传。</p>
+<pre><code class="language-bash"># 2) 取流 —— 密码对返回 200 且有数据，密码错返回 401
+python3 - &lt;&lt;'EOF'
+import base64, socket
+def probe(pw):
+    s = socket.create_connection((&quot;192.168.1.71&quot;, 2102), timeout=8)
+    auth = base64.b64encode(f&quot;2RTK:{pw}&quot;.encode()).decode()
+    s.sendall((f&quot;GET /2RTK HTTP/1.0\r\nUser-Agent: NTRIP probe\r\n&quot;
+               f&quot;Authorization: Basic {auth}\r\nNtrip-Version: Ntrip/2.0\r\n\r\n&quot;).encode())
+    head = s.recv(256).split(b&quot;\r\n&quot;)[0].decode()
+    s.settimeout(3)
+    total = 0
+    try:
+        while total &lt; 60000:
+            d = s.recv(8192)
+            if not d: break
+            total += len(d)
+    except socket.timeout:
+        pass
+    print(f&quot;password={pw!r:8} -&gt; {head}  {total} bytes&quot;)
+probe(&quot;2RTK&quot;)
+probe(&quot;bad&quot;)
+EOF
+</code></pre>
+<pre><code class="language-text">password='2RTK'   -&gt; HTTP/1.1 200 OK  60828 bytes
+password='bad'    -&gt; HTTP/1.1 401 Unauthorized  0 bytes
+</code></pre>
+<p>那个 <code>401</code> 是有意义的：说明 Caster 真的在校验凭据，不是谁都能取。反过来，如果对着一个完全不校验的 Caster 还定不了位，那就是另一类问题 —— 知道手上是哪种，能省掉很多排查。</p>
+<h3 id="104">10.4 端口冲突</h3>
+<p>有个细节值得弄明白：<strong>监听端口</strong>是真的占用了盒子上那个 TCP 端口；而 <strong>中继端口</strong> 和 <strong>Caster 端口</strong> 是<em>出站</em>目标 —— 盒子从临时源端口连出去。所以本地 Caster 用 <code>2102</code>、同时从 <code>2101</code> 的上游 Caster 拉流，两者并不冲突。</p>
+<p>真正会冲突的是两个本地进程绑同一个端口 —— 包括上一个还没完全退出的实例。本地 Caster 起不来时，先查有没有残留进程。</p>
+<hr />
+<h2 id="11">11. 数传电台透传</h2>
+<p>流动站出了网络覆盖范围时，差分可以改走 UHF 电台。盒子把 RTCM 流送往第二个串口，由它驱动电台。</p>
+<h3 id="111">11.1 启用</h3>
+<p>在 <strong>配置</strong> 页的 <strong>数据出口</strong> 里勾选 <strong>③ 数传电台透传</strong>。</p>
+<p><img alt="数传透传已启用，出现端口与波特率字段" src="images/tutorial/web-23-radio-config.png" /></p>
+<p><em>数传透传已启用，出现端口与波特率字段</em></p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>填什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>数传串口</td>
+<td>电台数据线所在的串口设备，例如 <code>/dev/ttyUSB1</code></td>
+</tr>
+<tr>
+<td>波特率</td>
+<td><strong>必须和电台本身的设置一致。</strong> 默认 <code>115200</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="112">11.2 它的行为</h3>
+<ul>
+<li><strong>单向，只发不收。</strong> 盒子单向广播差分，不从电台读任何东西。这适用于标准广播式 RTK —— 流动站只负责听。</li>
+<li><strong>电台是第二个串口设备。</strong> 如果也是 CH340 一类，会呈现为下一个可用的 <code>/dev/ttyUSB*</code> —— GNSS 模块占了 <code>ttyUSB0</code> 的话通常就是 <code>ttyUSB1</code>。用字段旁的 <strong>扫描串口</strong> 枚举。</li>
+<li><strong>波特率必须对上硬件。</strong> GNSS 那边有自动探测，这里没有。先在电台自己的软件或拨码上设好，这里填一样的。</li>
+<li><strong>它需要独立的端口。</strong> 盒子只有一个 USB 串口且被 GNSS 模块占着时，就没有口可发。设置能保存，但出口会报"已启用但未运行"。</li>
+</ul>
+<p>配置前先确认手上到底有什么：</p>
+<pre><code class="language-bash">ls -l /dev/ttyUSB* /dev/ttyACM*
+</code></pre>
+<pre><code class="language-text">crw-rw---- 1 root dialout 188, 0 Nov 11 07:54 /dev/ttyUSB0
+</code></pre>
+<p>只有一个设备，就只有一个口。GNSS 模块在 <code>ttyUSB0</code> 上时，数传需要再一个转接器 —— 通常是第二个 CH340 或一根 USB 转 RS232 线。</p>
+<h3 id="113">11.3 电台与速率的选型</h3>
+<p>多星座接收机的 RTCM MSM4 大约在 <strong>2–4 kbit/s</strong>，但瞬时峰值更高。9600 波特通常太窄，会丢消息，进而拉低流动站精度。实际下限：</p>
+<table>
+<thead>
+<tr>
+<th>链路速率</th>
+<th>适用性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>9600 波特</td>
+<td>勉强 —— 会丢消息</td>
+</tr>
+<tr>
+<td>19200 波特</td>
+<td>精简消息集下可用</td>
+</tr>
+<tr>
+<td>38400 波特及以上</td>
+<td>比较从容</td>
+</tr>
+</tbody>
+</table>
+<p>流动站通过电台定位慢或不稳定时，先查链路速率。</p>
+<h3 id="114">11.4 距离，以及基准站高度为什么重要</h3>
+<p>电台链路在实际使用中是视距的。1 W 的 UHF 电台在开阔地形能到几公里，丘陵或建筑密集的区域会短得多。两件事可以补偿：</p>
+<ul>
+<li><strong>天线高度。</strong> 架到 10 m 的基站天线，覆盖距离远大于架在 2 m 的 —— 这是提升距离最有效的一招。</li>
+<li><strong>在制高点加一台中继电台</strong>，需要覆盖山谷时这么做。</li>
+</ul>
+<p>RTCM 是单向广播，丢了的消息没法补发，流动站只能等下一个历元。所以链路勉强时，表现为"定位慢"而不是"断线"。</p>
+<blockquote>
+<p><strong>📷 实物图占位 —— 数传电台</strong><br />
+<em>需要：电台连到盒子上，能看出数据口和天线。</em></p>
+</blockquote>
+<hr />
+<h2 id="12">12. 日常维护</h2>
+<h3 id="_17">查看服务状态</h3>
+<pre><code class="language-bash">systemctl status 2rtkserver          # 在跑吗
+journalctl -u 2rtkserver -n 100      # 最近日志
+journalctl -u 2rtkserver -f          # 实时跟踪
+</code></pre>
+<h3 id="_18">重启</h3>
+<pre><code class="language-bash">sudo systemctl restart 2rtkserver
+</code></pre>
+<p>也可以在 Web 界面上重启——配置页的「保存并重启」保存完就会自动重启。</p>
+<h3 id="_19">升级</h3>
+<pre><code class="language-bash">cd /opt/2RTKserver
+sudo bash update.sh
+</code></pre>
+<p>升级脚本会保留你的配置和标定历史。</p>
+<h3 id="_20">卸载</h3>
+<pre><code class="language-bash">cd /opt/2RTKserver
+sudo systemctl stop 2rtkserver
+sudo bash uninstall.sh
+</code></pre>
+<h3 id="_21">备份</h3>
+<p>真正要紧的只有两处：</p>
+<table>
+<thead>
+<tr>
+<th>内容</th>
+<th>位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>配置与标定历史</td>
+<td><code>/opt/2RTKserver/2RTKserver.db</code>、<code>calibration.db</code></td>
+</tr>
+<tr>
+<td>标定工作数据</td>
+<td><code>/opt/2RTKserver/.calibration/</code></td>
+</tr>
+</tbody>
+</table>
+<p>定期把这几样拷出盒子。恢复到全新安装里，就不用重跑标定——硬件坏了但天线位置没变时特别有用。</p>
+<h3 id="_22">关于持续运行</h3>
+<p>服务注册时带了 <code>Restart=always</code>，进程挂了 systemd 会自动拉起。长期值守的基站建议配 UPS——标定写入窗口中途断电是回滚逻辑唯一覆盖不到的场景（见 §7.7）。</p>
+<hr />
+<h2 id="a">附录 A — 支持的模块</h2>
+<table>
+<thead>
+<tr>
+<th>模块</th>
+<th>星座</th>
+<th>频点</th>
+<th>角色</th>
+<th>可用标定方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Quectel LG290P</td>
+<td>GPS、GLONASS、Galileo、BDS、QZSS、NavIC</td>
+<td>多频</td>
+<td>基站 + 流动站（双模）</td>
+<td>全部四种</td>
+</tr>
+<tr>
+<td>u-blox ZED-F9P</td>
+<td>GPS、GLONASS、Galileo、BDS</td>
+<td>L1/L2</td>
+<td>基站 + 流动站（双模）</td>
+<td>全部四种</td>
+</tr>
+<tr>
+<td>Unicore UM980 / N4</td>
+<td>GPS、GLONASS、Galileo、BDS、QZSS</td>
+<td>多频</td>
+<td>基站 + 流动站（双模）</td>
+<td>全部四种</td>
+</tr>
+<tr>
+<td>Quectel LC29H</td>
+<td>GPS、GLONASS、Galileo、BDS</td>
+<td>L1/L5</td>
+<td>有限</td>
+<td>视具体型号</td>
+</tr>
+</tbody>
+</table>
+<p><strong>双模</strong>指模块既能当基站也能当流动站。这对标定很关键：CORS 一键固定需要模块临时变成流动站、收差分、锁固定解——只能当基站的接收机做不到这一点，只能用自收敛。</p>
+<p>标定页会自动识别模块，只提供它真正能执行的方式。你预期能看到 CORS 一键固定但没出现，要么模块没有上报双模能力，要么没被正确识别。</p>
+<hr />
+<h2 id="b">附录 B — 常见问题</h2>
+<h3 id="_23">网页打不开</h3>
+<table>
+<thead>
+<tr>
+<th>检查项</th>
+<th>命令 / 动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>服务在跑吗</td>
+<td><code>systemctl status 2rtkserver</code></td>
+</tr>
+<tr>
+<td>端口在听吗</td>
+<td><code>ss -lntp \| grep 5757</code></td>
+</tr>
+<tr>
+<td>防火墙拦了</td>
+<td><code>sudo ufw status</code>——放行局域网访问 5757</td>
+</tr>
+<tr>
+<td>IP 记错了</td>
+<td>看安装脚本输出，或 <code>ip addr</code></td>
+</tr>
+<tr>
+<td>代理动了 <code>.local</code></td>
+<td>改用 IP；把 <code>*.local</code> 加进代理直连列表</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_24">状态页没有卫星</h3>
+<p>模块在通信但没跟踪到卫星。几乎都是天线问题：</p>
+<ul>
+<li>接了吗？SMA 接头比较娇气，检查中心针。</li>
+<li>能看见天空吗？室内基本是零到几颗。</li>
+<li>天线供电了吗？有源天线需要偏置供电。多数模块会供，部分载板要跳线。</li>
+</ul>
+<h3 id="_25">有卫星但位置一直解不出来</h3>
+<p>接收机有卫星却没定位。通常是：</p>
+<ul>
+<li>卫星太少——理论最少 4 颗，稳定定位实际上要 6 颗以上。</li>
+<li>PDOP 很高——几何构型差，多半是天空视野受限。</li>
+<li>模块处于抑制定位输出的模式。</li>
+</ul>
+<h3 id="_26">数据在流但流动站不固定</h3>
+<p>经典的 <code>1005</code> 问题。看状态页的 RTCM 输出列表：</p>
+<ul>
+<li><strong>有没有 <code>1005</code>（或 <code>1006</code>）？</strong> 没有它，流动站不知道基站在哪，差分用不上。</li>
+<li><strong>标定真的做完了吗？</strong> 没标定的基站可能播 <code>1005</code>，但里面是粗糙的单点坐标，最好也就是米级。</li>
+<li><strong>坐标系对得上吗？</strong> WGS84 和 CGCS2000 不匹配会产生固定偏移。</li>
+</ul>
+<h3 id="fix_wait">标定一直卡在 FIX_WAIT 超时</h3>
+<p>按 §7.7 的顺序逐项排查。最常被忽略的两个原因是端口与坐标系配对、以及 CORS 账号的权限范围——这两者都允许你成功连接、正常收数据，却永远给不出固定解。</p>
+<h3 id="_27">标定失败后主程序起不了数据面</h3>
+<p>模块大概被留在流动站模式了。重跑一次标定：程序会检测到流动站模式，并在回滚路径里恢复成基站模式。如果服务完全碰不到模块，先确认串口还在（<code>ls /dev/ttyUSB*</code>），以及没别人占着（<code>sudo fuser -v /dev/ttyUSB0</code>）。</p>
+<h3 id="caster">本地 Caster 起不来</h3>
+<p>监听端口被占了：</p>
+<pre><code class="language-bash">sudo ss -lntp | grep 2101
+</code></pre>
+<p>如果是上一轮残留的进程占着，重启服务即可。如果是别的程序需要这个端口，在配置里换一个监听端口。</p>
+<hr />
+<h2 id="_28">结语</h2>
+<p>2RTKserver 建立在 Flask、pyserial 和 NTRIP 协议之上。标定命令序列依据各模块公开的协议文档实现。</p>
+<p>欢迎反馈问题、提出改进建议。</p></main></body></html>

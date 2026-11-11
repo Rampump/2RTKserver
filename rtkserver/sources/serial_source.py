@@ -16,7 +16,7 @@ from ..core import state
 from ..core.config import save_serial_config
 from ..core.constants import ART_LOGO, SERIAL_SCAN_BAUDS
 from ..core.distributor import distribute
-from ..core.status import describe_targets, push_run_status
+from ..core.status import describe_target_parts, describe_targets, push_run_status
 from ..utils.common import (ThreadExitRequested, clear_screen, format_bytes,
                             format_duration, retry)
 from .rtcm_parser import extract_rtcm_frames
@@ -107,9 +107,13 @@ def upload_via_serial(ser, cfg, thread_exit_event):
     total_bytes = 0
 
     # 增量更新，不整体替换全局 dict：避免覆盖其他模块写入的 radio / local_caster 字段
+    # mode 给人看（日志/控制台），mode_key 给前端查 i18n 表——否则英文界面会漏出中文
     state.run_status["mode"] = "串口模式"
+    state.run_status["mode_key"] = "serial"
     state.run_status["data_source"] = f"{cfg['serial_port']} @ {cfg['baud_rate']}bps"
     state.run_status["target_caster"] = describe_targets(cfg)
+    # 结构化版本：英文界面靠它重新拼，避免直接显示中文
+    state.run_status["target_parts"] = describe_target_parts(cfg)
     push_run_status()
 
     while not thread_exit_event.is_set():

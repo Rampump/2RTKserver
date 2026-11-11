@@ -1004,6 +1004,13 @@ class CalibrationService:
         self._lease = lease
         final_stage = 'FAILED'
         final_message = ''
+        # 从这一刻起串口归标定独占，数据面的 `thread_exit_event` 与本单位无关：
+        # 主循环每次被 `restart_event` 唤醒都会走一遍 `run_once()`，其中
+        # "上一轮线程未退出"的分支会置位 `thread_exit_event`。若不加这个标志，
+        # 标定侧的 `@retry` 包装器（`connect_to_host` 等）会把它当成"自己也该退出"，
+        # 抛出一个**没有参数**的 `ThreadExitRequested`，最终显示成
+        # "连接失败："（冒号后为空），一次 socket 都没发出去（2026-11-11 06:03 真机）。
+        state.calibration_owns_serial = True
         try:
             self._set_stage('PREPARE', f'校验参数：{task["port"]} @ {task["baud"]}')
             self._checkpoint()
@@ -1093,6 +1100,11 @@ class CalibrationService:
             self._persist(payload, force=True)
             if final_stage != 'DONE':
                 self._record_events(final_stage, {'error': final_message})
+            # 串口交还，数据面重新开始正常"收退出信号"的语义。
+            # 必须放在 `lease.release()` **之后**：release 里 `restart_event.set()`
+            # 会立刻把主循环唤醒，它随后可能又置位一次 `thread_exit_event`；
+            # 而那时标定已经结束，标志留不清也只影响一个空闲的事件对象。
+            state.calibration_owns_serial = False
 
     # ---------- 任务一：P0 只读诊断 ----------
     def _run_diagnose(self, driver, lease, task):

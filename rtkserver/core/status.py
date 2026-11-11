@@ -20,23 +20,56 @@ def describe_targets(cfg) -> str:
 
     未勾选的出口不会出现在这里——即使数据库里存着历史地址。
     """
+    parts = [p['text'] for p in describe_target_parts(cfg)]
+    return " + ".join(parts) if parts else "仅本地监控（未启用任何出口）"
+
+
+
+def describe_target_parts(cfg) -> list:
+    """describe_targets 的结构化版本：返回 [{kind, text, ...}]。
+
+    kind 是给前端查 i18n 用的机器可读标识，text 保留原中文串。
+    这样英文界面可以重新拼一遍，而不是把中文直接塞进界面。
+    """
     parts = []
     if str(cfg.get('caster_enabled', '0')) == '1' and cfg.get('caster_host'):
-        parts.append(f"上传 {cfg.get('caster_host')}:{cfg.get('caster_port')}"
-                     f"/{cfg.get('caster_mountpoint')}")
+        parts.append({
+            'kind': 'caster',
+            'host': cfg.get('caster_host'),
+            'port': cfg.get('caster_port'),
+            'mountpoint': cfg.get('caster_mountpoint'),
+            'text': f"上传 {cfg.get('caster_host')}:{cfg.get('caster_port')}"
+                    f"/{cfg.get('caster_mountpoint')}",
+        })
     if str(cfg.get('local_caster_enabled', '0')) == '1':
         # 只有真正监听成功才会有对象；bind 失败时这里是 None。
         # 之前只看配置项，导致"启动失败"仍打印成"就绪"，状态页也显示正常，容易误判。
         if state.local_caster is not None:
-            parts.append(f"本地 Caster {cfg.get('local_caster_host')}:{cfg.get('local_caster_port')}")
+            parts.append({
+                'kind': 'local_caster',
+                'host': cfg.get('local_caster_host'),
+                'port': cfg.get('local_caster_port'),
+                'text': f"本地 Caster {cfg.get('local_caster_host')}:{cfg.get('local_caster_port')}",
+            })
         else:
-            parts.append(f"本地 Caster 启动失败（端口 {cfg.get('local_caster_port')} 不可用）")
+            parts.append({
+                'kind': 'local_caster_failed',
+                'port': cfg.get('local_caster_port'),
+                'text': f"本地 Caster 启动失败（端口 {cfg.get('local_caster_port')} 不可用）",
+            })
     if str(cfg.get('radio_enabled', '0')) == '1':
         if state.serial_bridge is not None:
-            parts.append(f"数传 {cfg.get('radio_port')}")
+            parts.append({
+                'kind': 'radio',
+                'port': cfg.get('radio_port'),
+                'text': f"数传 {cfg.get('radio_port')}",
+            })
         else:
-            parts.append("数传 未配置串口")
-    return " + ".join(parts) if parts else "仅本地监控（未启用任何出口）"
+            parts.append({
+                'kind': 'radio_unconfigured',
+                'text': "数传 未配置串口",
+            })
+    return parts
 
 
 def refresh_network_info():
