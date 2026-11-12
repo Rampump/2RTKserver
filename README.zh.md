@@ -1,40 +1,39 @@
 # 2RTK NTRIP Server
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%2F%20Armbian-orange.svg)](#兼容性)
-[![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB.svg)](#运行要求)
+`GPLv3` · `Linux / Armbian` · `Python 3.8+`
 
 [English](README.md) · **中文**
 
-> 一个 RTK 模块 + 一个小主机 + 宽带 = 你自己的 GNSS 基准站。
+> 一个 RTK 基准站模块 + 一个机顶盒（Armbian）+ 宽带 WiFi = 你自己的 RTK 基准站。
 
-自建的 RTK 基准站 NTRIP 服务端。从串口 RTK 模块读 RTCM3（或 relay 别的 Caster 的流），
-分发到**三个互相独立**的出口：上传到上游 Caster、开一个局域网内置 Caster、
-通过 USB 数传模块播发 —— 任意组合，各有各的开关。基准站标定直接在浏览器里做。
+一个支持 RTK 基准站的模块，通过 USB 或者 UART 接入一个可以刷 Armbian 的机顶盒、树莓派、玩客云、Armbian 开发板等。
+程序会通过读取串口的 RTK 模块数据自建 RTKBASE（或者 relay 别的 NTRIP Caster 上挂载点的数据）：
 
-![状态页](docs/images/screenshot-status.png)
+1. 可以转发到你自建的 NTRIP Caster 或者 RTK2GO 等。
+   自建 NTRIP Caster 可以用 <https://github.com/Rampump/NTRIPcaster>；
+   不想自建可以用 NTRIP Caster 测试服务器 <https://2rtk.com/test-caster/>。
+2. 也可同时开启本地内网 NTRIP Caster。
+3. 还可以同时通过另外串口上的无线数传模块播发出去。
+
+![实物参考](docs/images/RTKBASE.webp)
+
+如上图接好硬件，室外固定好 RTK 天线。
 
 ## 一键安装
 
-复制下面**这一整行**到设备终端里回车：
+SSH 或直接登录 Armbian 设备，然后复制下面**这一整行**到设备终端里回车：
 
 ```bash
 sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone --depth 1 https://gitcode.com/rampump/NTRIPserver.git /tmp/2rtk-install || (sudo rm -rf /tmp/2rtk-install && sudo git clone --depth 1 https://github.com/Rampump/2RTKserver.git /tmp/2rtk-install)) && sudo bash /tmp/2rtk-install/install.sh
 ```
 
 缺 `git` 会先装 `git`；先试国内 GitCode 镜像，连不上再退到 GitHub。
-装完浏览器打开 `http://设备IP:5757`，账号密码都是 **`admin`**，进去第一件事改密码。
-
-已经装过旧版本？用 [`update.sh`](#升级) 或网页里的 **系统维护 → 立即升级**，
-配置和已测坐标都会保留。
+装完浏览器打开 `http://设备IP:5757` 或 `http://2rtk.local:5757`（Windows / macOS / iOS / Linux）。
+默认登录账号密码都是 **`admin`**。
 
 完整说明见 [INSTALL.md](INSTALL.md) · [English](INSTALL.en.md)。
 
-**完整使用教程（安装 → 标定 → 发布）：** [完整使用教程（中文）](docs/tutorial.zh.md) · [tutorial.en.md](docs/tutorial.en.md)
-
-> **从 Windows 复制粘贴的坑**：直接粘贴，不要手打。这一行是纯 ASCII、没有换行，
-> 能完整黏贴过去；但 `CR LF` 换行、全角标点（，；：）、以及窗口太窄导致命令折行，
-> 这三种情况都会让它失败。
+**完整使用教程（安装 → 标定 → 发布）：** [中文](docs/tutorial.zh.md) · [English](docs/tutorial.en.md)
 
 ## 功能
 
@@ -44,34 +43,32 @@ sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone 
   （适合把上游流在本地再播一遍，或做备用基准站）。
 - **网页端标定**（`/calibrate`）—— 测量天线位置并写进模块，不用厂家上位机。
   支持 CORS/VRS、Survey-in、手动输入；内置 Quectel LG290P、Quectel LC29H(BS)、
-  Unicore N4 的型号档案。每条结果都标注 `fixed` / `float` / `sub_meter` / `decimeter`
-  —— 天线被挡住时给一个诚实的等级，而不是假装成功。
-- **写后回读校验** —— 写入坐标后回读 RTCM 1005/1006 逐项比对，
-  播出去的和写进去的不一致就判失败。
-- **自动识别模块** —— 波特率是从模块**回读**的，不是猜的；按型号记住，下次直接用。
-  波特率框留空即可，程序自己判断。
-- **固定地址访问** —— `http://2rtk.local:5757`，Windows / macOS / iOS / Linux 都能解析，
-  不用记 IP。名字被占用时自动退成 `2rtk-2.local`。
-- **中英双语界面** —— 运行时随时切换。
-- **自包含** —— 配置存 SQLite，没有云账号、没有厂商服务、没有遥测。
-  1 GHz ARM 板 + 512 MB 内存跑得动。
+  Unicore N4 的型号档案。每条结果都标注 `fixed` / `float` / `sub_meter` / `decimeter`。
 - **网页升级** —— 检查更新、一键升级、失败自动回滚，不用 SSH。
   卸载刻意只留 SSH，不给浏览器入口。
 
 ## 截图
 
-| 配置页 —— 出口、数据源、各出口实时状态 |
-| --- |
-| ![配置页](docs/images/screenshot-settings.png) |
+**状态页** —— 数据源、三个出口、实时卫星与差分状态一目了然。
 
-| 本地 Caster —— 本机唯一真正 bind 的端口 |
-| --- |
-| ![本地 Caster 设置](docs/images/screenshot-local-caster.png) |
+![状态页](docs/images/screenshot-status.png)
 
-**标定页**（`/calibrate`）—— 选方式、看阶段进度与实时质量指示，最后当场给出坐标与精度等级。
-历史列表可以复用之前的结果（前提是同一根天线）。
+**配置页** —— 出口、数据源、各出口实时状态。
 
-**系统维护**（`/upgrade`）—— 检查更新、一键升级（自动回滚），以及仅 SSH 的卸载说明。
+![配置页](docs/images/screenshot-settings.png)
+
+**标定页**（`/calibrate`）—— 四条互斥的路径，选哪条，页面就只显示那条真正会用到的设置：
+
+1. **CORS 差分标定** —— 模块临时切成流动站，连 CORS 取差分，稳定固定解后采集过滤，
+   再写回基准站坐标。精度最高（厘米级），需要 CORS 账号，且模块要支持基准站/流动站双模切换。
+2. **Survey-in 自收敛** —— 由模块固件自己长时间平均出坐标，不连 CORS、不占账号。
+   耗时十几分钟到一小时，全程不能动天线，精度一般为亚米级，达不到厘米级。
+3. **写入已知坐标** —— 不测量，把手上已有的坐标直接写进模块并设为基准站。
+   可以是手动输入、复用本机历史记录，或先用「只测坐标」测出来再回来写。
+4. **只测坐标（不改模块）** —— 连 CORS 测出天线坐标就结束，不写坐标、不保存 NVM。
+   用于外接流动站，或没有命令集的未知模块：测完给你一组坐标，由你手动配进基准站。
+
+![标定页](docs/images/screenshot-calibrate.png)
 
 ## 系统构成
 
@@ -101,18 +98,11 @@ sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone 
 | ② 局域网 Caster | 把同一路流服务给局域网，任意 NTRIP 客户端可连 | `0.0.0.0:2102`，挂载点 `2RTK` |
 | ③ 数传播发 | 单向透传到 USB 数传模块 | 自动扫描端口 @ 115200 |
 
-**端口，以及唯一值得记住的那个坑**：
-
-| 端口 | 这是谁的端口 | 占不占本机？ |
-| --- | --- | --- |
-| `5757` | 本程序的网页界面 | 占 |
-| `2101`（relay / 上传） | **远端** Caster 的 | **不占** —— 出站连接用的是临时本地端口 |
-| `2102`（本地 Caster） | 本机的 | **占** —— 真的 `bind()` 了 |
-
-所以 relay 和上传可以同时用 2101，而本地 Caster 用 2102，这不冲突 ——
-也正是本地 Caster 默认 2102 的原因。
-
 ## 硬件
+
+> **关于真机测试范围**：手上目前只有 **LG290P** 和 **LC29HC** 两块模块，所以只对这两款做了真机测试。
+> 其他型号（LC29HBS、N4 等）的驱动与命令集是按厂家手册写的，尚未经过实机验证 —— 用之前请留意，
+> 遇到问题欢迎提 issue 反馈。
 
 - **天线** —— 大地测量 / 测量型，稳固安装，**天线相位中心（APC）坐标要事先测好**。
   差分是相对相位中心算的；这个坐标错了，所有流动站都会整体偏移，软件救不回来。
@@ -126,72 +116,7 @@ sudo apt-get install -y git && sudo rm -rf /tmp/2rtk-install && (sudo git clone 
 - **数传（可选）** —— 任意透明传输的 USB 数传模块（如 410–470 MHz），
   流动站端配一个对应接收机。
 
-<!-- 实物照片待补：把照片放到 docs/images/ 下，例如 hardware-01.jpg，然后取消下面注释 -->
-<!--
-| | |
-| --- | --- |
-| ![楼顶天线](docs/images/hardware-01.jpg) | ![模块与主机](docs/images/hardware-02.jpg) |
-| ![数传链路](docs/images/hardware-03.jpg) | ![手机上的界面](docs/images/hardware-04.jpg) |
--->
-
-## 运行要求
-
-- Linux / Armbian / Debian / Ubuntu，Python **3.8+**（建议 3.10+）
-- 一个串口 RTK 模块（或 relay 模式下的一台远端 Caster）
-- 上传 / relay 需要出站 TCP；局域网 Caster 需要一个空闲 TCP 端口
-- 除了打开串口设备和 bind 1024 以上端口，不需要任何 root 特权功能
-
-依赖（`requirements.txt`）：`pyserial`、`pyrtcm`、`flask`、`flask-sock`，
-以及 `zeroconf`（可选 —— 只用于 `2rtk.local`，不装也能跑）。
-
-## 固定地址访问
-
-程序启动后通过 mDNS / DNS-SD 把自己广播出去，不用先查 IP：
-
-```
-http://2rtk.local:5757
-```
-
-- Windows 10/11、macOS、iPhone / iPad、装了 avahi 的 Linux 都能解析。
-- NTRIP 客户端也能用：`2rtk.local:<监听端口>/2RTK`（默认 `2rtk.local:2102/2RTK`）。
-- 局域网里已有设备占了 `2rtk`，本机会自动退成 `2rtk-2.local` —— 日志里一行提示，
-  不用配任何东西。DHCP 换了 IP，这个名字照样跟着走。
-- 没装 `zeroconf` 包？其他功能照常，只是没有这个别名。
-
-**打不开怎么办？** 先看状态页上的「固定地址」那一行 —— 名字被占用时它显示的是实际的
-退让名。如果浏览器报 **502 但 IP 能开**，是本机代理或 VPN（Clash、v2rayN、公司 VPN）
-把 `.local` 劫走了，把 `*.local` 加进代理绕过列表。快速判断：`ping 2rtk.local`，
-有回应说明 mDNS 正常，问题在浏览器/代理层。
-
-**安卓手机和平板不解析 `.local`** —— 用状态页上的 IP 访问。
-
-## 服务管理
-
-```bash
-sudo 2rtkserver start | stop | restart | status
-journalctl -u 2rtkserver -f          # 实时日志
-tail -f /opt/2RTKserver/server.log   # 或看文件日志（1 MB × 3 轮转）
-```
-
-### 升级
-
-用 `update.sh`，**不要**用 `install.sh` —— 后者结尾的 `systemctl start`
-对已在运行的服务是空操作，文件换完了旧代码还在跑。
-
-```bash
-sudo rm -rf /tmp/2rtk-update && (sudo git clone --depth 1 https://gitcode.com/rampump/NTRIPserver.git /tmp/2rtk-update || (sudo rm -rf /tmp/2rtk-update && sudo git clone --depth 1 https://github.com/Rampump/2RTKserver.git /tmp/2rtk-update)) && sudo bash /tmp/2rtk-update/update.sh
-```
-
-`update.sh` 会保留 `2RTKserver.db`、`calibration.db`、`.calibration/` 和 `venv`，
-只换程序文件并重装依赖。网页上 **系统维护 → 立即升级** 效果一致：拉取最新代码、
-校验（语法编译、导入冒烟、契约测试）、停服务、等端口真正释放、换文件、装依赖、
-起服务、等网页端口应答。任何一步失败都自动回滚到原版本。
-
-两个下载源并行探测，先通的赢 —— GitCode 镜像（`gitcode.com/rampump/NTRIPserver`）
-和 GitHub（`github.com/Rampump/2RTKserver`）。两边仓库名不一样，这是有意的。
-可在 `/opt/2RTKserver/.upgrade/sources.json` 里按设备覆盖。
-
-### 卸载
+## 卸载
 
 刻意不给浏览器入口 —— 它会停服务、删 systemd 单元、删掉整个安装目录，
 在你只能远程访问的设备上，一个确认对话框不足以拦住误点。
@@ -204,7 +129,7 @@ printf 'y\ny\n' | sudo bash /opt/2RTKserver/uninstall.sh     # 确认卸载 + �
 `2RTKserver.db`（管理员口令 + 连接设置）和 `calibration.db`（你实测的基准站坐标，
 含未合并的 `-wal`）都会在删除任何东西之前先拷到 `/root/`。
 
-### 忘记管理员密码？
+## 忘记管理员密码？
 
 刻意没有网页重置接口。
 
@@ -214,53 +139,10 @@ sudo /opt/2RTKserver/venv/bin/python /opt/2RTKserver/reset_config.py --yes
 sudo systemctl start 2rtkserver
 ```
 
-## 故障排除
-
-**本地 Caster 启动时报 `Address already in use`。** 端口被别的进程占了：
-
-```bash
-ss -lntp | grep :2102
-```
-
-**上传能连上但超时。** 上游 Caster 没开、拒绝了挂载点，或者你把上传指到了**本机**
-（`127.0.0.1` + 本地 Caster 端口）—— 这种自环现在在保存时就被拒绝。
-
-**`Permission denied: /dev/ttyUSB0`。** 把服务用户加进 `dialout`，或检查
-`ls -l /dev/ttyUSB0`。安装脚本是以 root 跑服务的，所以这主要影响手动安装。
-
-**没有卫星 / 面板空的。** 流是通的，但里面没有 1004/1012/1077 这类观测数据 ——
-检查模块是否处于基准站模式、是否真的在发 MSM 电文。
-
-**地图瓦片空白。** 只是网络限制，不影响差分数据。
-
-**「读取模块信息」像是卡住了。** 它在逐档扫描波特率；按钮下方有转圈、当前阶段和已用时间。
-出厂全新的模块第一档就通；在型号下拉框里指定型号可以完全跳过扫描。
-
-更多见 [INSTALL.md § 故障排除](INSTALL.md)。
-
-## 兼容性
-
-已在 Armbian（Debian / Ubuntu 系）的 ARM 机顶盒、玩客云类设备，以及 x86_64 Debian 上测过。
-任何有 Python 3.8+ 和 USB 串口的 Linux 应该都一样。`install.sh` 覆盖的是
-Debian/Ubuntu 的包名；别的发行版请手动装 `python3`、`python3-venv`、`python3-pip`，
-直接跑 `server.py`。
-
-## 设计取舍
-
-- **没有构建步骤，没有容器。** Flask + SQLite + 线程，没有东西要编译。
-- **阻塞 I/O 被隔离。** 每个出口一个线程 + 一个有界队列，数据源循环只负责入队。
-  这就是"一个慢上游拖住串口"和"三个出口各自失败互不影响"的区别。
-- **透传的是字节，不是帧。** 出口拿到的是原始数据块；只有统计解析器会重新分帧，
-  且 CRC 失败后逐字节重新同步 —— 帧中间被切断只损失一帧，不损失整条流。
-- **标定包可以整个删掉。** 删掉 `rtkserver/calibration/`，程序照常运行，
-  它没有织进数据通路里。
-- **驱动自己拥有协议。** 命令集、波特率表、重启语义、应答风格都由各驱动类声明，
-  绝不写进流程层；某个型号的行为一旦渗到别的型号，契约测试就会变红。
-
 ## 文档
 
 - [INSTALL.md](INSTALL.md) —— 安装、配置、天线相位中心、故障排除
-- [INSTALL.en.md](INSTALL.en.md) — English installation guide
+- [INSTALL.en.md](INSTALL.en.md) —— English installation guide
 - [CHANGELOG.md](CHANGELOG.md) —— 版本更新记录
 - [`reset_config.py`](reset_config.py) —— 命令行重置管理员口令与连接设置
 
