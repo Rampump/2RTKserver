@@ -19,7 +19,7 @@
 
   const POLL_INTERVAL = 2000;
   const POLL_MAX = 12 * 60 * 1000;      // 升级最长等 12 分钟
-  const TERMINAL = new Set(['success', 'failed', 'rolled_back']);
+  const TERMINAL = new Set(['success', 'up_to_date', 'failed', 'rolled_back']);
 
   let pollTimer = null;
   let pollStart = 0;
@@ -108,12 +108,29 @@
       const mark = s.ok
         ? (s.has_update ? '<span class="is-warn">↑</span>' : '<span class="is-ok">✓</span>')
         : '<span class="is-bad">✕</span>';
+      // 必须写清"这个源和本地是什么关系"。只给一个 ✓/↑ 时，
+      // 用户会把 ✓ 读成"这个源说没有更新"，而标题又说"发现新版本"，
+      // 看上去就是自相矛盾（2026-11-13 现场：镜像与本地同为 a8d6469，
+      // GitHub 已是 1916a22，用户以为版本明明一样还在提示升级）。
+      const rel = s.ok
+        ? '<span class="dim">' + t(s.has_update ? 'maint.src.newer' : 'maint.src.same') + '</span>'
+        : '';
       const detail = s.ok
         ? '<span class="mono">' + (s.commit || '') + '</span>'
         : '<span class="dim">' + (s.error || '') + '</span>';
-      row.innerHTML = mark + '<span>' + s.label + '</span>' + detail;
+      row.innerHTML = mark + '<span>' + s.label + '</span>' + rel + detail;
       box.appendChild(row);
     });
+    // 两源不一致时给一句人话，否则用户不知道该点哪个（升级器会自动挑有更新的那个）
+    const okSources = (data.sources || []).filter((s) => s.ok);
+    const mixed = okSources.some((s) => s.has_update)
+      && okSources.some((s) => !s.has_update);
+    if (mixed) {
+      const tip = document.createElement('div');
+      tip.className = 'row';
+      tip.innerHTML = '<span class="dim">' + t('maint.src.mixed') + '</span>';
+      box.appendChild(tip);
+    }
   }
 
   // ---------- 遮罩 ----------
@@ -209,9 +226,12 @@
 
   function finish(st) {
     stopPoll();
-    const ok = st.stage === 'success';
+    // `up_to_date` 也算正常结束，但它一个文件都没换，标题不能写「升级完成」
+    const ok = st.stage === 'success' || st.stage === 'up_to_date';
     const rolled = st.stage === 'rolled_back';
-    const title = ok ? t('maint.ok') : (rolled ? t('maint.rolled') : t('maint.failed'));
+    const title = st.already_latest
+      ? t('maint.up_to_date')
+      : (ok ? t('maint.ok') : (rolled ? t('maint.rolled') : t('maint.failed')));
     const msg = st.message || '';
     const bar = $('maint-bar');
     if (bar) bar.style.width = '100%';

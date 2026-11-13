@@ -57,13 +57,29 @@ def local_git_commit():
         return _git_commit['value']
     _git_commit['done'] = True
     try:
-        p = subprocess.run(['git', '-C', paths.BASE_DIR, 'rev-parse', '--short', 'HEAD'],
+        # 12 位与 `.version` / ls-remote 对齐：7 位和 12 位直接比永远不相等
+        p = subprocess.run(['git', '-C', paths.BASE_DIR, 'rev-parse', '--short=12', 'HEAD'],
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
         if p.returncode == 0:
             _git_commit['value'] = p.stdout.decode('utf-8', 'replace').strip()
     except (OSError, subprocess.SubprocessError):
         pass
     return _git_commit['value']
+
+
+def same_commit(a, b):
+    """两个提交串是否指向同一个提交。
+
+    **必须按前缀比**：`git rev-parse --short HEAD` 默认给 7 位，`git ls-remote`
+    这里取 12 位，`.version` 里记录的也是 12 位。直接 `==` 会让
+    「本地 1916a22 / 远端 1916a2262fde」永远不相等 —— 界面上版本看着一样，
+    却一直提示"有新版本"，升完还是同一个提交（2026-11-13 现场）。
+    """
+    a = (a or '').strip().lower()
+    b = (b or '').strip().lower()
+    if not a or not b:
+        return False
+    return a[:min(len(a), len(b), 12)] == b[:min(len(a), len(b), 12)]
 
 
 def current_version():
@@ -228,7 +244,8 @@ def check_updates():
             'commit': commit,
             'error': err,
             # 没有本地版本信息时不能断定"有更新"，宁可让用户自己决定
-            'has_update': bool(ok and cur_commit and commit and commit != cur_commit),
+            'has_update': bool(ok and cur_commit and commit
+                               and not same_commit(commit, cur_commit)),
         }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(items))) as ex:

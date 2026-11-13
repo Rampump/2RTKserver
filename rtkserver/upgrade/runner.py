@@ -50,6 +50,8 @@ STAGE_TEXT = {
     'starting': '正在启动服务',
     'health': '正在等待服务就绪',
     'success': '升级完成',
+    # 源上的提交与本地相同：没换任何文件，所以不能说"升级完成"
+    'up_to_date': '无需升级',
     'failed': '升级失败',
     'rolling_back': '正在回退到升级前的版本',
     'rolled_back': '已回退到升级前的版本',
@@ -83,6 +85,56 @@ PROBE_TIMEOUT = 15       # 单个升级源探活超时（并发探测，取最�
 CLONE_TIMEOUT = 300      # git clone 超时（秒）
 PORT_FREE_TIMEOUT = 30   # 停服后等端口释放的超时
 HEALTH_TIMEOUT = 90      # 启动后等 Web 端口可访问的超时
+
+# 源与本地提交的关系
+REL_NEWER = 'newer'      # 与本地不同 —— 这才是真正"有更新"
+REL_SAME = 'same'        # 与本地相同 —— 拉下来等于什么都没换
+
+
+def same_commit(a, b):
+    """两个提交串是否指向同一个提交（按前缀比，最多 12 位）。
+
+    与 `service.same_commit()` 是同一份逻辑，**故意重复**：本文件会被复制到
+    `.upgrade/` 独立运行，不能 import 项目内模块（否则升级替换 `rtkserver/`
+    之后 import 会拿到新代码甚至 ModuleNotFoundError）。改这里时记得同步另一处。
+
+    `git rev-parse --short` 默认 7 位、`git ls-remote` 我们取 12 位，
+    直接 `==` 会让"本地 1916a22 / 远端 1916a2262fde"永远不相等。
+    """
+    a = (a or '').strip().lower()
+    b = (b or '').strip().lower()
+    if not a or not b:
+        return False
+    n = min(len(a), len(b), 12)
+    return a[:n] == b[:n]
+
+
+def rank_sources(probed, local_commit, order):
+    """把探测结果排成尝试顺序：**先"与本地不同"的，再"与本地相同"的**。
+
+    2026-11-13 真机事故（192.168.1.71）：GitCode 镜像停在 a8d6469，GitHub 已有
+    1916a22，本地也是 a8d6469。源顺序是 gitcode 优先，于是`fetch()` 克隆了第一个
+    可达源 —— **停服务、换文件、重启，装回来的还是 a8d6469**，却报"升级成功"。
+    下次检查依旧提示有更新，用户看到的就是"明明版本一样还让我升级"。
+
+    所以选源不能只看"能不能连上"，必须看"这个源上的提交和本地是不是同一个"。
+    返回 `[(url, commit, relation), ...]`，同组内保持配置顺序（sort 是稳定的）。
+    探测失败或没有提交信息的源直接剔除。
+    """
+    ranked = []
+    for url in order or []:
+        ok, commit, _err = (probed or {}).get(url, (False, '', '未探测'))
+        if not ok or not commit:
+            continue
+        if not local_commit:
+            # 本机没记录安装提交：无从判断，按配置顺序试（保持老行为）
+            ranked.append((url, commit, REL_NEWER))
+        elif same_commit(commit, local_commit):
+            ranked.append((url, commit, REL_SAME))
+        else:
+            ranked.append((url, commit, REL_NEWER))
+    ranked.sort(key=lambda item: 0 if item[2] == REL_NEWER else 1)
+    return ranked
 
 
 class Runner:
@@ -293,12 +345,27 @@ class Runner:
         os.makedirs(self.staging, exist_ok=True)
 
         probed = self.probe_sources(sources, branch)
+        local_commit = self.plan.get('from_commit', '') or ''
+        ranked = rank_sources(probed, local_commit, sources)
+        if not ranked:
+            errors = [f'{u} → {probed.get(u, (False, "", "未探测"))[2]}' for u in sources]
+            self.state['fetch_errors'] = errors
+            self.log('所有升级源均不可用: ' + '; '.join(errors), 'ERROR')
+            return 'fail', None, None, ''
+
+        fresh = [item for item in ranked if item[2] != REL_SAME]
+        if not fresh:
+            # 每个可达源都和本地同一个提交：拉下来只是把同样的文件再抄一遍，
+            # 却要停服、换文件、重启。老代码在这里报"升级成功"，害得用户
+            # 下次检查还以为有更新（横幅永远消不掉）。直接收工，不动任何文件。
+            url, commit, _rel = ranked[0]
+            self.state['source'] = url
+            self.state['new_commit'] = commit
+            self.log(f'所有可达源的提交都与本地相同（{commit}），无需升级')
+            return 'same', url, commit, ''
+
         errors = []
-        for url in sources:
-            ok, commit, err = probed.get(url, (False, '', '未探测'))
-            if not ok:
-                errors.append(f'{url} → {err}')
-                continue
+        for url, commit, _rel in fresh:
             self.log(f"使用源: {url} @ {commit}")
             rc, _ = self.run(
                 ['git', '-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=30',
@@ -317,10 +384,10 @@ class Runner:
             self.state['new_commit'] = commit
             self.state['new_date'] = date
             self.log(f"获取成功: {url} @ {commit} ({date})")
-            return True, url, commit, date
+            return 'ok', url, commit, date
         self.state['fetch_errors'] = errors
         self.log('所有升级源均不可用: ' + '; '.join(errors), 'ERROR')
-        return False, None, None, None
+        return 'fail', None, None, ''
 
     # ---------- 校验 ----------
     def verify(self):
@@ -688,12 +755,23 @@ class Runner:
         # 给 Web 一点时间把「已启动」的响应发回浏览器，再动手停服务
         time.sleep(int(self.plan.get('delay', 2)))
 
-        ok, url, commit, date = self.fetch()
-        if not ok:
+        status, url, commit, date = self.fetch()
+        if status == 'fail':
             self.set_state('failed', 100, '所有升级源均不可用，未做任何改动',
                            error='; '.join(self.state.get('fetch_errors', [])),
                            finished_at=time.strftime('%Y-%m-%d %H:%M:%S'))
             return 1
+
+        if status == 'same':
+            # 源上的提交和本地是同一个：不停服务、不换文件，只如实告诉用户。
+            # 这里必须走 success 且带 `already_latest`，前端才能把"升级完成"
+            # 和"本来就不用升级"分开说，而不是又弹一个"升级成功"让人以为变了。
+            self.set_state('up_to_date', 100,
+                           f'已是最新版本（{commit}），无需升级；服务未改动',
+                           finished_at=time.strftime('%Y-%m-%d %H:%M:%S'),
+                           new_version=commit, already_latest=True)
+            self.log("=== 已是最新，未做任何改动 ===")
+            return 0
 
         ok, err = self.verify()
         if not ok:

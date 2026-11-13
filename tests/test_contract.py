@@ -552,6 +552,105 @@ class TestUpgrade(unittest.TestCase):
         self.assertIn('stage', st)
         self.assertIn('progress', st)
 
+    # ---------- 选源：必须挑"真的比本地新"的源 ----------
+    def test_rank_sources_prefers_the_one_that_differs(self):
+        """镜像与本地同提交、官方源更新时，必须先试官方源。
+
+        2026-11-13 真机（192.168.1.71）：GitCode 镜像停在 a8d6469（=本地），
+        GitHub 已有 1916a22。源顺序是镜像优先，老代码克隆第一个可达源就收工，
+        于是停服务、换文件、重启，装回来的还是 a8d6469，却报「升级成功」，
+        下次检查照样提示有更新 —— 用户看到的就是「版本一样还让我升级」。
+        """
+        from rtkserver.upgrade import runner
+
+        mirror = 'https://gitcode.example/x.git'
+        official = 'https://github.example/x.git'
+        probed = {
+            mirror: (True, 'a8d6469bdcac', ''),
+            official: (True, '1916a2262fde', ''),
+        }
+        ranked = runner.rank_sources(probed, 'a8d6469bdcac', [mirror, official])
+        self.assertEqual([(u, rel) for u, _c, rel in ranked],
+                         [(official, runner.REL_NEWER), (mirror, runner.REL_SAME)])
+
+    def test_rank_sources_all_same_means_nothing_to_do(self):
+        """所有可达源都与本地同提交 → 全是 REL_SAME，调用方据此直接收工。"""
+        from rtkserver.upgrade import runner
+
+        a, b = 'https://a/x.git', 'https://b/x.git'
+        probed = {a: (True, 'a8d6469bdcac', ''), b: (True, 'a8d6469bdcac', '')}
+        ranked = runner.rank_sources(probed, 'a8d6469bdcac', [a, b])
+        self.assertEqual([rel for _u, _c, rel in ranked],
+                         [runner.REL_SAME, runner.REL_SAME])
+
+    def test_rank_sources_drops_unreachable_and_keeps_order(self):
+        """不可达源直接剔除；同组内保持配置顺序，不许乱序。"""
+        from rtkserver.upgrade import runner
+
+        a, b, c = 'https://a/x.git', 'https://b/x.git', 'https://c/x.git'
+        probed = {
+            a: (True, '111111111111', ''),
+            b: (False, '', '连接超时'),
+            c: (True, '222222222222', ''),
+        }
+        ranked = runner.rank_sources(probed, '999999999999', [a, b, c])
+        self.assertEqual([u for u, _c, _r in ranked], [a, c])
+        self.assertTrue(all(rel == runner.REL_NEWER for _u, _c, rel in ranked))
+
+    def test_rank_sources_without_local_commit_falls_back_to_order(self):
+        """本机没记录安装提交时无从比较，按配置顺序全试（保持老行为）。"""
+        from rtkserver.upgrade import runner
+
+        a, b = 'https://a/x.git', 'https://b/x.git'
+        probed = {a: (True, '111111111111', ''), b: (True, '222222222222', '')}
+        ranked = runner.rank_sources(probed, '', [a, b])
+        self.assertEqual([u for u, _c, _r in ranked], [a, b])
+
+    def test_commit_prefix_comparison(self):
+        """7 位与 12 位必须判成同一个提交。
+
+        `git rev-parse --short` 给 7 位，`ls-remote`/`.version` 是 12 位。
+        老代码用 `!=` 直接比，结果本地 `1916a22` 与远端 `1916a2262fde` 永远不等
+        —— 界面上版本一模一样，却一直显示"发现新版本"，升多少次都消不掉。
+        这也是 2026-11-13 用户报的那句「明明一样还提示有更新」的第二个成因。
+        """
+        from rtkserver.upgrade import runner, service
+
+        for mod in (service, runner):
+            self.assertTrue(mod.same_commit('1916a22', '1916a2262fde'))
+            self.assertTrue(mod.same_commit('1916A2262FDE', '1916a22'))
+            self.assertFalse(mod.same_commit('a8d6469bdcac', '1916a2262fde'))
+            self.assertFalse(mod.same_commit('', '1916a22'))
+
+    def test_rank_sources_treats_short_commit_as_same(self):
+        """本地记 7 位、源给 12 位时，不能误判成"有更新"。"""
+        from rtkserver.upgrade import runner
+
+        a = 'https://a/x.git'
+        probed = {a: (True, '1916a2262fde', '')}
+        ranked = runner.rank_sources(probed, '1916a22', [a])
+        self.assertEqual([rel for _u, _c, rel in ranked], [runner.REL_SAME])
+
+    def test_upgrade_reports_up_to_date_without_stopping_service(self):
+        """同提交时必须走 `up_to_date` 收尾，且**在停服之前**返回。
+
+        只断言行为在源码里的位置：`status == 'same'` 的分支必须出现在
+        `systemctl stop` 之前，否则一旦有人把它挪到后面，就会出现
+        「什么都没升级，却把服务停了一次」。
+        """
+        from rtkserver.upgrade import service as svc
+        with open(svc.RUNNER_SRC, 'r', encoding='utf-8') as f:
+            src = f.read()
+        # 只看 do_upgrade 的函数体：`'systemctl', 'stop'` 在 stop_service()
+        # 里也出现过，全文找下标会拿到错的位置（那是定义顺序，不是执行顺序）
+        body = src.split('def do_upgrade', 1)[1].split('def _version_label', 1)[0]
+        self.assertIn("'up_to_date'", body)
+        self.assertIn("status == 'same'", body)
+        same_at = body.index("status == 'same'")
+        stop_at = body.index("'systemctl', 'stop'")
+        self.assertLess(same_at, stop_at,
+                        '「已是最新」的返回必须早于停服务')
+
 
 
 class TestRadioLogThrottle(unittest.TestCase):
