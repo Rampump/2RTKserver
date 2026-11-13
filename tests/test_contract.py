@@ -3461,12 +3461,79 @@ class TestCalibrationStage7(unittest.TestCase):
 
         self.assertGreaterEqual(len(calib.DETECT_BAUD_CANDIDATES), 4)
         worker = inspect.getsource(calib.CalibrationService._worker)
-        self.assertIn("allow_baud_scan=not task.get('baud_explicit')", worker)
+        self.assertIn("allow_scan = not task.get('baud_explicit')", worker)
+        self.assertIn('allow_baud_scan=allow_scan', worker)
+        # 诊断任务在"自动探测 + 未填波特率 + 未 force"时**不得**枚举：
+        # 8 档 × 6 驱动 ≈ 45 秒，而结果必然是"模块无应答"。
+        self.assertIn("== 'diagnose'", worker)
+        self.assertIn("not task.get('force')", worker)
         scan = inspect.getsource(calib.CalibrationService._scan_bauds)
         self.assertIn('channel.baud = int(original)', scan,
                       '枚举失败必须把波特率恢复原值再交回通道')
         self.assertIn('lease.baud = int(baud)', scan,
                       '换上正确波特率后要同步到租约，否则重启模块会用错档位')
+
+    def test_preflight_checks_outputs_before_switching_mode(self):
+        """PREFLIGHT 必须在 ROVER_SETUP 之前：先确认模块在说话，再谈切模式。"""
+        import inspect
+
+        from rtkserver.calibration import writer as w
+
+        collect = inspect.getsource(w.CoordinateWriter._step_cors_collect)
+        self.assertIn('self._step_preflight(plan)', collect)
+        self.assertLess(
+            collect.index('self._step_preflight(plan)'),
+            collect.index('self._step_cors_rover_setup(plan)'),
+            '预检必须在切流动站之前，否则又要白等一整轮 GGA 超时')
+
+        pre = inspect.getsource(w.CoordinateWriter._step_preflight)
+        self.assertIn('self._is_passive_driver()', pre)
+        self.assertLess(
+            pre.index('self._is_passive_driver()'),
+            pre.index('self._factory_reset_to_rover('),
+            '未知模块必须先被拦下：不恢复出厂，直接提示并结束')
+
+    def test_factory_reset_reopens_baud_and_opens_nmea(self):
+        """恢复出厂后波特率可能变：必须重新枚举，并把 NMEA 打开。"""
+        import inspect
+
+        from rtkserver.calibration import writer as w
+
+        reset = inspect.getsource(w.CoordinateWriter._factory_reset_to_rover)
+        self.assertIn('self.driver.factory_reset()', reset)
+        self.assertIn('self._reopen_after_reset()', reset)
+        self.assertIn('self._open_nmea_output()', reset)
+        self.assertIn("mode != 'rover'", reset,
+                      '恢复出厂后必须回读确认真的回到 rover，不能假设')
+
+        reopen = inspect.getsource(w.CoordinateWriter._reopen_after_reset)
+        self.assertIn('channel.baud = int(baud)', reopen)
+        self.assertIn('self.driver.get_mode()', reopen,
+                      '换档后要用命令确认应答，不能只看串口打开成功')
+
+    def test_known_modules_declare_factory_reset_cap(self):
+        """实现了 factory_reset 的型号必须声明能力位，否则流程误判"不支持"。"""
+        from rtkserver.calibration.drivers import (quectel_lc29hbs, quectel_lg290p,
+                                                   ublox_zed_f9p, unicore_n4)
+
+        for mod in (quectel_lg290p, quectel_lc29hbs, unicore_n4, ublox_zed_f9p):
+            self.assertTrue(mod.CAPS.get('factory_reset'),
+                            f'{mod.__name__} 有 factory_reset 实现却没声明能力位')
+
+    def test_unknown_port_cannot_click_read_module_info(self):
+        """非 GNSS 端口不能直接点「读取模块信息」：一次白等约 45 秒。"""
+        js_path = os.path.join(REPO_ROOT, 'static', 'calibration.js')
+        with io.open(js_path, encoding='utf-8') as fp:
+            js = fp.read()
+        self.assertIn('function portFamily(', js)
+        self.assertIn('function refreshDetectGate(', js)
+        self.assertIn("fam !== 'gnss'", js)
+        self.assertIn('force: force', js, '强制读取必须把 force 交给后端')
+
+        api_path = os.path.join(REPO_ROOT, 'rtkserver', 'web', 'api_calibration.py')
+        with io.open(api_path, encoding='utf-8') as fp:
+            api = fp.read()
+        self.assertIn("force=bool(body.get('force'))", api)
 
     def test_detect_failure_explains_the_real_cause(self):
         """识别失败的三种病因要分别给动作（§14 #2 / #25）。"""
@@ -4725,6 +4792,46 @@ class TestLc29hbsRealDevice(unittest.TestCase):
                                         'PQTMCFGSVIN,R'])
         self.assertEqual(data['ignored']['distance'], 30.0)
 
+    # ---------- ⑥ 收敛进度输出：漏一步会把本型号唯一能干的活判死 ----------
+    def test_enable_survey_status_sends_msgrate_with_msg_ver(self):
+        """打开进度输出必须下发 `PQTMCFGMSGRATE,W,PQTMSVINSTATUS,1,1`。
+
+        2026-11-13 真机（COM3，出厂态）：连读 8 秒一条 `$PQTMSVINSTATUS` 都没有，
+        `channel.cache['svin']` 全空 —— 出厂默认是**关的**，不是"没有这条语句"。
+        驱动早先没实现 `enable_survey_status()`，落到基类那句
+        "本型号没有进度语句"，于是流程层 `_step_svin_cfg()` 在**写完 survey 参数
+        之后**拿到 `ok=False`、`_caps('svin_has_status', True)` 又为真，
+        直接 `WriteFailed('SVIN_CFG')`：这个单基站模块唯一能做的 survey-in
+        基准站，被自己判死在配置已进模块的那一刻。
+        """
+        driver, channel = self._driver([('ok', '$PQTMCFGMSGRATE,OK*29')])
+        ok, message, data = driver.enable_survey_status(True, 1)
+        self.assertTrue(ok, message)
+        # 第 4 段是 MsgVer，漏了会写到一条永不输出的记录上且**不报错**
+        self.assertEqual(channel.sent, ['PQTMCFGMSGRATE,W,PQTMSVINSTATUS,1,1'])
+
+    def test_enable_survey_status_off_uses_zero_rate(self):
+        """关闭用速率 0（§2.2.5 的"关"就是 0，不是单独一条命令）。"""
+        driver, channel = self._driver([('ok', '$PQTMCFGMSGRATE,OK*29')])
+        ok, message, _data = driver.enable_survey_status(False)
+        self.assertTrue(ok, message)
+        self.assertEqual(channel.sent, ['PQTMCFGMSGRATE,W,PQTMSVINSTATUS,0,1'])
+
+    def test_enable_survey_status_is_not_base_unsupported(self):
+        """本型号不许再落到基类"没有进度语句"的假结论上。"""
+        from rtkserver.calibration.drivers.quectel_lc29hbs import LC29HBSDriver
+
+        self.assertIn('enable_survey_status', LC29HBSDriver.__dict__,
+                      'LC29H(BS) 有 PQTMSVINSTATUS，必须自己实现开启方法')
+        self.assertIs(LC29HBSDriver.CAPS.get('svin_has_status'), True,
+                      'CAPS 要显式声明，别靠流程层的默认值兜')
+
+        driver, channel = self._driver([('ok', '$PQTMCFGMSGRATE,OK*29')])
+        ok, message, data = driver.enable_survey_status(True, 1)
+        self.assertTrue(ok, message)
+        self.assertNotEqual((data or {}).get('error'), 'unsupported')
+        self.assertTrue(channel.sent, '不许"返回成功但一条命令都没发"')
+
 
 class TestCrossModelIsolation(unittest.TestCase):
     """一个型号的驱动改动，不许把另一个型号带歪。
@@ -4734,6 +4841,37 @@ class TestCrossModelIsolation(unittest.TestCase):
     凡是"为了某个型号方便"而写进共用层的假设（默认档、字段形状、能力位、
     应答收取方式、是否重启），都会在这里报红。
     """
+
+    # ---------- ⓪ 能力位说"有"，驱动就必须实现 ----------
+    def test_svin_status_capability_has_real_implementation(self):
+        """声称有收敛进度语句的型号，必须自己实现 `enable_survey_status()`。
+
+        这条是 2026-11-13 真机事故的机器可读版本：LC29H(BS) 的 CAPS 没声明
+        `svin_has_status`，流程层按默认 `True` 要求"打开进度输出"，而驱动没写
+        这个方法 → 基类回"本型号没有进度语句" → `_step_svin_cfg()` 在**已经把
+        survey 参数写进模块之后**抛 `WriteFailed('SVIN_CFG')`。
+        结果：这块只能做基准站的单模模块，唯一的功能被自己判死。
+
+        判据用 `__dict__` 而不是 `hasattr`：继承来的基类实现恰恰是"假装没有"
+        的那一份，`hasattr` 永远为真，什么也拦不住。
+        """
+        from rtkserver.calibration.drivers import driver_manager as dm
+
+        offenders = []
+        for key in dm.supported_driver_ids():
+            cls = dm.get_driver_by_id(key)
+            cls = type(cls)
+            caps = getattr(cls, 'CAPS', {}) or {}
+            if not caps.get('svin'):
+                continue
+            if not caps.get('svin_has_status', True):
+                continue          # 手册里真没有进度语句（Unicore N4 全系）
+            if 'enable_survey_status' not in cls.__dict__:
+                offenders.append(f'{key}({cls.__name__})')
+        self.assertEqual(offenders, [],
+                         '这些型号声称有收敛进度语句却没实现开启方法：'
+                         + '、'.join(offenders))
+
 
     # ---------- ① 波特率：每个型号一份，不许互相抄 ----------
     def test_default_baud_is_per_model(self):
@@ -6711,6 +6849,221 @@ class TestNoFeatureProbingOnDriver(unittest.TestCase):
                 f'{name} 声明了 CAPS["persist_check"] 却没自己实现 '
                 f'verify_persisted()：基类默认实现只回 unsupported，'
                 f'这条能力位就成了空头承诺')
+
+
+    def test_offline_antenna_absence_is_not_mistaken_for_silence(self):
+        """无天线时必须能区分"没输出"和"有输出但没定位"。
+
+        2026-11-13 真机（ZED-F9P 未接天线）：每秒一条
+        `$GNGGA,,,,,,0,00,99.99,...`，字段全空、星数 0。
+        老判据 `nmea = bool(kinds)` 只看"有没有有效定位"，于是判成
+        "模块没有输出 NMEA"，流程接着去 `ensure_nmea_output()` 白写一次模块
+        配置（只读模式也写），最后报"打开 GGA 后仍然没有 NMEA 定位语句"。
+        结论对了、原因全错，用户会去查天线接口而不是天线本身。
+        """
+        import inspect as _inspect
+
+        from rtkserver.calibration import writer
+        source = _inspect.getsource(writer.CoordinateWriter._classify_output)
+        for field in ("'sentences'", "'sats'", "'quality'"):
+            self.assertIn(field, source,
+                          f'_classify_output 必须返回 {field}，'
+                          f'否则上层只能拿 nmea 一个布尔去猜"没星"还是"没输出"')
+        self.assertIn('lines > 0', source,
+                      'sentences 要靠 NMEA 行数判定，不能复用"有效定位"的判据')
+
+    def test_preflight_does_not_write_when_only_fix_is_missing(self):
+        """有 NMEA 语句但没定位时，PREFLIGHT 不许去改动模块输出。
+
+        这是"只读"契约的一部分：模块本来就在正常输出 GGA，开输出既没用，
+        还会在仅测量模式下留下改过的痕迹。
+        """
+        import inspect as _inspect
+
+        from rtkserver.calibration import writer
+        source = _inspect.getsource(writer.CoordinateWriter._step_preflight)
+        # rover 分支必须先判 sentences、再决定要不要 _open_nmea_output()
+        rover = source.split("if mode == 'rover':", 1)
+        self.assertEqual(len(rover), 2, 'PREFLIGHT 里找不到 rover 分支')
+        block = rover[1].split("# ---- 非流动站 ----", 1)[0]
+        self.assertIn("if snap['sentences']:", block,
+                      'rover 分支必须先判 sentences（有语句=没星），'
+                      '不能直接落到 _open_nmea_output()')
+        self.assertLess(block.index("if snap['sentences']:"),
+                        block.index('self._open_nmea_output()'),
+                        '顺序反了：先开输出再判"没星"，等于必然白写一次模块')
+
+    def test_factory_reset_snapshot_is_persisted_before_reset(self):
+        """仅测量恢复出厂之前必须落盘快照。
+
+        只测不写原先根本不采备份，而 `backup.json` 只留最近一次 ——
+        里面可能是**上一块模块**的备份。收尾文案却写着"可用还原恢复"，
+        用户真去点还原就会把错的坐标写进这一块。
+        """
+        import inspect as _inspect
+
+        from rtkserver.calibration import service as service_mod
+        from rtkserver.calibration import writer
+        source = _inspect.getsource(writer.CoordinateWriter._factory_reset_to_rover)
+        self.assertIn('_persist_preflight_snapshot', source,
+                      '恢复出厂前必须先把快照落盘，否则"可还原"是空头承诺')
+        self.assertLess(source.index('_persist_preflight_snapshot'),
+                        source.index('self.driver.factory_reset()'),
+                        '落盘必须在 factory_reset() 之前 —— 之后模块已经被清空了')
+
+        # 只测不写也要采快照（读操作，不写模块）
+        service_src = _inspect.getsource(service_mod.CalibrationService._run_write)
+        branch = service_src.split('if readonly:', 1)[1].split('elif is_restore:', 1)[0]
+        self.assertIn('backup_mod.capture', branch,
+                      '只测不写分支必须采集快照（纯读），不能只返回 skipped')
+
+    def test_f9p_backup_rates_exclude_names_it_cannot_read(self):
+        """F9P 的备份清单不许列它读不到的名字。
+
+        `RATE_TARGETS` 是 Quectel 口径（107X 通配名、1006、1033）。
+        套到 F9P 上每做一次备份就冒 7 条"速率没读到"的假警告，
+        真正的失败（比如 GGA 真读不到）反而被淹没。
+        """
+        from rtkserver.calibration.drivers import driver_manager
+
+        driver_manager.load_builtin_drivers()
+        f9p = driver_manager._REGISTRY['zed_f9p']
+        rates = getattr(f9p, 'BACKUP_RATES', None)
+        self.assertTrue(rates, 'F9P 必须声明 BACKUP_RATES，否则会用 Quectel 的清单')
+        for bad in ('RTCM3-1006', 'RTCM3-1033', 'RTCM3-107X',
+                    'RTCM3-108X', 'RTCM3-111X', 'RTCM3-1114'):
+            self.assertNotIn(bad, rates,
+                             f'{bad} 在 F9P 上读不到（只能输入/无键/通配写法），'
+                             f'列进备份清单只会产生假警告')
+        for good in ('GGA', 'RTCM3-1005', 'RTCM3-1230', 'RTCM3-1074'):
+            self.assertIn(good, rates, f'{good} 是 F9P 真实存在且必须备份的')
+
+        # capture() 必须优先用驱动声明的清单
+        import inspect as _inspect
+        from rtkserver.calibration import backup as backup_mod
+        source = _inspect.getsource(backup_mod.capture)
+        self.assertIn("getattr(driver, 'BACKUP_RATES', None)", source,
+                      'backup.capture 没有用驱动声明的 BACKUP_RATES')
+
+    def test_f9p_mode_message_never_says_disabled(self):
+        """切到流动站时不许给用户看 TMODE 的枚举名 `disabled`。
+
+        真机现象：`set_mode('rover')` 返回"已切换到 disabled"，
+        用户第一反应是"模块被我关掉了"。枚举名只该出现在 data['mode'] 里。
+        """
+        from rtkserver.calibration.drivers import ublox_zed_f9p as f9p
+
+        self.assertIn(0, f9p.MODE_TEXT, 'MODE_TEXT 必须覆盖 MODE_DISABLED')
+        self.assertNotEqual(f9p.MODE_TEXT[0].lower(), 'disabled',
+                            '给人看的模式名不能是 disabled')
+        self.assertIn('流动站', f9p.MODE_TEXT[0])
+
+        import inspect as _inspect
+        source = _inspect.getsource(f9p.ZEDF9PDriver.set_mode)
+        self.assertIn('MODE_TEXT.get(target', source,
+                      'set_mode 的提示语要用 MODE_TEXT，不能用 MODE_LABEL')
+
+
+class TestPreflightOutputContract(unittest.TestCase):
+    """PREFLIGHT 的三条硬契约：别把"没星"当"没输出"、别白清 NVM、别谎报原因。"""
+
+    def test_silence_verdict_uses_sentences_not_fix(self):
+        """入口判"模块有没有在说话"必须用 `sentences`，不能用 `nmea`。
+
+        2026-11-13 真机（COM9，未知模块，未接天线）：
+        `_classify_output` 明明返回 `sentences=True / lines=94`，
+        但入口判据写的是 `not snap['nmea'] and not snap['rtcm']`，
+        于是报"6 秒内没有任何输出"并让用户去查 TX/RX 和波特率 ——
+        串口已经读到 94 行 NMEA 了。这条错误提示会把用户带偏到硬件上。
+        """
+        import inspect as _inspect
+
+        from rtkserver.calibration import writer
+        source = _inspect.getsource(writer.CoordinateWriter._step_preflight)
+
+        self.assertIn("if not snap['sentences'] and not snap['rtcm']:", source,
+                      '入口判"无输出"必须看 sentences（有语句就算在说话），'
+                      '不能看 nmea（有效定位）—— 没天线时后者恒为 False')
+        self.assertNotIn("if not snap['nmea'] and not snap['rtcm']:", source,
+                         '又退回用 nmea 判沉默了：无天线模块会被判成"没输出"')
+
+    def test_unknown_module_without_fix_is_not_rejected(self):
+        """未知模块"在说话但没星"要放行，不能扣上"只播 RTCM"的帽子。
+
+        老代码只看 `snap['nmea']`，无天线的未知模块会落到最后那条
+        "当前输出的是 RTCM 数据流而不是 NMEA" —— 事实完全相反。
+        用户按提示去换模块/改模式，而真正要做的只是把天线接到窗外。
+        """
+        import inspect as _inspect
+
+        from rtkserver.calibration import writer
+        source = _inspect.getsource(writer.CoordinateWriter._step_preflight)
+        passive = source.split('if self._is_passive_driver():', 1)
+        self.assertEqual(len(passive), 2, 'PREFLIGHT 里找不到未知模块分支')
+        block = passive[1].split('# ---- 已知模块：读模式 ----', 1)[0]
+
+        self.assertIn("if snap['sentences']:", block,
+                      '未知模块分支必须先判 sentences 再判"只播 RTCM"')
+        self.assertLess(block.index("if snap['nmea']:"),
+                        block.index("if snap['sentences']:"),
+                        '先判有定位、再判有语句 —— 顺序反了会把"没星"当"没输出"')
+        # "只播 RTCM"这条结论只允许出现在"连语句都没有"的兜底分支里
+        self.assertLess(block.index("if snap['sentences']:"),
+                        block.index('RTCM 数据流而不是 NMEA'),
+                        '报"只播 RTCM"必须在确认没有 NMEA 语句之后')
+
+    def test_single_base_module_never_gets_factory_reset(self):
+        """单基站固件做不了流动站 —— 不许用"恢复出厂"去试。
+
+        LC29H(BS) 没有 `PQTMCFGRCVRMODE`，出厂就是基准站语义，
+        而且它连软重启都没有：`PQTMRESTOREPAR` 要断电才生效
+        （2026-11-13 真机 COM10 实测：下发后模式/坐标/RTCM 输出全都没变）。
+        老流程会先落盘快照、再清 NVM、再等 NMEA，最后报"恢复出厂后收不到语句"，
+        用户损失的是坐标，换来的是一句查错方向的提示。
+        """
+        import inspect as _inspect
+
+        from rtkserver.calibration import writer
+        from rtkserver.calibration.drivers import driver_manager
+
+        driver_manager.load_builtin_drivers()
+        lc29 = driver_manager._REGISTRY['lc29hbs']
+        self.assertEqual(getattr(lc29, 'FACTORY_RESET_ROLE', None), 'base',
+                         'LC29H(BS) 必须声明恢复出厂后仍是 base')
+
+        source = _inspect.getsource(writer.CoordinateWriter._step_preflight)
+        self.assertIn('FACTORY_RESET_ROLE', source,
+                      'PREFLIGHT 没有读 FACTORY_RESET_ROLE，'
+                      '单基站模块会被一路清到 NVM')
+        self.assertLess(source.index('FACTORY_RESET_ROLE'),
+                        source.index('self._factory_reset_to_rover(mode)'),
+                        '拦截必须在调用恢复出厂之前')
+
+        # 真正下发命令的方法自己也要再拦一次：将来被别的分支复用也不该清 NVM
+        reset_src = _inspect.getsource(writer.CoordinateWriter._factory_reset_to_rover)
+        self.assertIn('FACTORY_RESET_ROLE', reset_src,
+                      '_factory_reset_to_rover 内部缺少最后一道闸')
+        self.assertLess(reset_src.index('FACTORY_RESET_ROLE'),
+                        reset_src.index('self.driver.factory_reset()'),
+                        '守卫在 factory_reset() 之后等于没守')
+
+    def test_factory_reset_without_reboot_says_power_cycle(self):
+        """恢复出厂后没有软重启的型号，提示必须说"断电"，不能说"重启后生效"。
+
+        实测 LC29HBS：`reboot()` 返回不支持（RESTART_REQUIRED=False），
+        `PQTMRESTOREPAR` 的"重启后生效"永远等不到 —— 配置一个字节都没变，
+        但界面会显示"已下发恢复出厂"，用户对着没变的模块查半天。
+        """
+        from rtkserver.calibration.drivers import quectel_lc29hbs as lc29
+
+        self.assertFalse(getattr(lc29.LC29HBSDriver, 'RESTART_REQUIRED', True),
+                         'LC29H(BS) 不该声明需要软重启')
+        import inspect as _inspect
+        source = _inspect.getsource(lc29.LC29HBSDriver.factory_reset)
+        self.assertIn('断电', source,
+                      '没有软重启命令的型号必须提示"断电重插"')
+        self.assertIn('needs_power_cycle', source,
+                      '要把"需断电"这件事放进返回数据，让上层能提示用户')
 
 
 if __name__ == '__main__':

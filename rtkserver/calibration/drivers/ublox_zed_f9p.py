@@ -142,6 +142,13 @@ MODE_DISABLED = 0
 MODE_SURVEY_IN = 1
 MODE_FIXED = 2
 MODE_LABEL = {MODE_DISABLED: 'disabled', MODE_SURVEY_IN: 'survey_in', MODE_FIXED: 'fixed'}
+# 给人看的模式名。**不要拿 `MODE_LABEL` 直接拼提示语**：
+# 那个是 UBX 的 TMODE 枚举值，`0` 叫 `disabled` —— 切到流动站时界面会显示
+# "已切换到 disabled"，用户第一反应是"模块被我关掉了"。
+# 枚举名留在 `data['mode']` 里给机器读，提示语只用人话。
+MODE_TEXT = {MODE_DISABLED: '流动站',
+             MODE_SURVEY_IN: '自收敛（Survey-in）',
+             MODE_FIXED: '定点基准站'}
 MODE_VALUE = {v: k for k, v in MODE_LABEL.items()}
 # 兼容流程层传 'rover'/'base' 两种叫法
 MODE_ALIASES = {
@@ -432,6 +439,16 @@ class ZEDF9PDriver(BaseDriver):
 
     MODEL_KEY = 'zed_f9p'
     DISPLAY_NAME = 'u-blox ZED-F9P'
+    # 本型号备份要读的报文名。**只列真的存在且可读的**（2026-11-13 真机逐条验过）：
+    #   1006 在 F9P 上只能输入、不能输出（RTCM_INPUT_ONLY）；
+    #   1033 没有配置键（F9P 不做天线描述，基准站要用 1230 补偿 GLONASS）；
+    #   1114 不支持（F9P 不输出 QZSS 的 MSM）；
+    #   107X~112X 是 Quectel 的通配写法，F9P 必须给具体号，所以 MSM4/MSM7 两档都列。
+    # 不按这张表读，每做一次备份就会冒出 7 条"速率没读到"的假警告。
+    BACKUP_RATES = ('GGA', 'RMC', 'GSA', 'GLL', 'GSV', 'VTG', 'ZDA',
+                    'RTCM3-1005', 'RTCM3-1230',
+                    'RTCM3-1074', 'RTCM3-1077', 'RTCM3-1084',
+                    'RTCM3-1094', 'RTCM3-1124')
     # MON-VER 的 swVersion 形如 `EXT CORE 1.00 (61b2dd)` / `HPG 1.32`。
     # 型号认领在 `detect()` 里按完整固件串做（见那里的注释），
     # 这里的 MATCH_PREFIX 只用于"粗筛"，不当唯一判据。
@@ -857,7 +874,8 @@ class ZEDF9PDriver(BaseDriver):
             'svin_mode': label,
             'source': 'TMODE_MODE',
         }
-        return True, f'当前模式：{label}', data
+        # 提示语用人话；`data['svin_mode']` 保留枚举名，前端/备份按它判定
+        return True, f'当前模式：{MODE_TEXT.get(code, label)}', data
 
     def set_mode(self, mode, persist=True, restart=True, verify=True):
         """切模式。
@@ -921,7 +939,7 @@ class ZEDF9PDriver(BaseDriver):
             data['hint_mode'] = 'survey_in'
         if not verify:
             data['mode'] = MODE_LABEL.get(target, 'unknown')
-            return True, f'已切换到 {MODE_LABEL.get(target)}（未回读校验）', data
+            return True, f'已切换到{MODE_TEXT.get(target, MODE_LABEL.get(target))}（未回读校验）', data
 
         # 回读确认：ACK 只代表"收到了"，不代表"值和我要的一样"
         names = ['TMODE_MODE'] + ([inprot_key] if inprot_key else [])
@@ -937,7 +955,7 @@ class ZEDF9PDriver(BaseDriver):
                        f'{values.get(inprot_key)!r}），移动站将收不到差分')
         if bad:
             return False, '写入后回读不一致：' + '；'.join(bad), data
-        msg = f'已切换到 {MODE_LABEL.get(target)}'
+        msg = f'已切换到{MODE_TEXT.get(target, MODE_LABEL.get(target))}'
         if inprot_key:
             msg += f'（{port} 已开启 RTCM3 输入）'
         return True, msg, data

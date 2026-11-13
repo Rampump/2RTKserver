@@ -39,6 +39,26 @@
 正确档位 NMEA 校验和 47/47 全过，错档位一个完整的 `$...*hh` 行都凑不出来。
 两层的结论都写进返回值的 `verdict` 字段推给前端，不做过滤 ——
 扫描器依旧只判定、不决断。
+
+## 第三件事：这块到底是 RTK 还是普通 GNSS
+
+`family='gnss'` 这个判定太粗：**接到 RTCM 差分的基准站模块**和**九块九的
+单点定位 GPS 模块**会落进同一档。用户照着这行去挑，挑到廉价模块，等整条
+标定跑到 `FIX_WAIT` 才发现它根本不会差分 —— 时间全白花。
+
+所以返回值多一个 `class` 字段，判据只认硬件事实：
+
+    CLASS_RTK    读到 **CRC-24Q 校验通过**的 RTCM3 帧 —— 差分数据是 RTK 的身份证
+    CLASS_GNSS   只有定位数据（NMEA / UBX / 各家私有），没有差分
+
+**一条 `$GNGGA` 绝不等于 RTK。** 单点定位的 GPS 模块同样每秒发 `$GNGGA`，
+它只是"知道自己在哪"，不知道"厘米级在哪"。能证明 RTK 的最小充分证据是
+RTCM 帧，其余一切（NMEA / UBX / 私有协议）只证明"这是一台 GNSS 设备"。
+
+`features` 也因此扩了一圈：除了 NMEA / RTCM / UBX，还识别
+Septentrio SBF、Ashtech/Hemisphere `$PASHR`、NovAtel OEM、Trimble TSIP、
+以及 `$PUBX` / `$PMTK` 这一族厂商私有 NMEA。认得出厂牌就报厂牌
+（`vendor`），认不出就只报"厂商私有 NMEA"—— 不猜。
 """
 import logging
 import re
@@ -68,30 +88,146 @@ FAMILY_GNSS = 'gnss'          # 确认是 GNSS/RTK 模块家族
 FAMILY_UNKNOWN = 'unknown'    # 没读到特征字节（空口、或模块静默）
 FAMILY_NOISE = 'noise'        # 有字节但一个特征都不符合
 
+# 设备等级：比 `family` 再细一层，回答"这块到底能不能差分"。
+# 判据见模块 docstring —— RTCM 帧（CRC 通过）才判 RTK，其余只判 GNSS。
+CLASS_RTK = 'rtk'
+CLASS_GNSS = 'gnss'
+
 # 特征 → 说明。前端原样显示这个列表，让用户自己判断。
+# 顺序也是可信度顺序：RTCM / NMEA / UBX 有帧结构与校验位，
+# 私有 ASCII 只是"设备在打招呼"。
 FEATURE_LABEL = {
-    'nmea': 'NMEA 语句',
     'rtcm': 'RTCM 差分数据',
+    'nmea': 'NMEA 语句',
     'ubx': 'u-blox UBX 二进制',
-    'unicore': '和芯星通 ASCII',
-    'pq': 'Quectel PQTM/PAIR 命令',
+    'sbf': 'Septentrio SBF 二进制',
+    'sirf': 'SiRF 二进制',
+    'ashtech': 'Ashtech/Hemisphere 定位语句',
     'novatel': 'NovAtel OEM 二进制',
     'trimble': 'Trimble TSIP 二进制',
+    'unicore': '和芯星通 ASCII',
+    'pq': 'Quectel PQTM/PAIR 命令',
+    'nmea_priv': '厂商私有 NMEA 语句',
+    'nmea_qx': 'QX 私有语句（姿态/DR）',
 }
 
 # NMEA 会话 ID。$GP $GN $BD $GL $GA $GB $GQ $GI $GS
 # 只认 GPS/GLONASS/Galileo/北斗/QZSS/NavIC 这几家的组合 —— 不写成 `\$[A-Z]{2}`
 # 是因为那样连 `$PMTK`（联发科私有）和 `$PUBX`（u-blox 私有 NMEA）都会被算成
 # "NMEA 定位语句"，而那两种恰好是**非 RTK** 的廉价模块常发的。
-_NMEA_RX = re.compile(rb'\$(?:GP|GN|GL|GA|GB|GQ|GI|GS|BD|GZ|DT)(GGA|RMC|GSA|GSV|GLL|GNS|VTG|ZDA|GST)')
-# 和芯星通：应答以 `#VERSIONA` / `#MODE` 开头，命令回显以 `$command,response:` 开头
-_UNICORE_RX = re.compile(rb'(?:#(?:VERSION|MODE|SAT|CONFIG|ANT)[A-Z]*,|\$command,response:)')
+# 那两个走 `_PRIVATE_NMEA_RX`，单独归到 `nmea_priv`。
+#
+# `TXT` 也算：`$GNTXT` / `$GPGGA` 之外的这条是模块**自报厂名与版本**的通道
+# （u-blox 默认就发 `$GNTXT,01,01,02,u-blox AG ...`）。不算它的话，
+# 一条只发 TXT 的流会被判成噪声，厂牌信息白白丢掉。
+_NMEA_RX = re.compile(rb'\$(?:GP|GN|GL|GA|GB|GQ|GI|GS|BD|GZ|DT)'
+                      rb'(GGA|RMC|GSA|GSV|GLL|GNS|VTG|ZDA|GST|TXT)')
+# 和芯星通 / NovAtel 都用 `#` 开头的 ASCII 日志头，**两者格式几乎一样**
+# （Unicore 的日志格式就是照着 NovAtel 做的，`#VERSIONA` 两家都有）。
+# 所以这里绝不按"看到 `#` 就当 Unicore"下结论 —— 那会把 NovAtel OEM7
+# 整条产线认成和芯星通。区分交给 `_ascii_log_vendor()` 看头部内容。
+_ASCII_LOG_RX = re.compile(rb'^#([A-Z][A-Z0-9]{2,12}),')
+# Unicore 的命令回显格式，NovAtel 没有这一种
+_UNICORE_CMD_RX = re.compile(rb'\$command,response:')
+# 兼容旧调用点：`#` 日志头（任一厂）或 Unicore 命令回显
+_UNICORE_RX = re.compile(rb'(?:^#[A-Z][A-Z0-9]{2,12},|\$command,response:)', re.M)
 # Quectel：PQTM / PAIR 两族
 _QUECTEL_RX = re.compile(rb'\$(?:PQTM[AC-Z]|PAIR\d{3})')
-# NovAtel OEM6/OEM7：AA 44 12 组帧头
-_NOVATEL_RX = re.compile(rb'\xaa\x44\x12')
-# Trimble TSIP：DLE(0x10) ETX(0x03) 帧头
-_TSIP_RX = re.compile(rb'\x10\x03')
+# Quectel 版本应答：`$PQTMVERNO,<型号>,<固件>,...` —— 直接给出型号
+_QUECTEL_VERNO_RX = re.compile(rb'\$PQTMVERNO,([^,*\r\n]{2,40})')
+# Septentrio SBF：块头 `$@`（0x24 0x40）
+_SBF_RX = re.compile(rb'\x24\x40')
+# u-blox 常把厂名写进 NMEA TXT 语句：`$GNTXT,01,01,02,u-blox AG - www.u-blox.com`
+_UBX_FWVER_RX = re.compile(rb'FWVER=([A-Z ]{2,8}\s?[0-9.]{2,10})')
+# 厂商私有 NMEA：`$P` + 三个大写字母的厂商码。
+# **是 3 个字母不是 4 个**：NMEA 私有语句的惯例是 `$P` + 3 字符厂商码
+# （`$PUBX` / `$PMTK` / `$PSTI` / `$PSRF` / `$PTNL` / `$PJAV` / `$PGRMZ`），
+# 只有 Ashtech 的 `$PASHR` 是 `P` + 4 字符，所以它也会被这条命中 ——
+# 归类的分支在 `sniff()` 里按 talker 前 4 字符再分一次。
+_PRIVATE_NMEA_RX = re.compile(rb'\$P[A-Z]{3}')
+# `$QX` 是一个**不在 NMEA 标准 talker 表里、也不是 `$P<厂商码>` 形式**的私有族。
+# 2026-11-13 真机实测（COM9）：一块带 IMU 的多模模组在 0 星时也在发
+# `$QXATT`（姿态）与 `$QXDRS`（DR 状态），同时对所有 `$P...` 查询回 `$NACK,0`。
+# 两套现有判据（标准 talker / `$P` 私有语句）都匹配不到它，
+# 于是扫描结果只显示"NMEA 语句"，看不出"这块带 DR/姿态"这个关键差异。
+_QX_RX = re.compile(rb'\$QX[A-Z]{3},')
+# 私有 NMEA 的厂商标识（`$` 之后的前 4 个字符）→ 品牌。
+#
+# **认不出就不报**，不要拿"P"开头就当厂牌 —— 编出来的名字比空白更糟。
+# 这张表只收"该厂确有这条私有语句"的确定项，且都要求校验和通过
+# （见 `_private_nmea_talkers()`），所以撞中的概率极低。
+#
+# 为什么值得收这么多：现场最常见的困惑是"这口到底是哪家的模块"，
+# 而一家厂往往只有一两条私有语句露头，收漏一条就等于这个厂认不出来。
+_PRIVATE_TALKER_VENDOR = {
+    b'PUBX': 'u-blox',              # u-blox 的 NMEA 扩展（$PUBX,00 定位 / 40 卫星）
+    b'PMTK': 'MediaTek',            # 联发科 MT33xx/MTK 平台（$PMTK001 应答）
+    b'PSTI': 'SkyTraq',             # SkyTraq Venus 系列（$PSTI,030,OK）
+    b'PSRF': 'SiRF',                # SiRF Star III/IV（$PSRF100 串口配置）
+    b'PTNL': 'Trimble',             # Trimble（$PTNLGGK / $PTNLDG / $PTNLPJT）
+    b'PJAV': 'Javad',               # Javad（$PJAV）
+    b'PASH': 'Ashtech/Hemisphere',  # Ashtech / Hemisphere（$PASHR,ATT / $PASHR,POS）
+    b'PGRM': 'Garmin',              # Garmin（$PGRMZ / $PGRME / $PGRMM）
+    b'PSTM': 'ST Teseo',            # ST Teseo（$PSTMVER / $PSTMSETPAR）
+    b'PSSN': 'Septentrio',          # Septentrio 私有 NMEA（$PSSN,HRP 姿态）
+    b'PFEC': 'Furuno',              # Furuno（$PFEC）
+    b'PMGN': 'Magellan',            # Magellan（$PMGNST / $PMGNSM）
+}
+# ---------------------------------------------------------------------------
+# 设备自述字符串里的厂名关键词。
+#
+# 为什么要有这一层：很多模块把厂名写在**文本**里 —— NMEA TXT 语句、
+# `#VERSION` 日志头、命令应答的版本串。这些字节用正则认不出来，
+# 但一个 6~10 字符的品牌名在文本行里出现，几乎不可能是巧合。
+#
+# **只在文本行里搜**（见 `_banner_vendor()`），不在整个二进制缓冲里搜：
+# 二进制载荷里凑出 "u-blox" 的概率虽低，但把判据限制在"以 $ 或 # 开头的
+# 可打印行"里是零成本的严格化。
+# 键是 **bytes**：既因为要比对的是原始字节流，也因为 `和芯` 这种中文
+# 厂名没法用 ASCII 编码 —— 存成字节就不用每次匹配时再做编码转换。
+_BANNER_KEYS = (
+    (b'U-BLOX', 'u-blox'),
+    (b'UBLOX', 'u-blox'),
+    (b'QUECTEL', 'Quectel'),
+    (b'UNICORE', 'Unicore'),
+    (b'BDSTAR', 'Unicore'),
+    ('和芯'.encode('utf-8'), 'Unicore'),
+    (b'SEPTENTRIO', 'Septentrio'),
+    (b'NOVATEL', 'NovAtel'),
+    (b'HEXAGON', 'NovAtel'),
+    (b'TRIMBLE', 'Trimble'),
+    (b'ASHTECH', 'Ashtech/Hemisphere'),
+    (b'HEMISPHERE', 'Ashtech/Hemisphere'),
+    (b'JAVAD', 'Javad'),
+    (b'COMNAV', 'ComNav'),
+    (b'CHCNAV', 'CHC'),
+    (b'BYNAV', 'Bynav'),
+    (b'ALLYSTAR', 'Allystar'),
+    (b'TESEO', 'ST Teseo'),
+    (b'SKYTRAQ', 'SkyTraq'),
+    (b'MEDIATEK', 'MediaTek'),
+    (b'SIRF', 'SiRF'),
+    (b'GARMIN', 'Garmin'),
+    (b'FURUNO', 'Furuno'),
+)
+# 厂牌信息在"逐档 → 最终结果"之间的携带字段。
+#
+# 单独列成元组是因为这几个字段要在四五处返回值里各带一遍（每档证据、
+# 打不开、最佳档、全空）。手写会漏 —— 漏一处的后果是前端显示
+# "这个口认不出厂家"，而那恰好是用户最需要信息的时刻。
+VENDOR_FIELDS = ('vendor', 'vendor_confidence', 'vendor_evidence', 'model', 'firmware')
+
+
+def _vendor_slice(info, empty=False):
+    """从 `sniff()` 结果里抽出厂牌字段，供 probe 的各级返回值展开。"""
+    if empty or not info:
+        return {key: ([] if key == 'vendor_evidence' else '') for key in VENDOR_FIELDS}
+    return {key: info.get(key, [] if key == 'vendor_evidence' else '')
+            for key in VENDOR_FIELDS}
+
+
+# Ashtech / Hemisphere 的 talker（`$PASHR,` 的 `$` 后前 4 字符是 `PASH`）
+_ASHTECH_TALKER = b'PASH'
 
 
 def _crc24q(data):
@@ -104,6 +240,44 @@ def _crc24q(data):
             if crc & 0x1000000:
                 crc ^= 0x1864CFB
     return crc & 0xFFFFFF
+
+
+def _iter_rtcm_frames(buf, limit=512):
+    """逐帧产出 **CRC-24Q 校验通过** 的 RTCM3：`(消息号, 载荷)`。
+
+    抽成迭代器是因为厂牌判定要从 `1033`（接收机/天线自述）里取字符串，
+    而"哪些帧算数"必须和 `_count_rtcm_frames()` 用**同一套**判据 ——
+    两处各写一份 CRC 走帧，迟早会漂。
+
+    `limit` 只是防呆：一段 0.35 秒的缓冲里不可能有几百帧，
+    真到了那个数量说明字节流是乱的，继续扫也没意义。
+    """
+    index = 0
+    total = len(buf)
+    seen = 0
+    while seen < limit:
+        index = buf.find(b'\xd3', index)
+        if index < 0 or index + 6 > total:
+            return
+        second = buf[index + 1]
+        if second & 0xC0:                      # 保留位必须为 0
+            index += 1
+            continue
+        length = ((second & 0x03) << 8) | buf[index + 2]
+        if not (12 <= length <= 1023):         # 最短的 1005 也有 19 字节
+            index += 1
+            continue
+        end = index + 3 + length + 3           # 头 3 + 载荷 + CRC 3
+        if end > total:
+            return                             # 帧被截断：后面的不可能完整
+        expect = ((buf[end - 3] << 16) | (buf[end - 2] << 8) | buf[end - 1])
+        if _crc24q(buf[index:end - 3]) == expect:
+            payload = buf[index + 3:end - 3]
+            seen += 1
+            yield ((payload[0] << 4) | (payload[1] >> 4), payload)
+            index = end                        # 校验通过才跳过整帧，避免重复数
+        else:
+            index += 1
 
 
 def _count_rtcm_frames(buf):
@@ -120,66 +294,490 @@ def _count_rtcm_frames(buf):
     乱码凑出来的"帧"过不了 —— 这是**唯一**能把两者分开的判据。
     代价是要求缓冲里有完整帧（含 3 字节 CRC），长度不够就跳过、不计入。
     """
+    return sum(1 for _msg, _payload in _iter_rtcm_frames(buf))
+
+
+def _count_sbf(buf):
+    """数**结构自洽**的 Septentrio SBF 块（`$@` 块头）。
+
+    SBF 的块头 8 字节：`$@`(2) + 头 CRC(2) + 块 ID(2) + 块长度(2)，
+    随后是块体、再跟 4 字节尾 CRC，整块长度 = 12 + 块长度。
+
+    这里**只做结构校验**，不去算那两套 CRC：SBF 头 CRC 的覆盖范围在
+    几版手册里写法不一致，按错的算法算会把真块判成假块 —— 宁可少判一层。
+    所以 SBF 只作为"这条流是 GNSS 二进制"的证据，不给 `strict`。
+
+    为什么还要卡"块长度 4 字节对齐"：SBF 所有块体都是 4 字节对齐的，
+    这是协议硬约束，也是乱码最难凑出来的那一条。
+    """
     count = 0
     index = 0
     total = len(buf)
     while True:
-        index = buf.find(b'\xd3', index)
-        if index < 0 or index + 6 > total:
+        index = buf.find(b'\x24\x40', index)
+        if index < 0 or index + 8 > total:
             break
-        second = buf[index + 1]
-        if second & 0xC0:                      # 保留位必须为 0
-            index += 1
-            continue
-        length = ((second & 0x03) << 8) | buf[index + 2]
-        if not (12 <= length <= 1023):         # 最短的 1005 也有 19 字节
-            index += 1
-            continue
-        end = index + 3 + length + 3           # 头 3 + 载荷 + CRC 3
-        if end > total:
-            index += 1                         # 帧被截断：这一档没读全，不计入
-            continue
-        expect = ((buf[end - 3] << 16) | (buf[end - 2] << 8) | buf[end - 1])
-        if _crc24q(buf[index:end - 3]) == expect:
+        block_id = buf[index + 4] | (buf[index + 5] << 8)
+        length = buf[index + 6] | (buf[index + 7] << 8)
+        # 块 ID 实际落在 4000~6000（观测 4xxx、状态 59xx）；
+        # 长度非 0、4 字节对齐、整块在缓冲内。
+        if length and length % 4 == 0 and 4000 <= block_id <= 6100 \
+                and index + 12 + length <= total:
             count += 1
-            index = end                        # 校验通过才跳过整帧，避免重复数
+            index += 12 + length
         else:
-            index += 1
+            index += 2
     return count
 
 
-def _count_ubx_frames(buf):
-    """数头部自洽的 UBX 帧（B5 62 + class + id + 2 字节长度 ≤ 1024）。"""
+def _count_novatel(buf):
+    """数**结构自洽**的 NovAtel OEM 帧（`AA 44 12` + 头长 + 载荷长）。
+
+    只看三字节帧头不够：真机上的乱码流里 `AA 44 12` 会随机撞出来。
+    有区分度的是**两个长度字段互相自洽**：NovAtel 头里 `header_len`
+    （0x1C / 0x20 常见）与 `payload_len` 相加再加 4 字节 CRC，
+    正好等于一帧的长度。乱码要同时凑对这两处，概率极低。
+
+    仍不给 `strict`：NovAtel 的 CRC32 是自家变体（初值取反、结果取反），
+    和 `zlib.crc32` 不是一回事，算错会把真帧判假。
+    """
     count = 0
     index = 0
+    total = len(buf)
     while True:
-        index = buf.find(b'\xb5\x62', index)
-        if index < 0 or index + 6 > len(buf):
+        index = buf.find(b'\xaa\x44\x12', index)
+        if index < 0 or index + 10 > total:
             break
-        length = buf[index + 4] | (buf[index + 5] << 8)
-        if length <= 1024:
+        header_len = buf[index + 3]
+        payload_len = buf[index + 8] | (buf[index + 9] << 8)
+        if 0x1C <= header_len <= 0x40 \
+                and index + header_len + payload_len + 4 <= total:
             count += 1
+            index += header_len + payload_len + 4
+        else:
+            index += 3
+    return count
+
+
+def _count_tsip(buf):
+    """数**结构自洽**的 Trimble TSIP 帧（DLE `10 03` 头 + 包 ID + 长度 + 体 + `10 03` 尾）。
+
+    真帧体里若出现 0x10 会做 DLE 转义（`10 10`），所以不能拿"下一个
+    `10 03`"当帧尾 —— 那样会在转义处提前截断。这里按协议走一遍：
+    累积**未转义**字节数，遇到 `10 03` 收尾，再与长度字段比对。
+
+    帧结构：`DLE ETX` + 包 ID(1B) + 长度(2B) + 数据 + `DLE ETX`。
+    **长度字段从第 4 个字节开始（跳过包 ID）** —— 一开始把它算到包 ID 上，
+    真帧的长度就变成了 `包ID<<8 | 长度高位`，永远对不上。
+
+    长度字段的字节序按 little-endian 读，同时兼容 big-endian：
+    Trimble 不同产品线两种都出现过，而这里只拿它和"实际帧尾位置"比对，
+    多试一种字节序不会凭空造出帧。
+
+    乱码要凑出帧头、合理长度、位置刚好的帧尾三件事才能骗过它。
+    """
+    count = 0
+    index = 0
+    total = len(buf)
+    while True:
+        index = buf.find(b'\x10\x03', index)
+        if index < 0 or index + 6 > total:
+            break
+        raw_len = buf[index + 3:index + 5]
+        candidates = (raw_len[0] | (raw_len[1] << 8), (raw_len[0] << 8) | raw_len[1])
+        lengths = [n for n in candidates if 0 < n <= 1024]
+        if not lengths:
+            index += 2
+            continue
+        pos = index + 5
+        seen = 0
+        matched = False
+        while pos < total:
+            if buf[pos] == 0x10:
+                nxt = buf[pos + 1] if pos + 1 < total else None
+                if nxt == 0x03:                      # 未转义的帧尾
+                    matched = seen in lengths
+                    break
+                if nxt == 0x10:                      # 转义的数据字节
+                    seen += 1
+                    pos += 2
+                    continue
+            seen += 1
+            pos += 1
+        if matched:
+            count += 1
+            index = pos + 2
+        else:
+            index += 2
+    return count
+
+
+def _count_sirf(buf):
+    """数**校验和正确**的 SiRF 二进制帧（`A0 A2` 头 + 长度 + 载荷 + 校验 + `B0 B3` 尾）。
+
+    SiRF Star III/IV（含大量国产模块的早期方案）的 NMEA 和所有厂家一样，
+    但二进制协议只有它一家用 `A0 A2 … B0 B3` 这个框，所以认出来就能报厂。
+
+    校验和是"字节 2 到载荷末尾"的累加和（mod 0x10000），**必须验** ——
+    两字节头 `A0 A2` 在乱码里撞中率不低，只数头会把噪声当成 SiRF。
+    """
+    count = 0
+    index = 0
+    total = len(buf)
+    while True:
+        index = buf.find(b'\xa0\xa2', index)
+        if index < 0 or index + 8 > total:
+            break
+        length = ((buf[index + 2] & 0x7F) << 8) | buf[index + 3]
+        end = index + 4 + length + 2 + 2        # 头 4 + 载荷 + 校验 2 + 尾 2
+        if 0 < length <= 1024 and end <= total \
+                and buf[end - 2:end] == b'\xb0\xb3':
+            expect = (buf[end - 4] << 8) | buf[end - 3]
+            if sum(buf[index + 2:end - 4]) & 0xFFFF == expect:
+                count += 1
+                index = end
+                continue
         index += 2
     return count
 
 
+def _private_nmea_talkers(buf):
+    """统计**校验和正确**的厂商私有 NMEA 语句，返回 {厂商标识: 条数}。
+
+    标识取 `$` 之后的前 4 个字符：`$PUBX,` → `PUBX`，`$PASHR,` → `PASH`。
+
+    **必须验校验和。** `$Pxxxx,` 在错波特率的乱码里撞中的概率不低
+    （4 个字母 + 逗号，比标准 NMEA 的 `$GNGGA` 更容易随机出现）。
+    校验和用的是和标准 NMEA 一样的逐字节 XOR —— 同一条判据，
+    在"真在说私有协议"和"字节错位凑出来的巧合"之间划线。
+
+    为什么单独拿出来：这一族里除了 `$PASHR`（Ashtech/Hemisphere 的定位语句）
+    之外，绝大多数是**单点定位模块**的私有语句（`$PMTK` 是联发科、
+    `$PSTI` 是 SkyTraq）。认出来只说明"这是台 GNSS 设备"，
+    绝不能因此判成 RTK。
+    """
+    found = {}
+    for line in buf.split(b'\r\n'):
+        if len(line) < 9 or not _PRIVATE_NMEA_RX.match(line):
+            continue
+        star = line.rfind(b'*')
+        if star < 0 or star + 3 > len(line):
+            continue
+        try:
+            given = int(line[star + 1:star + 3], 16)
+        except ValueError:
+            continue
+        checksum = 0
+        for byte in line[1:star]:
+            checksum ^= byte
+        if checksum != given:
+            continue
+        talker = line[1:5]
+        found[talker] = found.get(talker, 0) + 1
+    return found
+
+
+def _count_qx_sentences(buf):
+    """数**校验和正确**的 `$QX...` 私有语句。
+
+    为什么要验校验和：和 `$P` 私有族一样的理由 —— `$QXATT,` 这种 7 字节头
+    在错波特率的乱码里撞中的概率不低。校验位是唯一有区分度的判据。
+
+    为什么单独统计：这一族说明模块**带惯性/姿态输出**（ATT=姿态，
+    DRS=DR 状态），它跟"能不能做 RTK"无关，但能解释
+    "为什么这块模块的 NMEA 里有一堆看不懂的语句"，
+    也提醒用户"这不是一块纯 GNSS 板子"。厂牌认不出就留空，不编。
+    """
+    hits = 0
+    for line in buf.split(b'\r\n'):
+        if len(line) < 9 or not _QX_RX.match(line):
+            continue
+        star = line.rfind(b'*')
+        if star < 0 or star + 3 > len(line):
+            continue
+        try:
+            given = int(line[star + 1:star + 3], 16)
+        except ValueError:
+            continue
+        checksum = 0
+        for byte in line[1:star]:
+            checksum ^= byte
+        if checksum == given:
+            hits += 1
+    return hits
+
+
+def _ascii_log_vendor(raw):
+    """`#` 开头的 ASCII 日志头 → `(厂牌, 头行数, 第一条头行)`。
+
+    为什么必须区分：Unicore 的日志格式大量借鉴 NovAtel，`#VERSIONA,...`
+    两家都发。按"看到 `#` 就当和芯星通"判，会把 NovAtel OEM7 整条产线
+    认成国产模块 —— 认错厂牌比不认更糟，用户会拿错的命令集去试。
+
+    区分点（看头部第 2 个字段）：
+        NovAtel   端口名 `COM1` / `COM2` / `THISPORT` / `USB1` / `IP1` / `NCOM1`
+                  时间状态常写作 `FINESTEERING`
+        Unicore   端口是个纯数字（`79`），时间状态 `FINE`
+    另外 `$command,response:` 是 Unicore 独有的命令回显，也归 Unicore。
+    """
+    count = 0
+    first = b''
+    for line in raw.split(b'\r\n'):
+        if len(line) < 8 or not line.startswith(b'#'):
+            continue
+        if not _ASCII_LOG_RX.match(line):
+            continue
+        count += 1
+        if not first:
+            first = line[:160]
+    if not first:
+        return '', 0, b''
+    if b'FINESTEERING' in first or re.match(rb'^#[A-Z0-9]+,(?:N?COM|USB|IP|THISPORT)\d*,', first):
+        return 'NovAtel', count, first
+    if b',FINE,' in first or b',COARSE,' in first:
+        return 'Unicore', count, first
+    return '', count, first
+
+
+class _Bits:
+    """按位读。RTCM 的字符串字段前面挂的是 8 bit 计数器，必须先读位再切字节。"""
+
+    __slots__ = ('_data', '_pos')
+
+    def __init__(self, data):
+        self._data = data
+        self._pos = 0
+
+    def read(self, bits):
+        value = 0
+        for _ in range(bits):
+            index = self._pos >> 3
+            if index >= len(self._data):
+                raise ValueError('位流不足')
+            value = (value << 1) | ((self._data[index] >> (7 - (self._pos & 7))) & 1)
+            self._pos += 1
+        return value
+
+    def text(self):
+        """`<8bit 长度><N×8bit ASCII>`。返回去掉尾部空白与控制符的字符串。"""
+        length = self.read(8)
+        if length > 64:                       # 描述串不会超过 64 字符，超了必是错位
+            raise ValueError('字符串长度不合理')
+        out = bytearray()
+        for _ in range(length):
+            out.append(self.read(8))
+        return out.decode('ascii', 'ignore').strip('\x00 ')
+
+
+def _decode_1033(payload):
+    """解 RTCM3-1033（接收机与天线描述），返回厂牌/型号/固件/序列号。
+
+    为什么这个比任何 NMEA 都值钱：**基准站模式下模块通常把 NMEA 全关了**，
+    这时串口上只有 RTCM。而 1033 是模块自己报的"我是谁" ——
+    `RECEIVER TYPE` 里就写着 `Quectel  LG290P` / `u-blox ZED-F9P` 这类字符串。
+    不解析它，基准站口就永远只能显示"RTCM 差分数据"，认不出厂家。
+
+    字段顺序（RTCM 10403.3）：
+        DF002(12) DF003(12) DF029(8) DF030×N DF031(8)
+        DF032(8) DF033×N DF227(8) DF228×N DF229(8) DF230×N DF231(8) DF232×N
+    """
+    if not payload or len(payload) < 12:
+        return None
+    bits = _Bits(payload)
+    try:
+        if bits.read(12) != 1033:
+            return None
+        station_id = bits.read(12)
+        antenna = bits.text()
+        bits.read(8)                          # DF031 天线安装方式
+        bits.text()                           # DF032 天线序列号
+        receiver = bits.text()                # DF227/228 接收机型号
+        firmware = bits.text()                # DF229/230 固件版本
+        serial = bits.text()                  # DF231/232 接收机序列号
+    except (ValueError, IndexError):
+        return None
+    return {'station_id': station_id, 'antenna': antenna, 'receiver': receiver,
+            'firmware': firmware, 'serial': serial}
+
+
+def _rtcm_descriptor(buf):
+    """从缓冲里的 1033 帧取设备自述。没有就返回 None。"""
+    for msg, payload in _iter_rtcm_frames(buf):
+        if msg != 1033:
+            continue
+        info = _decode_1033(payload)
+        if info and (info['receiver'] or info['antenna']):
+            return info
+    return None
+
+
+def _banner_vendor(raw):
+    """在**文本行**里找厂名关键词，返回 `(厂牌, 命中原文, rank)`。
+
+    只扫"以 `$` / `#` 开头且不含控制字符"的行。理由写死在 `_BANNER_KEYS`
+    上面：二进制载荷里凑出品牌名的概率虽低，但这条限制是零成本的严格化，
+    而且能把"整条流里恰好出现 u-blox"这种假阳性挡在外面。
+
+    u-blox 是这里最典型的场景：它默认往 `$GNTXT` 里发
+    `u-blox AG - www.u-blox.com`，一行就认全了。
+
+    rank 分两档：
+        2（中）  命中在 `$...TXT` 语句里 —— 这是设备自己的输出
+        1（低）  命中在 `#` 日志头或其他行 —— 可能是集成商/代理写的
+    """
+    for line in raw.split(b'\r\n'):
+        line = line.strip()
+        if len(line) < 8 or line[:1] not in (b'$', b'#'):
+            continue
+        # 只排除**控制字符**，不排除高位字节：国产模块的横幅会有中文
+        # （`和芯星通` / `上海华测`），按 `<=0x7E` 过滤会把它们整行丢掉。
+        if any(byte < 0x20 or byte == 0x7F for byte in line):
+            continue
+        upper = line.upper()
+        for key, vendor in _BANNER_KEYS:
+            if key in upper:
+                shown = line[:80].decode('utf-8', 'ignore')
+                is_txt = line[:1] == b'$' and b'TXT,' in upper[:16]
+                return vendor, shown, (2 if is_txt else 1)
+    return '', '', 0
+
+
+def _version_hints(raw):
+    """从版本应答里取型号/固件。返回 dict（可能为空）。
+
+    覆盖两种"一问就自报家门"的应答：
+        Quectel  `$PQTMVERNO,LG290P03AANR01A03S,...`  → 型号直接在前两段
+        u-blox   UBX-MON-VER 扩展字段 `FWVER=HPG 1.32` → 固件版本
+    两者都只在**主动探测**或模块自发输出时出现，被动扫描多半拿不到 ——
+    所以这里拿到是加分，拿不到不影响判定。
+    """
+    hints = {}
+    match = _QUECTEL_VERNO_RX.search(raw or b'')
+    if match:
+        hints['model'] = match.group(1).decode('ascii', 'ignore').strip()
+    for cls, msg_id, payload in _verify_ubx(raw or b''):
+        if (cls, msg_id) != (0x0A, 0x04):
+            continue
+        sw = payload[:30].decode('ascii', 'ignore').strip('\x00 ')
+        match = _UBX_FWVER_RX.search(payload)
+        hints['firmware'] = match.group(1).decode('ascii', 'ignore').strip() if match \
+            else sw
+        break
+    return hints
+
+
+def _resolve_vendor(raw, counts, private, ascii_vendor, descriptor):
+    """汇总所有厂牌证据，返回 `{vendor, vendor_confidence, vendor_evidence, ...}`。
+
+    **证据分级**（rank 3 = 高，2 = 中，1 = 低）：
+
+        high   设备自述字符串   RTCM-1033 的 `RECEIVER TYPE`、`#VERSION` 日志头、
+                              `$PQTMVERNO` 版本应答 —— 设备自己说的名字
+        high   专属二进制协议   UBX→u-blox / SBF→Septentrio / AA4412→NovAtel
+                              / TSIP→Trimble / SiRF `A0 A2`（都验了校验位）
+        high   私有命令族       `$PQTM`/`$PAIR`→Quectel、`$command,response:`→Unicore
+        medium 私有 NMEA talker `$PUBX`→u-blox、`$PSTM`→ST Teseo（校验和已验）
+        low    文本横幅里的厂名 用户看得到原文，但可能是代理/集成商写的
+
+    为什么要分级而不是"命中即返回"：现场要能解释"凭什么是这家的"。
+    每条证据都进 `vendor_evidence`，前端放 tooltip，用户和厂家对质时有据可查。
+    """
+    evidence = []
+    vendors = []
+    best_rank = 0
+
+    def add(name, why, rank):
+        nonlocal best_rank
+        if not name:
+            return
+        if name in vendors:
+            return
+        vendors.append(name)
+        evidence.append(why)
+        best_rank = max(best_rank, rank)
+
+    # ---- 1. 设备自述：最强，因为设备直接报了自己的名字 ----
+    if descriptor:
+        text = descriptor.get('receiver') or ''
+        blob = f'{text} {descriptor.get("antenna") or ""}'.upper().encode('utf-8', 'ignore')
+        for key, vendor in _BANNER_KEYS:
+            if key in blob:
+                add(vendor, f'RTCM-1033 自述接收机型号「{text}」', 3)
+                break
+
+    if ascii_vendor:
+        add(ascii_vendor, f'`#` ASCII 日志头（{ascii_vendor} 格式）', 3)
+
+    # ---- 2. 专属二进制协议 ----
+    if counts.get('ubx'):
+        add('u-blox', f'UBX 二进制帧（校验通过 {counts["ubx"]} 帧）', 3)
+    if counts.get('sbf'):
+        add('Septentrio', f'SBF 块结构（{counts["sbf"]} 块）', 3)
+    if counts.get('trimble'):
+        add('Trimble', f'TSIP 帧结构（{counts["trimble"]} 帧）', 3)
+    if counts.get('sirf'):
+        add('SiRF', f'SiRF 二进制帧（校验正确 {counts["sirf"]} 帧）', 3)
+    # `counts['novatel']` 里可能混着 ASCII 日志行（见 `sniff()` 的归因），
+    # 那种情况上面第 1 步已经报过，这里只报真正的二进制帧。
+    if counts.get('novatel') and ascii_vendor != 'NovAtel':
+        add('NovAtel', f'NovAtel OEM 帧结构（{counts["novatel"]} 帧）', 3)
+
+    # ---- 3. 私有命令族 ----
+    if counts.get('pq'):
+        add('Quectel', f'Quectel PQTM/PAIR 命令（{counts["pq"]} 条）', 3)
+    if counts.get('unicore') and ascii_vendor != 'Unicore':
+        add('Unicore', f'和芯星通 ASCII 命令应答（{counts["unicore"]} 条）', 3)
+
+    # ---- 4. 私有 NMEA talker ----
+    # `$PASHR` 在 `sniff()` 里已被单独挑出来归到 `ashtech`（它带伪距/姿态，
+    # 是定位语句），所以不在 `private` 里，得单独补一条。
+    if counts.get('ashtech'):
+        add('Ashtech/Hemisphere', f'`$PASHR` 定位语句 {counts["ashtech"]} 句', 2)
+    for talker, hits in sorted(private.items()):
+        brand = _PRIVATE_TALKER_VENDOR.get(talker)
+        if brand:
+            add(brand, f'`${talker.decode("ascii", "ignore")}` 私有语句 {hits} 句', 2)
+
+    # ---- 5. 文本横幅（兜底）----
+    banner_vendor, banner_text, banner_rank = _banner_vendor(raw)
+    if banner_vendor:
+        add(banner_vendor, f'文本里的厂名「{banner_text}」', banner_rank)
+
+    hints = _version_hints(raw)
+    if descriptor and descriptor.get('receiver'):
+        hints.setdefault('model', descriptor['receiver'])
+    if descriptor and descriptor.get('firmware'):
+        hints.setdefault('firmware', descriptor['firmware'])
+
+    confidence = {3: 'high', 2: 'medium', 1: 'low'}.get(best_rank, '')
+    return {'vendor': vendors[0] if vendors else '',
+            'vendor_confidence': confidence if vendors else '',
+            'vendor_evidence': evidence,
+            'model': hints.get('model', ''), 'firmware': hints.get('firmware', '')}
+
+
 def sniff(raw):
-    """从一段原始字节里认出 GNSS 家族特征。
+    """从一段原始字节里认出 GNSS 家族特征与设备等级。
 
     返回 dict：
         family     FAMILY_GNSS / FAMILY_UNKNOWN / FAMILY_NOISE
-        features   ['nmea', 'rtcm', ...]（按可信度排序）
+        class      CLASS_RTK / CLASS_GNSS（非 GNSS 时为空串）
+        vendor     认得出的厂牌（'u-blox' / 'Septentrio' / ...），认不出为 ''
+        features   ['rtcm', 'nmea', ...]（按可信度排序）
         counts     各特征的命中次数，给前端显示"读到了多少"
         bytes      收到的字节数
 
     **判定不等于结论**：`family='gnss'` 只说明"这条流里有 GNSS 数据"，
-    不说明是哪块模块、也不说明它能当基准站。选择权在前端/用户手里。
+    `class='rtk'` 也只是"实测到 RTCM 差分数据"。是哪块模块、能不能当基准站，
+    仍然推给前端/用户判断。
     """
     raw = raw or b''
     counts = {}
     if not raw:
-        return {'family': FAMILY_UNKNOWN, 'features': [], 'counts': counts,
-                'bytes': 0, 'note': '没有读到任何字节'}
+        return {'family': FAMILY_UNKNOWN, 'class': '', 'vendor': '',
+                'vendor_confidence': '', 'vendor_evidence': [],
+                'model': '', 'firmware': '', 'features': [],
+                'counts': counts, 'bytes': 0, 'note': '没有读到任何字节'}
 
     nmea = len(_NMEA_RX.findall(raw))
     if nmea:
@@ -187,44 +785,97 @@ def sniff(raw):
     rtcm = _count_rtcm_frames(raw)
     if rtcm:
         counts['rtcm'] = rtcm
-    ubx = _count_ubx_frames(raw)
-    if ubx:
-        counts['ubx'] = ubx
-    unicore = len(_UNICORE_RX.findall(raw))
-    if unicore:
-        counts['unicore'] = unicore
+
+    # UBX 只认**校验通过**的帧。早先数的是 `B5 62` 头部，真机实测在
+    # 错波特率的乱码里两字节头撞中率很高（见 `_verify_ubx` 注释），
+    # 会把透传桥和纯噪声一起算成 GNSS。校验位是这里唯一有区分度的东西。
+    ubx_frames = _verify_ubx(raw)
+    if ubx_frames:
+        counts['ubx'] = len(ubx_frames)
+
+    sbf = _count_sbf(raw)
+    if sbf:
+        counts['sbf'] = sbf
+    novatel = _count_novatel(raw)
+    if novatel:
+        counts['novatel'] = novatel
+    tsip = _count_tsip(raw)
+    if tsip:
+        counts['trimble'] = tsip
+    sirf = _count_sirf(raw)
+    if sirf:
+        counts['sirf'] = sirf
+
+    # 厂商私有 NMEA：`$PASHR` 单独归到 ashtech（它是定位语句，含伪距/姿态），
+    # 其余（PUBX / PMTK / PSTI / PSRF / PTNL / PJAV / PGRM / PSTM / PSSN）
+    # 归 nmea_priv。两者都要求校验和通过 —— 见 `_private_nmea_talkers()`。
+    private = _private_nmea_talkers(raw)
+    ashtech = private.pop(_ASHTECH_TALKER, 0)
+    if ashtech:
+        counts['ashtech'] = ashtech
+    rest = sum(private.values())
+    if rest:
+        counts['nmea_priv'] = rest
+
+    # `$QX` 私有族（姿态/DR）：不属标准 talker，也不是 `$P` 形式，单独计。
+    qx = _count_qx_sentences(raw)
+    if qx:
+        counts['nmea_qx'] = qx
+
+    # `#` 开头的 ASCII 日志头：**先分厂再计数**。Unicore 与 NovAtel 的
+    # 日志格式几乎一样，按 `#` 直接记成 Unicore 会把 NovAtel 认错厂。
+    ascii_vendor, ascii_logs, _first = _ascii_log_vendor(raw)
+    if ascii_logs:
+        if ascii_vendor == 'NovAtel':
+            counts['novatel'] = counts.get('novatel', 0) + ascii_logs
+        elif ascii_vendor == 'Unicore':
+            counts['unicore'] = ascii_logs
+    if _UNICORE_CMD_RX.search(raw):
+        counts.setdefault('unicore', len(_UNICORE_CMD_RX.findall(raw)))
     quectel = len(_QUECTEL_RX.findall(raw))
     if quectel:
         counts['pq'] = quectel
-    novatel = len(_NOVATEL_RX.findall(raw))
-    if novatel:
-        counts['novatel'] = novatel
-    tsip = len(_TSIP_RX.findall(raw))
-    if tsip:
-        counts['trimble'] = tsip
 
     if not counts:
         # 有字节、但一个特征都没有。**如实说"有数据但认不出"**，
         # 不要说"没有模块"—— 有的私有二进制协议不在上表里。
-        return {'family': FAMILY_NOISE, 'features': [], 'counts': {},
-                'bytes': len(raw), 'note': '收到数据但不含已知的 GNSS 特征'}
+        return {'family': FAMILY_NOISE, 'class': '', **_vendor_slice(None),
+                'features': [], 'counts': {}, 'bytes': len(raw),
+                'note': '收到数据但不含已知的 GNSS 特征'}
 
     # **唯一的特征是 UBX，且帧内容不像 GNSS 报文** → 这是透传/蓝牙桥，
     # 不是 GNSS 模块。真机实测 COM12 每个波特率都吐 01-3B 心跳，
     # 若照计数判就会把它当成 GNSS 模块推给前端（用户会去选它、然后标定必失败）。
     # 判据放在这里而不是扫完再改：`probe_passive` / `probe_active` 都靠
     # `family == gnss` 筛候选，漏进去一个假口，它的"最高分"会顶掉真口。
-    if set(counts) == {'ubx'} and _ubx_frames_are_heartbeat(_verify_ubx(raw)):
-        return {'family': FAMILY_NOISE, 'features': [], 'counts': {},
-                'bytes': len(raw),
+    if set(counts) == {'ubx'} and _ubx_frames_are_heartbeat(ubx_frames):
+        return {'family': FAMILY_NOISE, 'class': '', **_vendor_slice(None),
+                'features': [], 'counts': {}, 'bytes': len(raw),
                 'note': 'UBX 帧内容不像 GNSS 报文（透传/蓝牙桥的私有心跳），按非 GNSS 处理'}
 
-    # 排序：RTCM / NMEA / UBX 这三种是"实锤"（有帧结构校验），
-    # 私有命令回显次之（可能只是设备在打招呼）。
-    order = ['rtcm', 'nmea', 'ubx', 'unicore', 'pq', 'novatel', 'trimble']
+    # 排序：有帧结构/校验位的排前面，私有命令回显垫底。
+    order = ['rtcm', 'nmea', 'ubx', 'sbf', 'sirf', 'ashtech', 'novatel', 'trimble',
+             'unicore', 'pq', 'nmea_qx', 'nmea_priv']
     features = sorted(counts, key=lambda k: (order.index(k) if k in order else 99))
-    return {'family': FAMILY_GNSS, 'features': features, 'counts': counts,
-            'bytes': len(raw), 'note': '读' + '、'.join(FEATURE_LABEL[f] for f in features)}
+
+    # 厂牌判定：**只有 RTCM 时也要试** —— 1033 里写着接收机型号，
+    # 而基准站模式恰恰是"只有 RTCM、没有 NMEA"的典型场景。
+    descriptor = _rtcm_descriptor(raw) if counts.get('rtcm') else None
+    vendor_info = _resolve_vendor(raw, counts, private, ascii_vendor, descriptor)
+    vendor = vendor_info['vendor']
+
+    # **RTK 的判据只有一条：校验通过的 RTCM 帧。** 其余一切特征
+    # （NMEA / UBX / 私有协议）只证明"这是台 GNSS 设备"。
+    klass = CLASS_RTK if counts.get('rtcm') else CLASS_GNSS
+    note = '读' + '、'.join(FEATURE_LABEL[f] for f in features)
+    if vendor:
+        note += f'；厂牌 {vendor}'
+    note += '；判定为 RTK 模块' if klass == CLASS_RTK else '；未读到差分数据，仅判为 GNSS 模块'
+    return {'family': FAMILY_GNSS, 'class': klass, 'vendor': vendor,
+            'vendor_confidence': vendor_info['vendor_confidence'],
+            'vendor_evidence': vendor_info['vendor_evidence'],
+            'model': vendor_info['model'], 'firmware': vendor_info['firmware'],
+            'features': features, 'counts': counts, 'bytes': len(raw), 'note': note}
 
 
 def _verify_nmea(buf):
@@ -234,11 +885,17 @@ def _verify_nmea(buf):
     但只要波特率错一个档位，字节就错位，XOR 永远对不上 ——
     所以它是"这条流真的被正确采样了"的最硬证据。
     真机实测：LG290P@115200 → 47/47 全过；@230400/@57600/@19200 → 0 条成形。
+
+    **`$P` 开头的厂商私有语句不计入这里**（`$PUBX` / `$PMTK` / `$PASHR` …）。
+    两类语句的校验算法一样，但含义差得远：标准 NMEA 是"GNSS 定位输出"，
+    私有语句可能只是厂家的命令回显。混在一起数，`detail` 会报出
+    "NMEA 校验通过 5 句"这种让人以为看到 5 条定位数据的结论。
+    私有语句由 `_private_nmea_talkers()` 单独统计。
     """
     ok = 0
     seen = 0
     for line in buf.split(b'\r\n'):
-        if not line.startswith(b'$'):
+        if not line.startswith(b'$') or line.startswith(b'$P'):
             continue
         star = line.rfind(b'*')
         if star < 0 or star + 3 > len(line) + 1 or len(line) < 8:
@@ -453,10 +1110,40 @@ def verify(raw, active=False):
     if rtcm:
         strict['rtcm'] = rtcm
 
+    # 厂商私有 NMEA 有校验和，能验实 —— 但**只证明"这是 GNSS 设备"**，
+    # 不能升格成 RTK（`$PMTK` 那一族大量出现在单点定位模块上）。
+    private = _private_nmea_talkers(raw)
+    ashtech = private.pop(_ASHTECH_TALKER, 0)
+    if ashtech:
+        strict['ashtech'] = ashtech
+    priv_total = sum(private.values())
+    if priv_total:
+        strict['nmea_priv'] = priv_total
+
+    # 二进制私有协议（SBF / NovAtel / TSIP）只做了结构校验、
+    # 没有可独立验证的校验位，因此**只能算弱证据**，不进 `strict`。
+    # 把它们记在这里是为了 detail 能说出"看到了什么"，而不是干巴巴一句"没验出帧"。
+    structural = {}
+    for key, value in (('sbf', _count_sbf(raw)),
+                       ('novatel', _count_novatel(raw)),
+                       ('trimble', _count_tsip(raw)),
+                       ('sirf', _count_sirf(raw))):
+        if value:
+            structural[key] = value
+
     # 私有 ASCII 协议没有可独立校验的校验位，只能算"弱证据"。
-    for key, rx in (('unicore', _UNICORE_RX), ('pq', _QUECTEL_RX)):
-        if rx.search(raw):
-            strict.setdefault(key, 1)
+    # `#` 日志头要按厂归因：Unicore 与 NovAtel 格式雷同，混算会让
+    # NovAtel 的流被记成和芯星通（进而影响 `_score` 的帧数比较）。
+    ascii_vendor, ascii_logs, _first = _ascii_log_vendor(raw)
+    if ascii_logs:
+        if ascii_vendor == 'NovAtel':
+            structural.setdefault('novatel', ascii_logs)
+        else:
+            strict.setdefault('unicore', ascii_logs)
+    if _UNICORE_CMD_RX.search(raw):
+        strict.setdefault('unicore', 1)
+    if _QUECTEL_RX.search(raw):
+        strict.setdefault('pq', 1)
 
     reply = None
     loopback = False
@@ -491,6 +1178,19 @@ def verify(raw, active=False):
     if rtcm:
         return {'verdict': 'strict', 'strict': strict, 'reply': reply,
                 'detail': f'RTCM 帧 CRC 校验通过 {rtcm} 帧'}
+    if priv_total or ashtech:
+        parts = []
+        if ashtech:
+            parts.append(f'Ashtech/Hemisphere 定位语句 {ashtech} 句')
+        if priv_total:
+            names = '、'.join(sorted(t.decode('ascii', 'ignore') for t in private))
+            parts.append(f'厂商私有 NMEA {priv_total} 句（{names}）')
+        return {'verdict': 'strict', 'strict': strict, 'reply': reply,
+                'detail': '校验和通过：' + '；'.join(parts)}
+    if structural:
+        names = '、'.join(FEATURE_LABEL[k] for k in structural)
+        return {'verdict': 'weak', 'strict': strict, 'reply': reply,
+                'detail': f'识别到 {names} 的完整帧结构，但该协议没有可独立校验的校验位'}
     if frames:
         cls = '、'.join(f'{c:02X}-{i:02X}' for c, i, _p in frames[:3])
         return {'verdict': 'weak', 'strict': strict, 'reply': reply,
@@ -602,17 +1302,50 @@ def _score(info, verified):
     排序的依据来自真机：
       - `strict`（校验通过）永远压过 `weak`。波特率对了才验得实，
         错了只能靠两字节帧头撞大运。
-      - 同为 strict 时比"验实的帧数"。F9P 在错档位也回帧，但正确档位
+      - 同为 strict 时**先看有没有 RTCM**：差分数据只会在正确档位出现，
+        而且它是"这块是 RTK 模块"的唯一证据；比帧数更能说明问题。
+      - 再看"验实的帧数"。F9P 在错档位也回帧，但正确档位
         会多回一条 48 字节的 NAV-PVT（那是它自己的定位输出，错档位没有）。
       - 都没有时退回到读到的字节量：乱码流在荒谬的高波特率下会灌进来
         一大堆字节，这反而是"档位不对"的信号，所以字节量只作最后兜底。
     """
     if not info or not info.get('bytes'):
-        return (0, 0, 0)
+        return (0, 0, 0, 0)
     strict = (verified or {}).get('strict') or {}
     frames = sum(strict.values())
     tier = 2 if (verified or {}).get('verdict') == 'strict' else 1
-    return (tier, frames, info['bytes'])
+    differential = 1 if strict.get('rtcm') else 0
+    return (tier, differential, frames, info['bytes'])
+
+
+def probe_identity(port, baud, window=ACTIVE_WINDOW):
+    """在**已知波特率**上补发一次"报名字"查询，只为认厂牌/型号。
+
+    为什么需要这一步（真机实测得出的）：
+    基准站模式下模块通常关掉 NMEA、只播 RTCM，而 **1033 不一定会开**
+    —— 实测本机 LG290P 的基准站流里只有 1005 / 1074 / 1084 / 1094 /
+    1114 / 1124，一条 1033 都没有。这时按数据特征判，厂牌永远是空，
+    用户看到的「厂家」列只能显示破折号。
+
+    但模块的命令接口在基准站模式下照样活着：发一条 `$PQTMVERNO` /
+    UBX-MON-VER / `version`，它会回自己的型号与固件。这三条都是**读**查询，
+    不改任何配置 —— 和 `probe_active` 用的是同一组探针。
+
+    返回厂牌字段（`vendor` / `vendor_confidence` / `vendor_evidence` /
+    `model` / `firmware`），认不出就是空串。**绝不改 family/class** ——
+    这一步只回答"谁家的"，不回答"是不是 RTK"。
+    """
+    raw = _ask(port, baud, window, passive_probes())
+    if not raw:
+        return _vendor_slice(None)
+    info = _vendor_slice(sniff(raw))
+    # 证据措辞要交代"这条是怎么来的"：这里的 UBX 帧是我们**问**出来的应答，
+    # 不是模块自己在播。直接复用 `sniff()` 的证据会写成"UBX 二进制帧（1 帧）"，
+    # 用户会以为这块模块平时就在吐 UBX —— 而他可能正是因为"没看到 UBX"才来查。
+    if info.get('vendor'):
+        info['vendor_evidence'] = ['主动版本查询的应答：' + str(item)
+                                   for item in (info.get('vendor_evidence') or [])]
+    return info
 
 
 def probe_passive(port, bauds=None, window=PASSIVE_WINDOW, on_progress=None):
@@ -627,7 +1360,7 @@ def probe_passive(port, bauds=None, window=PASSIVE_WINDOW, on_progress=None):
     扫错了波特率，后面整条标定流程都要重来，代价远大于多等 3 秒。
 
     返回 dict：
-        port / baud / family / features / counts / bytes / tried / note
+        port / baud / family / class / vendor / features / counts / bytes / tried / note
         verdict / detail     第二层（帧完整性）的结论
         confidence           'high' / 'medium' / 'low'，给前端决定要不要提示复核
     `baud` 为 None 表示所有档位都没读到特征。
@@ -641,13 +1374,15 @@ def probe_passive(port, bauds=None, window=PASSIVE_WINDOW, on_progress=None):
             # 打不开：这个口现在不归我们（被主程序占着 / 不存在）。
             # 后面几档也不用试了 —— 同一个口打不开一次，九次都一样。
             tried.append({'baud': baud, 'bytes': None, 'family': 'busy'})
-            return {'port': port, 'baud': None, 'family': 'busy', 'features': [],
+            return {'port': port, 'baud': None, 'family': 'busy', 'class': '',
+                    **_vendor_slice(None), 'features': [],
                     'counts': {}, 'bytes': 0, 'tried': tried,
                     'verdict': 'none', 'detail': '', 'confidence': 'low',
                     'note': '串口打不开（可能正被数据面占用）'}
         info = sniff(raw)
         verified = verify(raw)
         tried.append({'baud': baud, 'bytes': len(raw), 'family': info['family'],
+                      'class': info.get('class', ''), **_vendor_slice(info),
                       'features': info['features'], 'counts': info['counts'],
                       'verdict': verified['verdict'], 'detail': verified['detail'],
                       'strict': verified['strict'],
@@ -655,7 +1390,7 @@ def probe_passive(port, bauds=None, window=PASSIVE_WINDOW, on_progress=None):
 
     candidates = [item for item in tried if item['family'] == FAMILY_GNSS]
     if candidates:
-        best = max(candidates, key=lambda item: item.get('score') or (0, 0, 0))
+        best = max(candidates, key=lambda item: item.get('score') or (0, 0, 0, 0))
         others = [item['baud'] for item in candidates if item['baud'] != best['baud']]
         confidence = 'high' if best['verdict'] == 'strict' else 'medium'
         # 有别的档位也叫 gnss：`confidence` 降级，前端会提示"建议复核"。
@@ -666,6 +1401,7 @@ def probe_passive(port, bauds=None, window=PASSIVE_WINDOW, on_progress=None):
         if others:
             note += f'；另有 {len(others)} 档也读到特征（{"、".join(str(b) for b in others)}）'
         return {'port': port, 'baud': best['baud'], 'family': FAMILY_GNSS,
+                'class': best.get('class', ''), **_vendor_slice(best),
                 'features': best['features'], 'counts': best['counts'],
                 'bytes': best['bytes'], 'tried': tried,
                 'verdict': best['verdict'], 'detail': best['detail'],
@@ -676,6 +1412,7 @@ def probe_passive(port, bauds=None, window=PASSIVE_WINDOW, on_progress=None):
     best = max(tried, key=lambda item: item.get('bytes') or 0) if tried else None
     return {'port': port, 'baud': None,
             'family': (best or {}).get('family') or FAMILY_UNKNOWN,
+            'class': '', **_vendor_slice(None),
             'features': [], 'counts': {},
             'bytes': (best or {}).get('bytes') or 0, 'tried': tried,
             'verdict': (best or {}).get('verdict') or 'none',
@@ -707,34 +1444,39 @@ def probe_active(port, bauds=None, window=ACTIVE_WINDOW, on_progress=None):
         raw = _ask(port, baud, window, probes)
         if raw is None:
             tried.append({'baud': baud, 'bytes': None, 'family': 'busy'})
-            return {'port': port, 'baud': None, 'family': 'busy', 'features': [],
+            return {'port': port, 'baud': None, 'family': 'busy', 'class': '',
+                    **_vendor_slice(None), 'features': [],
                     'counts': {}, 'bytes': 0, 'tried': tried, 'active': True,
                     'verdict': 'none', 'detail': '', 'confidence': 'low',
                     'note': '串口打不开（可能正被数据面占用）'}
         info = sniff(raw)
         verified = verify(raw, active=True)
         # 回环档位**必须**打成 noise：它读到的字节数很大（本轮真机 4512B 全是
-        # 自己写出去的东西），如果留在 `FAMILY_GNSS` 里，`_score()` 的第三档
+        # 自己写出去的东西），如果留在 `FAMILY_GNSS` 里，`_score()` 最后那档
         # "字节量兜底"会把它推成最佳档位。回环恰恰说明这一档**根本不通**。
-        family = FAMILY_NOISE if verified.get('loopback') else info['family']
+        loopback = verified.get('loopback', False)
+        family = FAMILY_NOISE if loopback else info['family']
         tried.append({'baud': baud, 'bytes': len(raw), 'family': family,
-                      'features': [] if verified.get('loopback') else info['features'],
-                      'counts': {} if verified.get('loopback') else info['counts'],
+                      'class': '' if loopback else info.get('class', ''),
+                      **_vendor_slice(info, empty=loopback),
+                      'features': [] if loopback else info['features'],
+                      'counts': {} if loopback else info['counts'],
                       'verdict': verified['verdict'], 'reply': verified['reply'],
-                      'loopback': verified.get('loopback', False),
+                      'loopback': loopback,
                       'detail': verified['detail'], 'strict': verified['strict'],
-                      'score': (0, 0, 0) if verified.get('loopback')
+                      'score': (0, 0, 0, 0) if loopback
                                else _score(info, verified)})
 
     candidates = [item for item in tried if item['family'] == FAMILY_GNSS]
     if candidates:
-        best = max(candidates, key=lambda item: item.get('score') or (0, 0, 0))
+        best = max(candidates, key=lambda item: item.get('score') or (0, 0, 0, 0))
         others = [item['baud'] for item in candidates if item['baud'] != best['baud']]
         note = best['detail'] or ''
         if others:
             note += f'；另有 {len(others)} 档也有应答（{"、".join(str(b) for b in others)}）'
             note += '，波特率以驱动默认档为准，请以实际连线为准'
         return {'port': port, 'baud': best['baud'], 'family': FAMILY_GNSS,
+                'class': best.get('class', ''), **_vendor_slice(best),
                 'features': best['features'], 'counts': best['counts'],
                 'bytes': best['bytes'], 'tried': tried, 'active': True,
                 'verdict': best['verdict'], 'detail': best['detail'],
@@ -752,7 +1494,8 @@ def probe_active(port, bauds=None, window=ACTIVE_WINDOW, on_progress=None):
     if loopbacks and best is not None and best.get('loopback'):
         note = (f'各档位均为串口回环（{"、".join(str(b) for b in loopbacks)} 档读到的'
                 f'是探测帧自己），没有真实模块应答')
-    return {'port': port, 'baud': None, 'family': FAMILY_NOISE, 'features': [],
+    return {'port': port, 'baud': None, 'family': FAMILY_NOISE, 'class': '',
+            **_vendor_slice(None), 'features': [],
             'counts': {}, 'bytes': (best or {}).get('bytes') or 0, 'tried': tried,
             'active': True, 'verdict': 'none',
             'detail': (best or {}).get('detail') or '', 'confidence': 'low',
@@ -860,13 +1603,34 @@ def scan(ports=None, bauds=None, active=True, on_progress=None):
 
         item['kind'] = kind
         item['baud_fixed'] = not _rate_free(kind)
+        # 厂牌还空着、但波特率已经确定 → 补一次只读版本查询。
+        #
+        # 这一步只对"认不出厂牌"的口做，代价是每口多 1.2 秒；换来的是
+        # 基准站模式（只播 RTCM、不开 1033）下也能显示厂家 —— 那恰好是
+        # 用户最想知道"这块是谁家的"的时候。已经认出厂牌的（UBX / SBF /
+        # 1033 / 私有语句）不重复问，省掉这一秒。
+        # `baud_fixed` 不能作为这一枪的前提：USB 直连（CDC）的口没有波特率概念，
+        # 但**恰恰是这种口最需要一个厂牌** —— u-blox 的 ZED-F9P 走 USB 时就是
+        # 虚拟串口，出厂只播标准 NMEA（无私有语句），被动扫永远认不出是谁家的；
+        # 而 UBX-MON-VER 在 CDC 上跟波特率无关，照样一问就回。
+        # 2026-11-13 真机实测：COM13 修前 vendor 为空，修后稳定认出 u-blox。
+        if not item.get('vendor') and item.get('baud'):
+            identity = probe_identity(port, item['baud'])
+            if identity.get('vendor'):
+                item.update(identity)
+                item['note'] = ((item.get('note') or '')
+                                + ('；' if item.get('note') else '')
+                                + '厂牌来自主动版本查询')
         if _rate_free(kind):
             # 这个口没有"正确波特率"可言。把选出来的档位保留在 `baud` 里
             # （建链时仍要填一个值，随便填一个能通的就行），但明确标注
             # 它不是设备状态，避免用户以为"扫出来就是这个数"。
+            # `note` 本身已经以 `detail` 开头（见 `probe_passive` 的组装），
+            # 两个都拼会把"NMEA 校验通过 14/14 句"重复一遍。
+            extra = item.get('note') or ''
             item['note'] = ('USB 直连（CDC）：该口没有波特率概念，速率由主机侧协商；'
                             '上面显示的数值只是建链时用的占位值。'
-                            + (' ' + item.get('detail', '') if item.get('detail') else ''))
+                            + (' ' + extra if extra else ''))
             item['confidence'] = 'high' if item['family'] == FAMILY_GNSS else 'low'
         results.append(item)
     return results

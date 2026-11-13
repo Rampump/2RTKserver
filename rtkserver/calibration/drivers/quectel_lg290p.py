@@ -105,6 +105,10 @@ CAPS = {
     'msg_rate': True,         # §6.1
     'rtcm_out': True,         # §6.2
     'err3': True,             # 会返回错误码 3（§2.2）
+    # §7.2 `PQTMRESTOREPAR`：清 NVM 全部配置，重启后回到出厂态（rover + NMEA 全开）。
+    # 标定流程的 PREFLIGHT 用它把"非流动站"的已知模块救回流动站；
+    # **基站上执行等于直接失去基站身份**，只能由流程在用户明确授权的仅测量路径下发。
+    'factory_reset': True,
 }
 
 # 基站播发的 MSM 星座清单（每条独立开关，必须全部下发才算"多星座"）。

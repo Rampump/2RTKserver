@@ -263,8 +263,24 @@ def api_calibration_scan():
         wait    bool    同步等待模式（CLI/脚本用），默认 false
 
     结果**不过滤**：每个口都返回，带 `family`（gnss / unknown / noise / busy）、
-    `features`（nmea / rtcm / ubx / ...）与 `note`。前端据此显示，
+    `class`（rtk / gnss，非 GNSS 口为空）、`vendor`（认得出厂牌才有）、
+    `vendor_confidence`（high / medium / low）、`vendor_evidence`（判定依据，
+    给前端做 tooltip）、`model`（型号，可能为空）、`features`
+    （rtcm / nmea / ubx / sbf / sirf / ashtech / novatel / trimble /
+    nmea_priv / unicore / pq）与 `note`。前端据此显示，
     用户自己决定点哪个口、要不要当成模块 —— 这里不做任何自动选择。
+
+    厂牌判定的证据链（强 → 弱）：
+        RTCM-1033 的 `RECEIVER TYPE`  /  `#VERSION` ASCII 日志头 /
+        UBX·SBF·TSIP·SiRF 专属二进制  /  `$PQTM` 等私有命令族  /
+        私有 NMEA talker（`$PUBX` `$PSTM` …）  /  文本横幅里的厂名
+    认不出就返回空串，**不猜** —— 编一个厂牌比空白更糟。基准站只播 RTCM
+    且没开 1033 时，扫描还会补发一次只读版本查询（`$PQTMVERNO` 等）来认。
+
+    `class` 与 `family` 的分工：`family` 回答"是不是 GNSS 设备"，
+    `class` 回答"能不能差分"。判据只有一条硬证据 —— CRC-24Q 校验通过的
+    RTCM3 帧；只有 NMEA / UBX / 私有语句的口一律标 `gnss`，
+    那是"知道自己在哪"，不是"厘米级"。
     """
     body = request.get_json(silent=True) or {}
     ports = body.get('ports')
@@ -323,7 +339,7 @@ def api_calibration_detect():
     body = request.get_json(silent=True) or {}
     ok, message, payload = calib.start_diagnose(
         port=body.get('port'), baud=_baud_param(body.get('baud')),
-        module=body.get('module'))
+        module=body.get('module'), force=bool(body.get('force')))
     if not ok:
         busy = '已有标定任务' in str(message)
         return jsonify({'ok': False, 'error': _mask(message),

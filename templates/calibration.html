@@ -64,6 +64,11 @@
                                    background: rgba(220, 38, 38, .07); }
     .cal-detect-progress.is-done { border-color: var(--success, #16a34a);
                                    background: rgba(22, 163, 74, .07); }
+    /* 「仍要强制识别」只在端口没被判定为 GNSS 时出现，所以样式要够显眼、
+       但别做成危险色 —— 它是个逃生口，不是错误。 */
+    .cal-force-wrap { display: inline-flex; align-items: center; gap: 6px;
+                      font-size: 13px; color: var(--warning, #b45309); }
+    .cal-force-wrap[hidden] { display: none; }
     .cal-detect-text { flex: 1 1 240px; min-width: 0; }
     .cal-detect-timer { font-variant-numeric: tabular-nums; opacity: .8; }
     /* 轨道只在"按档位推进"时有意义；观测阶段是固定时长，改用时间占比驱动 */
@@ -344,6 +349,13 @@
               <button type="button" class="btn btn-secondary" id="cal-detect">
                 <i class="fa fa-microchip" aria-hidden="true"></i><span data-i18n="cal.detect">读取模块信息</span>
               </button>
+              <!-- 扫描判定为 unknown / noise / busy 的口，识别一次要
+                   「自动探测 + 8 档波特率 × 6 个驱动」≈ 45 秒，结果必然是"无应答"。
+                   所以默认禁用，勾这里才显式放行（JS 侧 refreshDetectGate）。 -->
+              <label class="cal-force-wrap" id="cal-force-wrap" hidden>
+                <input type="checkbox" id="cal-force-detect">
+                <span data-i18n="cal.detect.force">该口未判定为 GNSS，仍要强制识别（约 45 秒）</span>
+              </label>
               <span class="cal-muted" data-i18n="cal.detect_hint">读固件版本、硬件编号与当前工作模式，不改动任何配置。</span>
             </div>
 

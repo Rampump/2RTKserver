@@ -171,7 +171,12 @@ def capture(driver, task_id='', port='', module=None):
         warn(f'读取 RTCM 配置失败（还原时将跳过 MSM 档位）：{message}')
 
     # ---- 关键报文速率 ----
-    for name in RATE_TARGETS:
+    # 清单优先取驱动声明的（`ZEDF9P.BACKUP_RATES`）：
+    # `RATE_TARGETS` 是 Quectel 口径，套到 u-blox 上会读一堆不存在的键
+    # （1006 只能输入、1033 无键、107X 是通配写法），每项都会变成一条
+    # "速率没读到"的假警告 —— 真正的失败被淹没在 7 条黄字里。
+    targets = tuple(getattr(driver, 'BACKUP_RATES', None) or RATE_TARGETS)
+    for name in targets:
         rate, offset = _read_rate(driver, name)
         backup['rates'][name] = rate
         if offset is not None:

@@ -57,6 +57,7 @@ STAGE_TEXT = {
     'OPEN': '打开串口',
     'DETECT': '识别模块',
     'BACKUP': '备份原配置',
+    'PREFLIGHT': '检查模块输出',
     'WRITE_COORD': '写入坐标',
     'BASE_SETUP': '切换工作模式',
     'MSG_SETUP': '配置报文输出',
@@ -97,7 +98,7 @@ STAGE_TEXT_RESTORE = {
 
 STAGE_PROGRESS = {
     'IDLE': 0, 'PREPARE': 3, 'HOLD': 8, 'OPEN': 14, 'DETECT': 20,
-    'BACKUP': 26,
+    'BACKUP': 26, 'PREFLIGHT': 26,
     'WRITE_COORD': 36, 'BASE_SETUP': 46, 'MSG_SETUP': 56, 'SAVE': 64,
     'SVIN_CFG': 30, 'SVIN_WAIT': 40,
     'ROVER_SETUP': 24, 'NMEA_SETUP': 28, 'GGA_WAIT': 32, 'CORS_CONNECT': 36,
@@ -292,6 +293,12 @@ class CalibrationService:
                                 'total': len(merged),
                                 'gnss': len(hits),
                                 'ports': [item['port'] for item in hits],
+                                # 读到 RTCM 差分数据（CRC 通过）的口 —— 扫描器
+                                # 用它判 `class='rtk'`。跟 `ports` 分开列，
+                                # 是因为"是 GNSS 模块"和"能差分"在现场是两件事：
+                                # 前者可能是九块九的单点定位模块。
+                                'rtk': [item['port'] for item in hits
+                                        if item.get('class') == 'rtk'],
                                 # 需要用户复核波特率的口：扫出来有多档都能对上，
                                 # 或者扫到的档位没有校验位撑腰（confidence != high）。
                                 # 只是个提示清单，不代表这些口不能用。
@@ -300,6 +307,16 @@ class CalibrationService:
                                 # 没有波特率概念的口（USB 直连 CDC）。
                                 'rate_free': [item['port'] for item in merged
                                               if item.get('baud_fixed') is False],
+                                # 认得出的厂牌：`{端口: 厂牌}`，只收非空的。
+                                # 现场最常问的一句话是"这个口是哪家的模块"，
+                                # 扫描器已经从 RTCM-1033 / 私有协议 / 横幅里
+                                # 拿到了答案，别让它烂在单个端口条目里。
+                                'vendors': {item['port']: item['vendor']
+                                            for item in merged
+                                            if item.get('vendor')},
+                                'vendor_names': sorted({item['vendor']
+                                                        for item in hits
+                                                        if item.get('vendor')}),
                             },
                         })
                 except Exception as e:                # noqa: BLE001 - 扫描失败不能拖垮服务
@@ -474,8 +491,14 @@ class CalibrationService:
 
     # ---------- 启动：P0 只读诊断 ----------
     def start_diagnose(self, port=None, baud=None, seconds=DEFAULT_OBSERVE_SECONDS,
-                       task_id=None, module=None):
-        """启动一次 P0 只读诊断。返回 `(success, message, status)`。"""
+                       task_id=None, module=None, force=False):
+        """启动一次 P0 只读诊断。返回 `(success, message, status)`。
+
+        `force=True` 表示"这个口没被扫描判定为 GNSS，但我仍要试"：
+        只有它会允许"自动探测 + 未填波特率"走全档枚举（8 档 × 6 驱动 ≈ 45 秒）。
+        默认不枚举 —— 前端已按扫描结果的 `family` 挡住非 GNSS 端口，
+        这里再兜一层，避免点错口白等。
+        """
         port = self._resolve_port(port)
         if not port:
             return False, '没有指定串口，配置里也没有设置串口', self.status()
@@ -491,7 +514,8 @@ class CalibrationService:
         return self._start_task(
             'diagnose', {'port': port, 'baud': baud, 'seconds': seconds,
                          'module': _clean_module(module),
-                         'baud_explicit': baud_explicit},
+                         'baud_explicit': baud_explicit,
+                         'force': bool(force)},
             task_id=task_id,
             log_text=f'只读诊断：{port} @ {baud}，观测 {seconds} 秒')
 
@@ -835,7 +859,8 @@ class CalibrationService:
 
         # ③ 都不成立：返回 None 由调用方决定（只测不写可以退化到 PassiveDriver，
         #    其它任务必须失败）。文案在这里拼好，避免上层再猜一遍病因。
-        return None, self._detect_failure_text(channel, message, attempts), attempts, ''
+        return None, self._detect_failure_text(
+            channel, message, attempts, allow_baud_scan), attempts, ''
 
     def _scan_bauds(self, lease, only):
         """依次换波特率重开串口再识别。成功返回 `(driver, baud)`，全失败返回 None。
@@ -977,7 +1002,7 @@ class CalibrationService:
         return head + [b for b in tail if b not in head]
 
     @staticmethod
-    def _detect_failure_text(channel, message, attempts):
+    def _detect_failure_text(channel, message, attempts, allow_baud_scan=True):
         """把"识别不到模块"翻译成用户能照做的下一步（方案 §14 #2 / #25）。"""
         received = getattr(channel, 'rx_bytes', 0)
         noise = (getattr(channel, 'counters', {}) or {}).get('noise', 0)
@@ -994,6 +1019,10 @@ class CalibrationService:
         else:
             lines.append('串口一个字节都没收到——检查模块供电、USB 线（有的线只供电不传数据）、'
                          '以及 TX/RX 是否接反')
+        if not allow_baud_scan:
+            lines.append('本次**没有**逐档枚举波特率（自动探测 + 未填波特率默认不扫，'
+                         '避免白等几十秒）。若确认这个口上就是模块，请先「扫描串口」看它'
+                         '在哪一档说话，或填上波特率，或点「强制识别」')
         return '；'.join(lines)
 
     def _worker(self):
@@ -1032,8 +1061,16 @@ class CalibrationService:
             only = [task.get('module')] if task.get('module') else None
             self._set_stage('DETECT',
                             f'识别模块型号（{"按所选型号 " + only[0] if only else "自动探测"}）')
+            # 自动探测 + 未填波特率 = 全档枚举（8 档 × 6 驱动 ≈ 45 秒）。
+            # 诊断任务默认**不**做这件事：前端已按扫描结果的 family 挡住非 GNSS
+            # 端口，这里是第二道闸。要强行试（老设备/扫描误判）必须显式 force。
+            # 选了型号时不限：那种枚举只问一个驱动，几十秒变几秒。
+            allow_scan = not task.get('baud_explicit')
+            if (task.get('action') or 'diagnose') == 'diagnose' and not only \
+                    and not task.get('force'):
+                allow_scan = False
             driver, message, attempts, note = self._detect_module(
-                lease, only, allow_baud_scan=not task.get('baud_explicit'))
+                lease, only, allow_baud_scan=allow_scan)
             if note:
                 self._set_stage('DETECT', f'{message}（{note}）')
             if driver is None:
@@ -1206,8 +1243,26 @@ class CalibrationService:
 
         # ---- 2. 备份标定前配置（还原任务用现成的备份，不再覆盖它）----
         if readonly:
-            snapshot = {'ok': True, 'skipped': True, 'readonly': True}
-            self._set_stage('BACKUP', '只测不写：不备份、不修改模块配置')
+            # 只测不写**也要采快照**，只是默认不落盘（见下）。
+            #
+            # 为什么不能像以前那样直接 `{'skipped': True}`：PREFLIGHT 阶段对
+            # "已知型号 + 非流动站"会执行**恢复出厂**（用户明确授权），那是真的
+            # 清 NVM —— 工作模式、坐标、波特率、报文速率一起没了。没有快照，
+            # 收尾文案里"可用「还原标定前配置」恢复"就是一句空话。
+            #
+            # 更糟的是**歧义覆盖**：backup.json 是"只留最近一次"的，只测不写
+            # 不写它，文件里留着的就是**上一次别的模块**的备份。用户在这种情况下
+            # 点还原，等于把另一块模块的坐标/模式写进当前这块 —— 比不还原严重得多。
+            #
+            # 采集本身是纯读操作，不违反"一个字节都不写模块"的契约。
+            snapshot = backup_mod.capture(driver, task_id=self._task_id, port=lease.port,
+                                          module=dict(plan.module))
+            snapshot['readonly'] = True
+            self._set_stage('BACKUP', '只测不写：采集快照备查（不改模块配置）')
+            if not snapshot.get('ok', True):
+                plan.warnings.append(
+                    '快照不完整（本次未改动模块，不影响只读测量）：'
+                    + '；'.join((snapshot.get('warnings') or [])[:3]))
         elif is_restore:
             snapshot = backup_mod.load()
             usable, why = backup_mod.usable(snapshot)
@@ -1279,6 +1334,12 @@ class CalibrationService:
             raise TaskFailed(e.message) from e
         finally:
             self._writer = None
+            # 恢复出厂可能把模块波特率打回默认档（PREFLIGHT 的已知风险）。
+            # 租约里必须跟着改，否则任务结束后状态还显示旧档位，
+            # 用户照着它去配数据面会连不上模块。成功/失败两条路都要同步。
+            moved = (getattr(writer, 'result', {}) or {}).get('baud_after_reset') or {}
+            if isinstance(moved, dict) and moved.get('to'):
+                lease.baud = int(moved['to'])
 
         result['summary'] = _summarize_write(result, plan)
         self._result = result
@@ -2077,9 +2138,10 @@ def get_service():
         return _SERVICE
 
 
-def start_diagnose(port=None, baud=None, seconds=DEFAULT_OBSERVE_SECONDS, module=None):
+def start_diagnose(port=None, baud=None, seconds=DEFAULT_OBSERVE_SECONDS, module=None,
+                   force=False):
     return get_service().start_diagnose(port=port, baud=baud, seconds=seconds,
-                                        module=module)
+                                        module=module, force=force)
 
 
 def start_write(port=None, baud=None, ecef=None, lat=None, lon=None, height=None,

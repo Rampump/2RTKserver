@@ -969,6 +969,7 @@ select.form-input {
    设下限，长文本才有地方换行：
      port   → 左右两列（串口名 / 波特率）定宽，它们是定长短串，不该被压缩
      family → 定宽，判定文案只有几个字
+     vendor → 定宽，厂牌（Quectel / u-blox / Septentrio …）是短串
      feats  → 自然宽度（chip 自己会换行，不参与挤压）
      note   → 弹性最小，给 12ch 下限，允许中文按字换行
      desc   → 吃满剩余空间，as many ch as fits
@@ -984,17 +985,21 @@ select.form-input {
 .scan-table th:first-child,
 .scan-table td:first-child { min-width: 5.5em; }
 
+/* 2 波特率 / 3 判定 / 4 厂家：三个定宽短列 */
 .scan-table th:nth-child(2),
 .scan-table td:nth-child(2) { min-width: 5em; }
 
 .scan-table th:nth-child(3),
 .scan-table td:nth-child(3) { min-width: 4em; }
 
-.scan-table th:nth-child(5),
-.scan-table td:nth-child(5) { min-width: 16em; }
+.scan-table th:nth-child(4),
+.scan-table td:nth-child(4) { min-width: 7em; }
 
 .scan-table th:nth-child(6),
-.scan-table td:nth-child(6) { min-width: 18em; }
+.scan-table td:nth-child(6) { min-width: 16em; }
+
+.scan-table th:nth-child(7),
+.scan-table td:nth-child(7) { min-width: 18em; }
 
 .scan-table th {
   padding: 4px 8px;
@@ -1033,7 +1038,9 @@ select.form-input {
   gap: 6px;
 }
 
-/* 家族辨识条：gnss 绿、noise 灰、busy 橙、unknown 蓝。 */
+/* 家族辨识条：rtk 青、gnss 绿、noise 灰、busy 橙、unknown 蓝。
+   rtk 单独一色是必要的 —— 它和 gnss 都能用，但只有前者能差分，
+   现场靠这一条色带就能把"能标定的"和"只能看定位的"分开。 */
 .scan-dot {
   width: 3px;
   height: 14px;
@@ -1042,6 +1049,7 @@ select.form-input {
   flex: none;
 }
 
+.scan-fam-rtk .scan-dot { background: #0d9488; }
 .scan-fam-gnss .scan-dot { background: #16a34a; }
 .scan-fam-unknown .scan-dot { background: #2563eb; }
 .scan-fam-noise .scan-dot { background: var(--muted); }
@@ -1082,6 +1090,44 @@ select.form-input {
   word-break: break-word;
   /* 中文备注按字换行没问题，但 `USB-SERIAL CH340 (COM3) · 1A86:7523`
      这类带连字符/冒号的长串不设这个就会整体不换行，把整列顶宽。 */
+  overflow-wrap: anywhere;
+}
+
+/* 「厂家」列。
+   用等宽字体 + 轻微底色，让它在一堆 11px 灰字里能一眼扫到 ——
+   用户看扫描表时的第一个问题通常是"这个口是哪家的模块"。
+   认不出时整格是灰色破折号（`is-unknown`），鼠标悬停给出"为什么认不出"，
+   避免让人以为界面漏渲染了。 */
+.scan-vendor-cell { white-space: nowrap; }
+
+.scan-vendor {
+  display: inline-block;
+  padding: 1px 7px;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--ink);
+  background: var(--accent-soft);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  cursor: help;
+}
+
+.scan-vendor.is-unknown {
+  color: var(--muted);
+  background: transparent;
+  border-color: transparent;
+  cursor: help;
+}
+
+/* 型号挂在厂牌下面一行：`Quectel` / `LG290P`。
+   型号来自 RTCM-1033 或 `$PQTMVERNO`，比厂牌更具体，但也更容易缺，
+   所以只给一小行灰字，不抢厂牌的位置。 */
+.scan-model {
+  margin-top: 2px;
+  font-size: 10.5px;
+  color: var(--muted);
+  white-space: normal;
   overflow-wrap: anywhere;
 }
 

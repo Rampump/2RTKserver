@@ -196,6 +196,9 @@ CAPS = {
     'rtcm_out': True,         # 同上
     'heading2': False,        # 双天线 Heading2 定向，子类按手册打开
     'err3': False,            # 简化 ASCII 不返回数字错误码，只有"不响应"或 `$command,response:...`
+    # `FRESET`：清 NVM 全部配置。恢复出厂后串口参数也可能回到默认档，
+    # PREFLIGHT 恢复出厂后必须重新枚举波特率再识别。
+    'factory_reset': True,
 }
 
 # 基站播发的 MSM 星座清单。N4 是**逐条消息号**独立开关（`rtcm1074 com2 1`），

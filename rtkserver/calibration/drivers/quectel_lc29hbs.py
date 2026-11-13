@@ -124,8 +124,16 @@ CAPS = {
     'ant_info': False,
     'ant_delta': False,
     'msg_rate': True,
+    # 显式声明"有收敛进度语句"。**这一位不能省**：不写时流程层按默认 True 处理，
+    # 而驱动又没实现 `enable_survey_status()`（早先正是这种状态），于是
+    # `_step_svin_cfg()` 写完 survey 参数后必定 `WriteFailed` —— 本型号唯一能做的
+    # survey-in 基准站被自己判死。声明出来，SVIN_WAIT 才走"按观测次数判收敛"。
+    'svin_has_status': True,
     'rtcm_out': True,
     'err3': True,
+    # §2.2.3 `PQTMRESTOREPAR`：清 NVM。本型号是单基站模块，恢复出厂后仍是
+    # 基准站语义，不会"变成流动站"——仅测量路径会在 PREFLIGHT 提前拦掉它。
+    'factory_reset': True,
 }
 
 # PAIR001 的结果码（§2.3.1）
@@ -205,6 +213,14 @@ class LC29HBSDriver(BaseDriver):
     # 只有 `PAIR864` 改波特率要重启（§2.3.8 备注 1，那一步本来就由用户断电完成）。
     # 流程层的 RESTART 步骤据此跳过，否则每次标定都会卡在"模块没有重启成功"。
     RESTART_REQUIRED = False
+
+    # 恢复出厂不会让这块模块变成流动站，理由有两层：
+    #   1) 它是单模固件，没有 `PQTMCFGRCVRMODE`，出厂默认就是"基准站语义 + 只播 RTCM"；
+    #   2) 它连软重启命令都没有，`PQTMRESTOREPAR` 要断电才生效 ——
+    #      实测（COM10）下发后模式/坐标/RTCM 输出全部原样未变。
+    # 仅测量模式遇到它会想靠恢复出厂拉回流动站，那是白折腾（轻则白清 NVM，
+    # 重则连清都没清却报告成功）。PREFLIGHT 靠这条声明在**下发之前**就拦下来。
+    FACTORY_RESET_ROLE = 'base'
 
     # 官方波特率（§2.3.8 PAIR864 的 <Baudrate> 取值范围，文档原样十档）。
     # 注意 4800 与 3000000 是 LG290P 根本没有的档位 —— 这就是"每型号存一份"
@@ -580,6 +596,34 @@ class LC29HBSDriver(BaseDriver):
             return False, '还没有收到 PQTMSVINSTATUS（模块尚未开始测量或速率是 0）', {}
         return True, '已读到测量状态', status
 
+    def enable_survey_status(self, enabled=True, rate=1):
+        """开关 `$PQTMSVINSTATUS` 输出（§2.2.5 `PQTMCFGMSGRATE`，必须带 `MsgVer`）。
+
+        **基类那句"本型号没有进度语句"对本型号是错的**：`CAPS['msg_rate']=True`、
+        `RATE_TARGETS` 里明写着 `PQTMSVINSTATUS`，它只是没有"NMEA 语句速率开关"，
+        进度语句走私有 `PQTMCFGMSGRATE`。出厂默认是**关的** —— 2026-11-13 真机
+        （COM3，出厂态）连读 8 秒一条都没有，`channel.cache['svin']` 全空，
+        单看现象很像"这个型号不会播"，其实只是没人给它开过。
+
+        不实现它的后果比文案难看得多：`_step_svin_cfg()` 在写完 survey 参数之后
+        才调本方法，拿到 `ok=False`，而 `_caps('svin_has_status', True)` 因为
+        CAPS 没声明这一位、按默认 `True` 处理 → 直接 `WriteFailed('SVIN_CFG')`。
+        也就是**这个型号唯一能干的活（survey-in 做基准站）会在参数已写进模块之后
+        被自己判死**，用户看到的是"打开收敛状态输出失败"，而真正原因是驱动缺一步。
+        """
+        value = _to_int(rate)
+        if value is None:
+            return False, f'速率必须是整数，收到 {rate!r}', {'error': 'bad_rate'}
+        if not enabled:
+            value = 0
+        ok, message, data = self.set_message_rate('PQTMSVINSTATUS', value)
+        if not ok:
+            return False, message, data
+        if value:
+            return True, (f'已打开收敛状态输出（$PQTMSVINSTATUS {value} Hz），'
+                          f'SVIN_WAIT 可以按观测次数判断收敛'), data
+        return True, '已关闭收敛状态输出（$PQTMSVINSTATUS 速率 0）', data
+
     # ==================== 四、报文输出 ====================
     def config_messages(self, items):
         """配输出速率。
@@ -924,9 +968,35 @@ class LC29HBSDriver(BaseDriver):
             {'error': 'no reboot command'}
 
     def factory_reset(self):
+        """下发 `PQTMRESTOREPAR`。**本型号没有软重启命令，必须断电才生效。**
+
+        2026-11-13 真机实测（COM10，恢复出厂前 mode=base / 坐标 fixed）：
+        下发后 `get_mode()` 仍读回 base、`PQTMCFGSVIN` 的 ECEF 一字未变、
+        串口里照旧播 1005 + MSM4 —— 也就是说**命令收了，但配置没动**，
+        因为这条命令要等模块重新上电才落到运行态。
+
+        同日断电重插后的复测（补上"到底生没生效"这一半）：
+          - 之前写死的固定坐标**被清掉了**：`PQTMCFGSVIN` 回到
+            `survey_in / count=43200 / acc=15.0 / ECEF=0`，
+            播出的 1005 变成正在收敛的均值（45 秒内漂移约 8 cm，ind=1）；
+          - 但 `mode` **仍然是 base** —— 单模固件出厂就是基准站语义。
+        所以"恢复出厂"对本型号只能清配置，永远变不成流动站。
+
+        老文案写的是"重启后生效"，而本型号 `reboot()` 返回不支持
+        （`RESTART_REQUIRED=False`），流程层那条"重启"是个空操作 ——
+        于是一句"已下发恢复出厂"会被当成"已经清干净了"，实际什么都没变。
+        这里把话说清楚，并把 `needs_power_cycle` 放进返回数据，
+        让上层能提示用户"拔电重插"，而不是让用户对着没变的配置猜。
+        """
         ok, message, data = self.request('factory_reset')
         if ok:
-            return True, '已下发恢复出厂，重启后生效', data
+            payload = dict(data or {})
+            payload['needs_power_cycle'] = True
+            return (True,
+                    '已下发恢复出厂；本型号没有软重启命令，**需要断电重插后才生效**。'
+                    '断电重插后会清空已写入的固定坐标、回到 Survey-in 出厂默认'
+                    '（43200 次 / 15 米），但工作模式仍是基准站 —— 单模固件变不成流动站',
+                    payload)
         return False, message, data
 
     # ==================== 八、解析 ====================

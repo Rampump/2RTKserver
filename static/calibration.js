@@ -1110,7 +1110,10 @@
     renderScanPanel();
     var ports = data.ports || [];
     var gnss = ports.filter(function (p) { return p.family === 'gnss'; });
-    var target = gnss[0];
+    // 预填时**优先挑读到 RTCM 的口**：同样都判定为 GNSS，能差分的那个
+    // 才可能是这次要标的模块。只在输入框为空时预填，用户随时能改 ——
+    // 这是排序建议，不是替他决定。
+    var target = gnss.filter(function (p) { return p.class === 'rtk'; })[0] || gnss[0];
     var input = $('cal-port');
     if (input && !input.value.trim() && target) {
       pickPort(portName(target));
@@ -1130,15 +1133,26 @@
       return;
     }
     var n = gnss.length;
+    // RTK 的口单独数：`class` 是后端按"CRC 通过的 RTCM 帧"判的，
+    // 跟 GNSS 不是一回事 —— 只发 NMEA 的廉价模块也算 GNSS，但它不能差分。
+    var rtk = ports.filter(function (p) { return p.class === 'rtk'; }).length;
     var verify = (data.summary && data.summary.verify) || [];
     var rateFree = (data.summary && data.summary.rate_free) || [];
-    var hint = t('cal.scan.done', { total: ports.length, gnss: n });
+    var hint = t('cal.scan.done', { total: ports.length, gnss: n, rtk: rtk });
     if (verify.length) hint += ' ' + t('cal.scan.done.verify', { ports: verify.join('、') });
     if (rateFree.length) hint += ' ' + t('cal.scan.done.ratefree', { ports: rateFree.join('、') });
+    // 认出厂牌就报一下：这行是"扫完看结果"的第一眼，比让用户自己
+    // 逐行去读「厂家」列要快。
+    var vendorNames = (data.summary && data.summary.vendor_names) || [];
+    if (vendorNames.length) {
+      hint += ' ' + t('cal.scan.done.vendors', { vendors: vendorNames.join('、') });
+    }
     // 耗时也留在常驻提示里：进度条 1.8 秒后收起，用户回头看就只剩这一行。
     // 扫描慢是常态（3 个口全无应答 30 秒+），把数字留着才好判断"要不要换个口再扫"。
     hint += ' ' + t('cal.scan.done.elapsed', { elapsed: elapsed.toFixed(1) });
     setPortHint(hint, n ? 'is-ok' : 'is-info');
+    // 扫描结果是判定「读取模块信息」能否点的唯一依据，扫完立刻重算
+    refreshDetectGate();
   }
 
   function renderScanPanel() {
@@ -1172,6 +1186,82 @@
     var key = 'cal.scan.fam.' + family;
     var text = t(key);
     return (text === key) ? (family || '—') : text;
+  }
+
+  // 判定列：优先用后端给的 `class`（rtk / gnss），没有才退回 family。
+  //
+  // 为什么要分两层：`family='gnss'` 把"接 RTCM 差分的基准站"和"九块九的
+  // 单点定位 GPS 模块"混成同一档，用户照着挑，挑到便宜货要等标定跑到
+  // `FIX_WAIT` 才发现它不会差分。`class` 的判据只认一条硬证据 ——
+  // CRC 通过后的 RTCM 帧。没有差分数据就老实说"GNSS 模块"，不吹成 RTK。
+  //
+  // 但反过来也不能踩坑：2026-11-13 真机接入一块**流动站**（$QXATT/$QXDRS，
+  // 4 星座 10 Hz，单点解 19 星）时它一帧 RTCM 都不播，扫描器判 `gnss`。
+  // 曾经这里的 tooltip 写"可能只支持单点定位"，等于把一台流动站说成廉价
+  // 单点模块 —— `class` 描述的是"这个口此刻在播什么"，不是"这块硬件能不能
+  // 差分"。tooltip 已改成点明这层区别。
+  function verdictLabel(p) {
+    var cls = p && p.class;
+    if (cls) {
+      var key = 'cal.scan.class.' + cls;
+      var text = t(key);
+      if (text !== key) return text;
+    }
+    return familyLabel(p && p.family);
+  }
+
+  // 判定列的 tooltip：把"凭什么这么判"讲清楚。
+  // 用户最常问的就是"你凭什么说它是 RTK"——答案只有一条：CRC 通过的 RTCM 帧。
+  function verdictTip(p) {
+    var cls = p && p.class;
+    if (!cls) return '';
+    var key = 'cal.scan.class.' + cls + '.tip';
+    var text = t(key);
+    return (text === key) ? '' : text;
+  }
+
+  // 当前输入框里的端口在扫描结果中的家族判定。
+  // 返回 null 表示"扫描结果里没有这个口"（用户手填/还没扫过）——
+  // 这种情况不能拦：手填 COM12 而扫描只覆盖了 COM1~11 是常态。
+  function portFamily(port) {
+    var name = String(port || '').trim();
+    if (!name || !STATE.scan || !STATE.scan.ports) return null;
+    var ports = STATE.scan.ports;
+    for (var i = 0; i < ports.length; i++) {
+      if (portName(ports[i]) === name) return ports[i].family || 'unknown';
+    }
+    return null;
+  }
+
+  // 「读取模块信息」的准入闸门。
+  // 为什么必须挡：未知/噪声口上识别一次要"自动探测 + 8 档波特率 × 6 个驱动"，
+  // 真机实测 45 秒起步，而结果必然是"模块无应答"。后端已经在诊断任务里
+  // 关掉了默认枚举，这里再把按钮禁掉，用户就不会白点。
+  // 逃生口：勾「仍要强制识别」= 显式告诉后端 force=true，允许全档枚举。
+  function refreshDetectGate() {
+    var btn = $('cal-detect');
+    if (!btn) return;
+    var port = ($('cal-port') && $('cal-port').value.trim()) || '';
+    var fam = portFamily(port);
+    var blocked = !!fam && fam !== 'gnss';
+    var box = $('cal-force-detect');
+    var wrap = $('cal-force-wrap');
+    if (wrap) wrap.hidden = !blocked;
+    if (!blocked) {
+      if (box) box.checked = false;
+    }
+    var force = !!(blocked && box && box.checked);
+    var lock = blocked && !force;
+    btn.dataset.famBlocked = lock ? '1' : '0';
+    if (lock) {
+      btn.disabled = true;
+      // 原因只放 title 与旁边的强制开关上，不抢 `cal-port-hint` ——
+      // 那行要留给扫描汇总（口数/耗时），否则用户扫完看不到结果。
+      btn.title = t('cal.err.detect_not_gnss', { fam: familyLabel(fam) });
+    } else {
+      btn.disabled = !!STATE.running;
+      btn.title = '';
+    }
   }
 
   // 端口类型 → 显示名。`usb-cdc` 是"这口没有波特率"的那一类，
@@ -1217,6 +1307,42 @@
     return t('cal.scan.ev.passive', { port: port, baud: baud });
   }
 
+  // 厂牌那一格。三种情况分开：
+  //   认出了厂牌 → 厂牌名（带证据 tooltip），能带出型号就再挂一行小字
+  //   认不出     → 破折号 + 说明"为什么认不出"，别让人以为是界面没做
+  //   USB 口     → 同上，厂牌只能从数据里认，VID 只能说明转接芯片是谁家的
+  function vendorCellHtml(port) {
+    var vendor = port.vendor || '';
+    if (!vendor) {
+      return '<span class="scan-vendor is-unknown" title="'
+        + escapeHtml(t('cal.scan.vendor.unknown.tip')) + '">—</span>';
+    }
+    var html = '<span class="scan-vendor" title="' + escapeHtml(vendorTip(port)) + '">'
+      + escapeHtml(vendor) + '</span>';
+    var model = port.model || '';
+    if (model) {
+      // 型号常常直接包含厂名（RTCM-1033 的 `Quectel  LG290P`），
+      // 已有厂牌在上头时就把重复的前缀去掉，避免一行里写成
+      // "Quectel / Quectel LG290P"。
+      var short = model.replace(new RegExp('^' + vendor.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*', 'i'), '');
+      if (short && short !== model) model = short;
+      html += '<div class="scan-model">' + escapeHtml(model) + '</div>';
+    }
+    return html;
+  }
+
+  // 厂牌证据：后端把"凭什么认为是这家的"逐条列好了，原样显示。
+  // 加一句置信度说明 —— low 的那条是"文本里出现了厂名"，可能是集成商写的，
+  // 不标注的话用户会拿它当定论。
+  function vendorTip(port) {
+    var lines = (port.vendor_evidence || []).slice();
+    if (!lines.length) lines = [t('cal.scan.vendor.novidence')];
+    var conf = port.vendor_confidence || '';
+    if (conf === 'low') lines.push(t('cal.scan.vendor.low'));
+    else if (conf === 'medium') lines.push(t('cal.scan.vendor.medium'));
+    return lines.join('\n');
+  }
+
   function scanTableHtml(ports) {
     if (!ports.length) {
       return '<p class="scan-note">' + escapeHtml(t('cal.scan.empty_row')) + '</p>';
@@ -1236,7 +1362,8 @@
       if (p.vid && p.pid) detail += (detail ? ' · ' : '') + p.vid + ':' + p.pid;
       var kind = kindLabel(p.kind);
       if (kind) detail += (detail ? ' · ' : '') + kind;
-      var rowClass = 'scan-row scan-fam-' + escapeHtml(p.family || 'unknown');
+      // 厂牌在上一列单独显示，这里不再前缀一遍（否则一行里出现两次）。
+      var rowClass = 'scan-row scan-fam-' + escapeHtml(p.class || p.family || 'unknown');
       if ((p.confidence || 'low') !== 'high' && p.family === 'gnss') rowClass += ' is-unverified';
       if (portName(p) === current) rowClass += ' is-current';
       return ''
@@ -1245,7 +1372,9 @@
         + '<td><span class="scan-dev"><span class="scan-dot"></span>'
         + escapeHtml(portName(p)) + '</span></td>'
         + '<td class="scan-baud">' + baudCellHtml(p) + '</td>'
-        + '<td>' + escapeHtml(familyLabel(p.family)) + '</td>'
+        + '<td class="scan-verdict" title="' + escapeHtml(verdictTip(p)) + '">'
+        + escapeHtml(verdictLabel(p)) + '</td>'
+        + '<td class="scan-vendor-cell">' + vendorCellHtml(p) + '</td>'
         + '<td><div class="scan-feats">' + (feats || '<span class="scan-note">—</span>') + '</div></td>'
         + '<td class="scan-note">' + escapeHtml(p.note || '') + '</td>'
         + '<td class="scan-desc">' + escapeHtml(detail) + '</td>'
@@ -1256,6 +1385,7 @@
       + '<th>' + escapeHtml(t('cal.scan.col.port')) + '</th>'
       + '<th>' + escapeHtml(t('cal.scan.col.baud')) + '</th>'
       + '<th>' + escapeHtml(t('cal.scan.col.family')) + '</th>'
+      + '<th>' + escapeHtml(t('cal.scan.col.vendor')) + '</th>'
       + '<th>' + escapeHtml(t('cal.scan.col.features')) + '</th>'
       + '<th>' + escapeHtml(t('cal.scan.col.note')) + '</th>'
       + '<th>' + escapeHtml(t('cal.scan.col.desc')) + '</th>'
@@ -1561,6 +1691,15 @@
     if (otherOpBusy('detect')) { showError(t('cal.err.op_busy')); return; }
     var port = $('cal-port').value.trim();
     if (!port) { showError(t('cal.err.need_port')); return; }
+    // 第二道闸：按钮可能被键盘/脚本绕过 disabled，这里再判一次。
+    var fam = portFamily(port);
+    var forceBox = $('cal-force-detect');
+    var force = !!(forceBox && forceBox.checked);
+    if (fam && fam !== 'gnss' && !force) {
+      showError(t('cal.err.detect_not_gnss', { fam: familyLabel(fam) }));
+      refreshDetectGate();
+      return;
+    }
     var baud = baudValue();
     var btn = $('cal-detect');
     if (btn) btn.disabled = true;
@@ -1582,7 +1721,10 @@
       body: JSON.stringify({
         port: port, baud: baud,
         // 同理只发手选型号：自动识别就让后端自己去认
-        module: pickedModuleId()
+        module: pickedModuleId(),
+        // force 只在用户勾了「仍要强制识别」时为 true：
+        // 后端据它决定要不要对"自动探测 + 未填波特率"做全档枚举（约 45 秒）。
+        force: force
       })
     })
       .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
@@ -1592,7 +1734,7 @@
           failDetectProgress(res.body.error || t('cal.err.detect'));
           showError(res.body.error || t('cal.err.detect'));
           DETECT_UI.started = 0;
-          if (btn) btn.disabled = false;
+          refreshDetectGate();
           setOpBusy('detect', false);
           return;
         }
@@ -1607,7 +1749,7 @@
         failDetectProgress(t('cal.err.detect'), err.message);
         showError(t('cal.err.detect') + ': ' + err.message);
         DETECT_UI.started = 0;
-        if (btn) btn.disabled = false;
+        refreshDetectGate();
         setOpBusy('detect', false);
       });
   }
@@ -2072,6 +2214,9 @@
       function (radio) { radio.disabled = !!locked || radio.dataset.capDisabled === '1'; });
     Array.prototype.forEach.call(document.querySelectorAll('input[name="cal-coord-src"]'),
       function (radio) { radio.disabled = !!locked; });
+    // 解锁之后还要再过一遍端口家族闸门：任务开始时这里把 cal-detect 放开，
+    // 但那个口可能根本是 noise，不能让它跟着变回可点。
+    refreshDetectGate();
   }
 
   // ---------------- 开始前预览 ----------------
@@ -2395,7 +2540,12 @@
     // 会把用户正在选的型号一路清掉，必须等他敲完（失焦/回车）再判。
     on($('cal-port'), 'change', function () {
       resetModuleForPort();
+      // 换口 = 换判定：只有扫描到 gnss 的口才允许直接点「读取模块信息」
+      refreshDetectGate();
     });
+    var forceBox = $('cal-force-detect');
+    if (forceBox) on(forceBox, 'change', refreshDetectGate);
+    refreshDetectGate();
     on($('cal-detect'), 'click', readModuleInfo);
     on($('cal-start'), 'click', confirmThenStart);
     on($('cal-abort'), 'click', doAbort);

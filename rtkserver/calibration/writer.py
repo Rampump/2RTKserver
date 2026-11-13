@@ -153,6 +153,24 @@ GGA_TOTAL_WAIT = 30.0
 # 2026-11-02 真机就是因为冷启动阶段（质量=1、卫星=9）径直进了 FIX_WAIT，
 # 白白耗掉 180 秒固定解等待窗口最后超时。
 POSITION_FIX_TIMEOUT = 90.0
+# 已经**确认没星**时（PREFLIGHT 看到 0 颗卫星、GGA 全空）改用这两个短窗口。
+#
+# 为什么允许缩短：90 秒 + 30 秒是给"天线正常、只是冷启动还在搜星"留的余量。
+# 当 PREFLIGHT 已经明确读到 0 颗卫星时，再等 120 秒只是在确认同一个事实 ——
+# 2026-11-13 真机实测（两块模块都没接天线）：GGA 每秒一条但字段全空，
+# 质量位恒 0、星数恒 0，硬等满 120 秒才失败。缩短后约 35 秒就能给出
+# "没卫星"这个结论，而且结论本身不会错 —— 真接上天线的话，这 12 秒里
+# 星数就会开始爬升，判据会自动放行。
+GGA_TOTAL_WAIT_NO_FIX = 12.0
+POSITION_FIX_TIMEOUT_NO_FIX = 20.0
+# PREFLIGHT 被动嗅探窗口（秒）。COM3 真机实测：正确波特率下 1 秒内就有 NMEA
+# 或 RTCM 帧；3 秒足够覆盖 1 Hz 输出，取不到再给第二次 3 秒。
+# 为什么不在入口直接等 GGA_TOTAL_WAIT：那时已经过了 ROVER_SETUP / NMEA_SETUP /
+# RTK_REINIT / GGA_RATE_CHECK 四步，用户白等 1~2 分钟才知道"模块根本没说话"。
+PREFLIGHT_PROBE_SECONDS = 3.0
+# 恢复出厂后等模块重启的时间（秒）。LG290P 的 PQTMRESTOREPAR 只回 OK，
+# 真正生效要等重启；真机实测 3~4 秒内首帧 NMEA 就回来了。
+PREFLIGHT_RESET_WAIT = 4.0
 # 定位间隔（毫秒）。**不要改成 1000**：本固件（LG290P03AANR01A03S）在 1 Hz
 # 定位节拍下 GGA 输出调度会卡死到 87 秒一条（实测 0.011 Hz），而
 # `PQTMCFGMSGRATE,R,1,GGA` 读回依然是 1，配置"看起来完全正常"。
@@ -729,6 +747,11 @@ class CoordinateWriter:
         #        'fix_rate': 1000 | None, 'configured': {...}}
         # 收尾时按它还原，见 `_restore_nmea_after_write`。
         self._nmea_orig = None
+        # PREFLIGHT 是否已经确认"模块在说话但一颗星都没有"。为 True 时
+        # 后面的定位等待改用短窗口（见 GGA_TOTAL_WAIT_NO_FIX 的说明）。
+        self._preflight_no_fix = False
+        self._preflight_sats = None
+        self._preflight_quality = None
         self._step = ''
         self.result = {}
 
@@ -741,6 +764,9 @@ class CoordinateWriter:
         self._touched = False
         self._mem_restore_mode = None
         self._nmea_orig = None
+        self._preflight_no_fix = False
+        self._preflight_sats = None
+        self._preflight_quality = None
         # 只测不写（external_rover）：全程不发写命令，失败时也不能"回写"
         # —— 没有备份可回，回写反而会朝一块不归我们管的设备发命令。
         self._readonly = plan.method == 'external_rover'
@@ -869,11 +895,27 @@ class CoordinateWriter:
             # 只测不写：没有写配置、没有保存 NVM。可能动过内存模式（附录D），
             # 但那条已经被 _restore_memory_mode 还原了，这里如实说"没写进 NVM"，
             # 不能说"什么都没动"——用户会去核对模块配置，发现模式变过就说不清了。
-            error.nvm_state = NVM_NOT_WRITTEN
+            #
+            # **例外：PREFLIGHT 的恢复出厂**。那是真的写了 NVM（清空），
+            # 此时再说"NVM 未改动"就是假话，用户拿厂商工具一看就发现配置没了。
+            reset = bool((self.result.get('factory_reset') or {}).get('applied'))
+            error.nvm_state = NVM_NOT_WRITTEN if not reset else NVM_UNKNOWN
             self.result['nvm_state'] = error.nvm_state
             self.result['error_step'] = error.step
             self.result['error'] = error.message
-            error.message = f'{error.message}（本模式未向模块写入任何配置，NVM 未改动）'
+            if not reset:
+                suffix = '（本模式未向模块写入任何配置，NVM 未改动）'
+            elif (self.result.get('preflight_backup') or {}).get('usable'):
+                suffix = ('（本次仅测量在 PREFLIGHT 阶段执行过恢复出厂，'
+                          '模块 NVM 已被重置为出厂默认；恢复出厂前的快照已落盘，'
+                          '可用「还原标定前配置」恢复）')
+            else:
+                # 快照没落盘/不可用就别再承诺能还原 —— 用户照做会扑空，
+                # 更糟的是 backup.json 里可能躺着上一块模块的备份。
+                suffix = ('（本次仅测量在 PREFLIGHT 阶段执行过恢复出厂，'
+                          '模块 NVM 已被重置为出厂默认；**本次没有可用的标定前快照**，'
+                          '无法自动还原，请用厂商工具重新配置模式与输出）')
+            error.message = f'{error.message}{suffix}'
             logging.error(f'只测不写失败于 {error.step}：{error.message}')
             self._record_step(error.step or 'FAILED', False, error.message,
                               {'nvm_state': error.nvm_state, 'readonly': True})
@@ -1620,6 +1662,11 @@ class CoordinateWriter:
         cfg = plan.cors or {}
         duration = int(cfg.get('duration') or CORS_DEFAULT_DURATION)
 
+        # ---- PREFLIGHT：先确认模块在说话（NMEA/RTCM），并在必要时回到流动站 ----
+        # 放在最前面：任何"等 GGA 超时"都比这里慢一个数量级，而且那时的报错
+        # 说不清是"没数据"还是"没定位"。
+        self._step_preflight(plan)
+
         # ---- ROVER_SETUP：切流动站（持久化 + 重启生效）----
         self._step_cors_rover_setup(plan)
 
@@ -1710,6 +1757,454 @@ class CoordinateWriter:
             logging.warning('[CORS_DOWNLINK] %s', text)
 
     # ---- ROVER_SETUP（§9.1）：CORS 标定的第一道门禁 ----
+    # ---- PREFLIGHT（CORS / 仅测量共用）：先确认"模块在说话、且在流动站" ----
+    def _step_preflight(self, plan):
+        """开工前的输出与模式预检（只读优先，必要时才恢复出厂）。
+
+        为什么必须放在 `ROVER_SETUP` 之前，而不是沿用 `GGA_WAIT` 兜底：
+
+        1. `start_cors(measure_only=True)` 的入口刻意**不拦**未知模块
+           （service.py 的注释：只要能输出 NMEA 就够了）。于是"模块到底说
+           不说话"一直拖到 `GGA_WAIT` 才判，那时已经过了 ROVER_SETUP /
+           NMEA_SETUP / RTK_REINIT / GGA_RATE_CHECK 四步，用户白等 1~2 分钟。
+        2. 基准站模块按协议**默认关闭全部 NMEA、只播 RTCM**，采集链路会空转
+           到超时，用户看到的是"等固定解失败"，真正原因是"根本没让它说话"。
+        3. 仅测量原先对 base 模块走 `set_mode_memory_only('rover')`，而 LG290P
+           真机验证过：仅内存切换**不重建 RTK 引擎**，只吐一条 NO FIX / 0 星
+           GGA 就再无输出。恢复出厂（NVM 重置为 rover）才是可靠做法。
+
+        用户已明确授权：**仅测量模式下，只要是已知型号就允许恢复出厂**；
+        未知型号不恢复，直接提示并结束。
+        """
+        self._stage('PREFLIGHT', '检查模块输出（NMEA/GGA 与 RTCM）')
+        snap = self._classify_output(PREFLIGHT_PROBE_SECONDS)
+        # 同样只看"有没有在说话"：无天线的模块每秒都在吐字段为空的 GGA，
+        # 用 `nmea` 判会让它白等一轮 3 秒，然后才进下面的正常分支。
+        if not snap['sentences'] and not snap['rtcm']:
+            self._warn(f'前 {PREFLIGHT_PROBE_SECONDS:g} 秒没有读到任何字节，'
+                       f'再等 {PREFLIGHT_PROBE_SECONDS:g} 秒确认')
+            snap = self._classify_output(PREFLIGHT_PROBE_SECONDS)
+
+        # 判"有没有在说话"必须用 `sentences`（有 NMEA 语句，不管有没有定位），
+        # **不能**用 `nmea`（有定位）。这两个混用是 2026-11-13 真机实测抓到的硬伤：
+        # 一块没接天线的模块每秒都在吐 `$GNGGA,,,,,,0,00,99.98,...`，
+        # `nmea=False / rtcm=False / sentences=True / lines=94`，
+        # 老判据于是报"6 秒内没有任何输出"，还让用户去查线序和波特率 ——
+        # 而串口明明读到了 94 行。用户按提示去换线、改波特率，全是白费。
+        if not snap['sentences'] and not snap['rtcm']:
+            raise WriteFailed(
+                'PREFLIGHT',
+                f'模块在 {PREFLIGHT_PROBE_SECONDS * 2:g} 秒内没有任何输出'
+                f'（既没有 NMEA 语句，也没有 RTCM 帧），已停止标定。按顺序查：'
+                f'① 串口是否选对、TX/RX 是否接反；'
+                f'② 波特率是否正确（当前 {getattr(self.channel, "baud", "?")}）；'
+                f'③ 模块供电是否正常；'
+                f'④ 模块是否被配置成"所有输出全关"（需用厂商工具打开）',
+                {'probe': snap})
+
+        # ---- 未知模块：不恢复出厂，只判断能否继续 ----
+        # 未知模块没有命令集，能做的只有"看它说什么"。这里同样要区分
+        # "在说话但没星"与"只播 RTCM"：前者换个位置/接上天线就能测，
+        # 后者是基准站语义、当流动站用不了。老代码只看 `nmea`，于是
+        # 无天线的未知模块会被扣上"输出的是 RTCM 数据流"的帽子，完全说反。
+        if self._is_passive_driver():
+            if snap['nmea']:
+                self.result['preflight'] = {'output': snap, 'passive': True}
+                self._record_step('PREFLIGHT', True,
+                                  '未知模块，但已在输出 NMEA 定位数据，按流动站继续',
+                                  snap)
+                return
+            if snap['sentences']:
+                # 有语句、没定位 = 没天线/被遮挡/刚上电。这不是配置问题，
+                # 换个位置或接上天线后重试即可 —— 继续往下走，由 GGA_WAIT
+                # 用缩短的超时窗口给出结论，而不是在这里就把流程掐死。
+                self._note_no_fix(snap)
+                self.result['preflight'] = {'output': snap, 'passive': True,
+                                            'no_fix': True}
+                self._record_step(
+                    'PREFLIGHT', True,
+                    f'未知模块，NMEA 语句正常但当前无定位'
+                    f'（质量位={snap.get("quality")}，卫星={snap.get("sats")}），'
+                    f'按流动站继续', snap)
+                return
+            raise WriteFailed(
+                'PREFLIGHT',
+                '这块模块未被识别为已知型号，当前输出的是 RTCM 数据流而不是 NMEA '
+                '定位数据，无法用于测量。未知型号没有可靠命令集，本流程不会对它'
+                '执行恢复出厂。请用厂商上位机把它切到流动站模式并打开 GGA 输出后重试',
+                {'probe': snap, 'passive': True})
+
+        # ---- 已知模块：读模式 ----
+        ok, message, data = self.driver.get_mode()
+        self._beat()
+        if not ok:
+            raise WriteFailed(
+                'PREFLIGHT',
+                f'读不到模块工作模式：{message}。模式未知时无法判断该不该切流动站，'
+                f'为避免把基准站配置写坏，已停止标定', data)
+        mode = (data or {}).get('mode') or 'unknown'
+
+        if mode == 'rover':
+            if snap['nmea']:
+                self.result['preflight'] = {'mode': mode, 'output': snap}
+                self._record_step('PREFLIGHT', True,
+                                  '流动站模式，NMEA 定位输出正常', snap)
+                return
+            # 有语句、没定位 → **这是"没星"，不是"输出没开"**。
+            # 别去 `ensure_nmea_output()`：模块每秒都在吐 GGA，只是字段全空；
+            # 打开输出既没用，还在只读模式下白改了模块配置。
+            if snap['sentences']:
+                self._note_no_fix(snap, stage='PREFLIGHT')
+                self.result['preflight'] = {'mode': mode, 'output': snap,
+                                            'no_fix': True}
+                self._record_step('PREFLIGHT', True,
+                                  f'NMEA 正常输出但当前无定位'
+                                  f'（质量位={snap.get("quality")}，'
+                                  f'卫星={snap.get("sats")}）', snap)
+                return
+            # 真的没有 NMEA 语句：可能被关掉了，打开一次（只改内存）再确认
+            self._open_nmea_output()
+            snap2 = self._classify_output(PREFLIGHT_PROBE_SECONDS)
+            if not snap2['sentences']:
+                snap2 = self._classify_output(PREFLIGHT_PROBE_SECONDS)
+            if not snap2['sentences']:
+                raise WriteFailed(
+                    'PREFLIGHT',
+                    '模块已是流动站模式，打开 GGA 输出后仍然收不到任何 NMEA 语句。'
+                    '按顺序查：① 串口 TX/RX 是否接反；'
+                    '② 波特率是否正确；③ 模块是否被配置成"所有输出全关"',
+                    {'mode': mode, 'probe': snap2})
+            if not snap2['nmea']:
+                self._note_no_fix(snap2, stage='PREFLIGHT')
+                self.result['preflight'] = {'mode': mode, 'output': snap2,
+                                            'opened_nmea': True, 'no_fix': True}
+                self._record_step('PREFLIGHT', True,
+                                  '已打开 NMEA 输出，但当前无定位（0 颗卫星）', snap2)
+                return
+            self.result['preflight'] = {'mode': mode, 'output': snap2,
+                                        'opened_nmea': True}
+            self._record_step('PREFLIGHT', True,
+                              '流动站模式，已自动打开 NMEA 输出', snap2)
+            return
+
+        # ---- 非流动站 ----
+        if not getattr(self, '_readonly', False):
+            # CORS 完整标定：`ROVER_SETUP` 会持久化 set_mode('rover')，这里只提示。
+            # 不恢复出厂 —— 这条路本来就要把模块改写成基准站，清 NVM 没有收益。
+            self._warn(f'模块当前是 {mode}（通常此时 NMEA 关闭、只播 RTCM），'
+                       f'下面 ROVER_SETUP 会把它切到流动站')
+            self.result['preflight'] = {'mode': mode, 'output': snap,
+                                        'will_switch': True}
+            self._record_step('PREFLIGHT', True,
+                              f'当前 {mode}，将由 ROVER_SETUP 切换为流动站', snap)
+            return
+
+        # 仅测量 + 已知型号 + 非流动站 → 恢复出厂（用户明确授权）
+        if not self._caps('factory_reset'):
+            raise WriteFailed(
+                'PREFLIGHT',
+                f'模块当前是 {mode}，仅测量需要流动站模式；该型号驱动声明不支持'
+                f'恢复出厂。请用厂商上位机把它切到流动站并打开 GGA 输出后重试', data)
+
+        # 再说一遍"恢复出厂也不会有用"的型号，必须在**下发之前**拦住。
+        #
+        # 单基站固件（LC29H(BS)）没有模式命令，`PQTMRESTOREPAR` 清完 NVM
+        # 依旧是基准站语义。老代码会一路走下去：落盘快照 → 清 NVM →
+        # 重探波特率 → 读模式（`disabled` 被反推成 rover，看着像成功了） →
+        # 等 NMEA 语句 → 等不到 → 报"恢复出厂后收不到 NMEA，查线序/波特率"。
+        # 用户的实际损失是**坐标和报文速率被清空**，换来一句查错方向的提示。
+        factory_role = getattr(self.driver, 'FACTORY_RESET_ROLE', 'rover')
+        if factory_role != 'rover':
+            raise WriteFailed(
+                'PREFLIGHT',
+                f'模块当前是 {mode}，而「仅测量」需要流动站模式。'
+                f'该型号是单基站固件（{self.driver.DISPLAY_NAME}），'
+                f'恢复出厂后仍然是基准站，无法作为流动站测量 —— '
+                f'所以这里**不会**对它执行恢复出厂（避免白清坐标与报文配置）。'
+                f'请换一块双模模块做测量，或改用「Survey-in 自收敛」/「写入已知坐标」'
+                f'生成基准站坐标', data)
+
+        self._factory_reset_to_rover(mode)
+
+    def _classify_output(self, seconds):
+        """被动嗅探串口一小段，判断现在吐的是 NMEA 还是 RTCM（不发任何命令）。
+
+        返回四个互不等价的结论，**不要把它们混成一个布尔**：
+
+          `nmea`       有**有效定位**的 NMEA（GGA 质量位 > 0 且带经纬度）。
+                       这是"能不能拿去标定"的判据。
+          `sentences`  有 NMEA 语句，**不管有没有定位**。无天线时模块照样吐
+                       `$GNGGA,,,,,,0,00,99.99,...`，只是字段全空 ——
+                       这是"模块在说话、只是没星"，和"模块不说话"是两回事。
+          `rtcm`       窗口内有 CRC 校验通过的 RTCM 帧增长。只有 GSV 不算：
+                       GSV 说明"看见了星"，不等于"定位成功"。
+          `sats`/`quality`  最近一条 GGA 的星数与质量位，给上层判断
+                       "0 颗星"还是"有星但没收敛"。
+
+        2026-11-13 真机教训（LG290P + ZED-F9P 同时插着，都没接天线）：
+        F9P 恢复出厂后 NMEA 全开、GGA 每秒一条，但字段全空（质量位 0、星数 0）。
+        按老判据 `nmea = bool(kinds)` 会判成"模块没有输出 NMEA"，于是流程去
+        `ensure_nmea_output()` 白写一次模块配置，再报"打开 GGA 后仍然没有
+        NMEA 定位语句" —— 既违反了只读契约，又把"没接天线"说成了"输出没开"。
+        """
+        channel = self.channel
+        if channel is None:
+            return {'nmea': False, 'sentences': False, 'kinds': [], 'rtcm': False,
+                    'frames': 0, 'lines': 0, 'sats': None, 'quality': None}
+        # 清掉缓存里的旧定位语句：DETECT 阶段可能已经填过一条，
+        # 直接读 cache 会把"几分钟前的旧值"当成"现在有输出"。
+        for key in ('gga', 'rmc', 'gll'):
+            channel.cache.pop(key, None)
+        frames0 = int(channel.counters.get('frames', 0) or 0)
+        lines0 = int(channel.counters.get('lines', 0) or 0)
+        deadline = time.time() + max(0.5, float(seconds))
+        while time.time() < deadline:
+            self._checkpoint()
+            self._beat()
+            remain = deadline - time.time()
+            self._drain_gga(max(0.05, min(0.3, remain)))
+        frames = int(channel.counters.get('frames', 0) or 0) - frames0
+        lines = int(channel.counters.get('lines', 0) or 0) - lines0
+        kinds = []
+        for key in ('gga', 'rmc', 'gll'):
+            item = channel.cache.get(key) or {}
+            if item.get('valid') and item.get('lat') is not None:
+                kinds.append(key.upper())
+        gga = channel.cache.get('gga') or {}
+        return {'nmea': bool(kinds), 'sentences': lines > 0, 'kinds': kinds,
+                'rtcm': frames > 0, 'frames': frames, 'lines': lines,
+                'sats': gga.get('num_sats'), 'quality': gga.get('quality')}
+
+    def _note_no_fix(self, snap, stage='PREFLIGHT'):
+        """记下"模块在说话，但当前一颗星都没有"。
+
+        `snap` 来自 `_classify_output()`，必须已经区分过 `sentences` 与 `nmea`，
+        否则会把"没星"误当成"没输出"。
+
+        标记只影响**后续等待时长**与报错文案，不改变标定结论：
+        真的接上天线后星数会自己爬上来，`_await_position_fix` 正常放行。
+        """
+        self._preflight_no_fix = True
+        self._preflight_sats = snap.get('sats')
+        self._preflight_quality = snap.get('quality')
+        self.result['no_fix_at_start'] = {'quality': snap.get('quality'),
+                                          'sats': snap.get('sats'),
+                                          'stage': stage}
+        self._warn(
+            f'当前没有卫星信号（质量位={snap.get("quality")}，'
+            f'卫星={snap.get("sats")}，但 NMEA 语句仍在正常输出）。'
+            f'天线未接、被遮挡或处在室内时会这样 —— 没有卫星就无法做任何定位，'
+            f'后面的定位等待会缩短到约 '
+            f'{GGA_TOTAL_WAIT_NO_FIX + POSITION_FIX_TIMEOUT_NO_FIX:.0f} 秒；'
+            f'接好天线（或移到室外）后立即重试即可')
+
+    def _open_nmea_output(self):
+        """把 GGA/RMC/GLL 输出打开（**只改内存**，不写 NVM）。
+
+        仅测量模式的约定是"不碰 NVM"；恢复出厂已经把 NVM 重置成默认值，
+        这里再写一次 Flash 既无必要，也会让"本次只动内存"这件事说不清。
+        """
+        if self._is_passive_driver():
+            return False
+        self._stage('PREFLIGHT', '模块没有输出 NMEA，尝试用驱动命令打开')
+        try:
+            ok, message, data = self.driver.ensure_nmea_output(
+                enabled=True, names=('GGA', 'RMC', 'GLL'), persist=False)
+        except Exception as e:                       # noqa: BLE001 - 补救动作不能抛
+            ok, message, data = False, f'{type(e).__name__}: {e}', {}
+        self._beat()
+        if ok:
+            self._touched = True
+            self.result.setdefault('preflight_actions', []).append('open_nmea')
+            self._warn(f'模块此前没有输出定位语句，已自动打开（{message}）')
+            self._record_step('PREFLIGHT', True,
+                              f'已自动打开 NMEA 输出：{message}', data)
+        else:
+            self._record_step('PREFLIGHT', False,
+                              f'尝试打开 NMEA 输出失败：{message}', data)
+        return bool(ok)
+
+    def _persist_preflight_snapshot(self):
+        """在**恢复出厂之前**把标定前快照落盘。
+
+        为什么不能等 BACKUP 阶段：只测不写模式原先根本不采备份，而
+        `backup.json` 是"只留最近一次"的 —— 里面留着的可能是上一次
+        **另一块模块**的备份。用户看到"可用还原恢复"去点还原，
+        就会把别的模块的坐标/模式写进这一块。
+
+        落盘失败不拦流程：用户已经授权恢复出厂，这时中断反而让模块
+        停在"一半清空一半没清"的状态上更麻烦。只如实警告。
+        """
+        backup = self._backup or {}
+        if not backup or backup.get('skipped'):
+            self._warn('本次没有可落盘的标定前快照；恢复出厂后无法用'
+                       '「还原标定前配置」找回原配置，请用厂商工具重新配置')
+            return False
+        from . import backup as backup_mod          # 局部导入：避免模块级循环依赖
+        try:
+            backup_mod.save(backup)
+        except OSError as exc:                       # noqa: BLE001
+            self._warn(f'标定前快照落盘失败（{exc}）；恢复出厂后将无法自动还原')
+            return False
+        usable, why = backup_mod.usable(backup)
+        self.result['preflight_backup'] = {'saved': True, 'usable': bool(usable),
+                                           'reason': why}
+        if not usable:
+            self._warn(f'快照已落盘但不可用于还原：{why}')
+        return bool(usable)
+
+    def _factory_reset_to_rover(self, from_mode):
+        """仅测量：已知型号非流动站 → 恢复出厂，重启后确认回到 rover。
+
+        风险已与用户确认：`PQTMRESTOREPAR` 会清掉工作模式、坐标、报文速率。
+
+        两件事必须在这里做，不能留给上层：
+
+        1. **恢复出厂之前把快照落盘**。只测不写模式原先跳过了备份，收尾文案
+           却说"可用还原标定前配置恢复" —— 而 `backup.json` 里留着的可能是
+           上一次**另一块模块**的备份，用户真去点还原就是把错的坐标写进这块。
+        2. **恢复出厂后只用"有没有 NMEA 语句"判存活，不用"有没有定位"**。
+           无天线时出厂态每秒一条 `$GNGGA,,,,,,0,00,99.99,...`，字段全空；
+           按老判据会报"仍没有 NMEA 定位语句"，把"没接天线"说成"输出没开"，
+           而此时 NVM 已经被清空了 —— 用户白折腾一场还查错方向。
+        """
+        # 最后一道闸：真正下发 `PQTMRESTOREPAR` 的地方必须自己再确认一次
+        # "恢复出厂之后真能变流动站"。调用方已经拦过，但这里是不可撤销的
+        # 破坏性操作 —— 将来谁把这个方法复用到别的分支，也不该清掉别人的 NVM。
+        if getattr(self.driver, 'FACTORY_RESET_ROLE', 'rover') != 'rover':
+            raise WriteFailed(
+                'PREFLIGHT',
+                f'{self.driver.DISPLAY_NAME} 恢复出厂后仍是基准站，'
+                f'恢复出厂解决不了"要做流动站测量"这件事，已中止（未清 NVM）')
+        self._stage('PREFLIGHT',
+                    f'当前是 {from_mode}，恢复出厂以回到流动站（会清空 NVM 配置）')
+        self._persist_preflight_snapshot()
+        self._warn(f'模块当前是 {from_mode}，仅测量模式按约定执行恢复出厂：'
+                   f'NVM 中的工作模式、坐标、报文速率将被清除。'
+                   f'标定前快照已保存到 .calibration/backup.json，'
+                   f'可用「还原标定前配置」恢复')
+        ok, message, data = self.driver.factory_reset()
+        self._beat()
+        if not ok:
+            raise WriteFailed(
+                'PREFLIGHT',
+                f'恢复出厂失败：{message}。请用厂商上位机把模块切到流动站后重试',
+                data)
+        self._touched = True
+        # 恢复出厂是真的动了 NVM（清空）。只测不写模式下 result 默认是
+        # NVM_NOT_WRITTEN，这里必须改口 —— 否则前端会把"配置已被清零"
+        # 显示成"未写入 NVM"，用户拿厂商工具一看就发现对不上。
+        self.result['nvm_state'] = NVM_UNKNOWN
+        self.result['factory_reset'] = {'applied': True, 'from_mode': from_mode,
+                                        'message': message}
+        self._record_step('PREFLIGHT', True, f'已下发恢复出厂：{message}', data)
+
+        # 恢复出厂只回 OK，真正生效要重启
+        try:
+            self.driver.reboot()
+        except Exception as e:                       # noqa: BLE001 - 让后面通信去判
+            logging.debug(f'恢复出厂后重启异常（继续等待）：{e}')
+        self._beat()
+        self._sleep(PREFLIGHT_RESET_WAIT)
+
+        # 恢复出厂**可能把波特率打回默认档**（F9P 一定会，Quectel 视固件），
+        # 必须重新枚举候选档位，否则会一直"模块无应答"。
+        baud = self._reopen_after_reset()
+
+        ok, message, data = self.driver.get_mode()
+        mode = (data or {}).get('mode') if ok else None
+        if not ok or mode != 'rover':
+            raise WriteFailed(
+                'PREFLIGHT',
+                f'恢复出厂并重启后仍未回到流动站模式'
+                f'（读到 {mode or "无应答"}：{message}）。'
+                f'请用厂商上位机手动切换模式后重试', data)
+        self.result['factory_reset']['mode_after'] = mode
+        self.result['factory_reset']['baud_after'] = baud
+        self._warn(f'恢复出厂完成：模块已回到流动站模式（串口 {baud}）')
+
+        # 出厂默认 NMEA 全开，但仍兜一层：不同固件可能只开了部分语句。
+        # 判"有没有语句"而不是"有没有定位" —— 见本函数开头的第 2 条。
+        snap = self._classify_output(PREFLIGHT_PROBE_SECONDS)
+        if not snap['sentences']:
+            self._open_nmea_output()
+            snap = self._classify_output(PREFLIGHT_PROBE_SECONDS)
+        if not snap['sentences']:
+            raise WriteFailed(
+                'PREFLIGHT',
+                '恢复出厂后模块已回到流动站模式，但串口仍然收不到任何 NMEA 语句。'
+                '这不是卫星问题（无星时也会输出字段为空的 GGA）。按顺序查：'
+                '① 恢复出厂把波特率改掉了，而本机还在用旧档位；'
+                '② 模块的 NMEA 输出被固件默认关掉（少见，可用厂商工具确认）；'
+                '③ 串口线只接了 TX 没接 RX', snap)
+        if not snap['nmea']:
+            # 有语句、没定位 = 没星（或刚上电还在搜星）。**这不是恢复出厂失败**，
+            # 把话说清楚，别让用户以为模块配置被清坏了。
+            self._warn(f'模块已恢复出厂并回到流动站，NMEA 输出正常，'
+                       f'但当前没有定位（质量位={snap.get("quality")}，'
+                       f'卫星={snap.get("sats")}）—— 天线未接或被完全遮挡时会这样，'
+                       f'后面的定位等待会因此失败')
+        self.result['preflight'] = {'mode': 'rover', 'output': snap,
+                                    'factory_reset': True}
+        self._record_step('PREFLIGHT', True,
+                          '恢复出厂后已回到流动站，NMEA 输出正常', snap)
+
+    def _reopen_after_reset(self):
+        """恢复出厂后按候选档位重开串口，确认驱动还能应答。
+
+        返回最终使用的波特率；全失败抛 `WriteFailed`。
+        候选表来自驱动自己的 `bauds()`（`DEFAULT_BAUD` 打头），
+        当前档位插在最前面 —— 恢复出厂后多数固件仍停在原档，
+        先试它最省时间。
+        """
+        channel = self.channel
+        if channel is None:
+            return None
+        current = int(getattr(channel, 'baud', 0) or 0)
+        try:
+            candidates = [int(b) for b in (self.driver.bauds() or [])]
+        except Exception:                            # noqa: BLE001
+            candidates = []
+        if current:
+            candidates.insert(0, current)
+        if not candidates:
+            candidates = [460800, 115200, 921600, 230400, 57600, 38400, 19200, 9600]
+        ordered, seen = [], set()
+        for baud in candidates:
+            if baud in seen:
+                continue
+            seen.add(baud)
+            ordered.append(baud)
+
+        last = ''
+        for baud in ordered:
+            self._beat()
+            try:
+                channel.close()
+                channel.baud = int(baud)
+                channel.open()
+                channel.drain()
+                channel.flush(0.2)
+            except Exception as e:                   # noqa: BLE001 - 换档失败试下一个
+                last = f'{baud}: {e}'
+                continue
+            ok, message, _data = self.driver.get_mode()
+            self._beat()
+            if ok:
+                if current and int(baud) != current:
+                    self._warn(f'恢复出厂后波特率已从 {current} 变为 {baud}，'
+                               f'已按新档位重新打开串口；'
+                               f'请把本机配置里的串口波特率也改成 {baud}，'
+                               f'否则标定结束后数据面会连不上模块')
+                self.result['baud_after_reset'] = {'from': current, 'to': int(baud)}
+                return int(baud)
+            last = f'{baud}: {message}'
+
+        raise WriteFailed(
+            'PREFLIGHT',
+            f'恢复出厂后无法与模块通信，已尝试 {len(ordered)} 个波特率：{last}。'
+            f'模块可能还在重启，可断电重插后重试', {'bauds': ordered})
+
     def _step_cors_rover_setup(self, plan):
         """**先读模式，再决定是否切换**——这是 CORS 标定的第一步，不能省。
         为什么必须先查：CORS 标定的本质是"把 RTCM 喂给模块、让模块自己解算"，
@@ -2285,7 +2780,11 @@ class CoordinateWriter:
         from .cors import GgaManager
         self._stage('GGA_WAIT', '等待模块输出定位（GGA）')
         channel = self.channel
-        deadline = time.time() + GGA_TOTAL_WAIT            # 完全没位置时的总等待
+        # PREFLIGHT 已经确认"有语句、没卫星"时用短窗口：再等 30 秒只是在
+        # 确认同一个事实（见 GGA_TOTAL_WAIT_NO_FIX 的说明）。
+        total_wait = (GGA_TOTAL_WAIT_NO_FIX if getattr(self, '_preflight_no_fix', False)
+                      else GGA_TOTAL_WAIT)
+        deadline = time.time() + total_wait                # 完全没位置时的总等待
         native_deadline = time.time() + GGA_NATIVE_WAIT    # 只给原生 GGA 的窗口
         gga_count = 0
         last_raw = None
@@ -2331,16 +2830,21 @@ class CoordinateWriter:
                 self._record_step('GGA_WAIT', True, '无原生 GGA，启用软件生成（精度受限）',
                                   {'gga_count': gga_count, 'software_gga': True})
             else:
+                no_fix_hint = ''
+                if getattr(self, '_preflight_no_fix', False):
+                    no_fix_hint = (f'（本次标定刚开始时就是 0 颗卫星，'
+                                   f'和这里是同一个原因：模块收不到卫星信号）')
                 raise WriteFailed('GGA_WAIT',
                                   f'模块既无 GGA 也无 RMC/GLL 输出，拿不到稳定 NMEA-GGA'
-                                  f'（{GGA_TOTAL_WAIT:g} 秒内一条有效语句都没有），'
-                                  f'无法获取位置。按顺序查：'
+                                  f'（{total_wait:g} 秒内一条有效语句都没有），'
+                                  f'无法获取位置{no_fix_hint}。按顺序查：'
                                   f'① 天线是否接好、上方是否被完全遮挡（无星则无定位语句）；'
                                   f'② 模块是否被切成基准站——基站模式会自动关闭 NMEA 改播 RTCM，'
                                   f'此时串口里是二进制流不是文本语句；'
                                   f'③ 串口是否接对（只接了 TX 不接 RX 时读不到回传的定位流）；'
                                   f'④ 模块是否有命令集需要先打开 GGA 输出（未知模块请先用厂商上位机打开）',
-                                  {'gga_count': gga_count})
+                                  {'gga_count': gga_count,
+                                   'no_fix_at_start': bool(getattr(self, '_preflight_no_fix', False))})
         self._await_position_fix(gga_manager)
         return gga_manager
 
@@ -2392,7 +2896,12 @@ class CoordinateWriter:
         channel = self.channel
         if channel is None:
             return
-        deadline = time.time() + POSITION_FIX_TIMEOUT
+        # 已经确认没星（PREFLIGHT 的 sats=0）就不必等满 90 秒 —— 那只是把
+        # 同一个事实再确认一遍，用户白等。详见 POSITION_FIX_TIMEOUT_NO_FIX。
+        no_fix_at_start = bool(getattr(self, '_preflight_no_fix', False))
+        fix_timeout = (POSITION_FIX_TIMEOUT_NO_FIX if no_fix_at_start
+                       else POSITION_FIX_TIMEOUT)
+        deadline = time.time() + fix_timeout
         last_note = 0.0
         first_q = None
         while time.time() < deadline:
@@ -2420,19 +2929,25 @@ class CoordinateWriter:
             if time.time() - last_note >= 10:
                 last_note = time.time()
                 self._warn(f'模块尚未定位（质量位={quality}，卫星={sats}），'
-                           f'等待搜星中…已等 {POSITION_FIX_TIMEOUT - (deadline - time.time()):.0f} 秒')
+                           f'等待搜星中…已等 {fix_timeout - (deadline - time.time()):.0f} 秒')
                 if gga_manager is not None:
                     gga_manager.source()      # 触发一次防抖提示（会说明"质量位为 0"）
 
+        no_sat_note = ''
+        if no_fix_at_start:
+            no_sat_note = (f'（本次标定开始时就已经读到 0 颗卫星，'
+                           f'等待窗口按"没星"场景缩短到 {fix_timeout:g} 秒；'
+                           f'这是天线/环境问题，不是模块配置问题）')
         raise WriteFailed(
             'GGA_WAIT',
-            f'模块 {POSITION_FIX_TIMEOUT:g} 秒内始终没有定位（GGA 质量位一直是 0），'
-            f'无法向 CORS 上报有意义的概略位置，差分也就无从生成。按顺序查：'
+            f'模块 {fix_timeout:g} 秒内始终没有定位（GGA 质量位一直是 0）'
+            f'{no_sat_note}，无法向 CORS 上报有意义的概略位置，差分也就无从生成。按顺序查：'
             f'① 天线是否接好、是否在室外能见到天空；'
             f'② 模块是否处于冷启动（首次上电需要 30~60 秒搜星，之后热启动只要几秒）；'
             f'③ 天线馈线是否短路/断路（可以用模块的 GSV 语句看各星座可见星数）；'
             f'④ 是否被错误配置成只跟踪少数星座',
-            {'first_quality': first_q})
+            {'first_quality': first_q, 'sats': sats,
+             'no_fix_at_start': no_fix_at_start})
 
     # ---- FIX_WAIT + COLLECT（§7.2 / §7.5）----
     def _step_cors_fix_and_collect(self, plan, client, gga_manager, duration,
@@ -4056,14 +4571,28 @@ class CoordinateWriter:
                     else f'RTCM3-{plan.coord_msg}')
             # 一条都没收到 → 重下发能救的是"速率没生效"，救不了"线没接好"。
             # 仍然走一轮重试：第一次重启后模块可能还没开始播发，速率确实可能是 0。
+            #
+            # 但有一种情况重试永远救不回来，必须说清楚，否则用户会反复重试：
+            # **没有卫星时，u-blox F9P 一条 RTCM 都不输出**（2026-11-13 真机实测：
+            # 1005/1230/MSM 速率全部读回 1 且已落盘重启，串口里仍然 0 个 RTCM 帧，
+            # 而 NMEA 每秒一条、只是字段全空）。同一位置换 LG290P 则照常播 RTCM。
+            # 这不是配置能修的，是固件行为。
+            no_sat = bool(getattr(self, '_preflight_no_fix', False))
+            hint = ''
+            if no_sat and total == 0:
+                hint = ('。注意：本轮标定全程**没有卫星信号**（GGA 质量位 0、星数 0），'
+                        '而 u-blox F9P 在没有观测值时不输出任何 RTCM 报文 —— '
+                        '这时"收不到 1005"是必然结果，不是配置错误。'
+                        '请接上天线、确认能收到卫星后重试')
             return {
                 'ok': False, 'verdict': 'unknown',
                 'reason': f'{self.rtcm_timeout:.0f} 秒内没有收到任何 {want} 报文',
                 'detail_text': (f'{self.rtcm_timeout:.0f} 秒内没有收到任何 {want} 报文'
                                 f'（共收到 {total} 个 RTCM 帧）：无法确认播发坐标。'
                                 f'若重试仍无报文，检查 {want} 速率是否为 1、'
-                                f'串口是否只接了 TX'),
-                'detail': {'frames': total, 'attempt': attempt},
+                                f'串口是否只接了 TX{hint}'),
+                'detail': {'frames': total, 'attempt': attempt,
+                           'no_fix_at_start': no_sat},
             }
 
         last = frames[-1]
