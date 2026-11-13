@@ -283,6 +283,10 @@ class UnicoreN4Base(BaseDriver):
     # 数据来源标注（前端"关于/型号详情"要显示，别让用户以为是我们编的）
     DOC_TITLE = 'Unicore Reference Commands Manual For N4 High Precision Products V2_CH_R1.1'
 
+    # 厂牌声明：扫描器认出的 `$command,response:` 命令族 / `#VERSIONA` 日志头
+    # 都归到 'Unicore'，四个子类共用（见 `BaseDriver.VENDOR` 的注释）。
+    VENDOR = 'Unicore'
+
     MATCH_PREFIX = ''          # 见文件头"一件事刻意没做"
     # 默认按双模：N4 主力型号（UM960 / UM980 / UM982）都有 `MODE ROVER` 与
     # `MODE BASE`。**唯一的例外是 UM960L**，它没有流动站命令，所以在自己的

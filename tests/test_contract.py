@@ -7165,5 +7165,167 @@ class TestPreflightOutputContract(unittest.TestCase):
                       '要把"需断电"这件事放进返回数据，让上层能提示用户')
 
 
+class TestScanButtonUnlock(unittest.TestCase):
+    """扫描结束后「扫描串口」必须自己变回可点（真机反馈：必须刷新页面才行）。
+
+    根因不是"少写了一句 `disabled = false`"，而是两个按钮各管一半：
+    扫描开始时直接 `btn.disabled = true` 禁掉**自己**，收尾只放开**对方**；
+    而唯一会把按钮整体重置的 `setFormLocked()` 只在状态轮询里跑 ——
+    没有标定任务时轮询早就停了（`render()` 里 `stopPolling()`）。
+    于是扫描按钮永久变灰，只能刷新页面。
+
+    修法是把"按钮可用性"收敛成一个从状态推导的纯函数 `opLocked()`，
+    任何一条线的开始/结束都调 `syncOpButtons()` 重算，不再成对开关。
+    """
+
+    def _js(self):
+        with io.open(os.path.join(REPO_ROOT, 'static', 'calibration.js'),
+                     encoding='utf-8') as handle:
+            return handle.read()
+
+    def test_op_locked_covers_all_three_lines(self):
+        js = self._js()
+        self.assertIn('function opLocked(', js)
+        body = js[js.index('function opLocked('):]
+        body = body[:body.index('function scanRunning(')]
+        for token in ('STATE.running', 'scanRunning()', 'detectRunning()'):
+            self.assertIn(token, body,
+                          '按钮锁必须同时考虑标定任务 / 扫描 / 识别三条线')
+
+    def test_no_paired_busy_switch_anymore(self):
+        """成对开关是这次死锁的来源：改一半就是永久禁用，直接不留。"""
+        js = self._js()
+        self.assertNotIn('function setOpBusy(', js,
+                         '不要再引入"按名字禁用/放开"的成对开关')
+        sniff = js[js.index('function sniffPorts('):]
+        sniff = sniff[:sniff.index('function pollScan(')]
+        self.assertNotIn('disabled = true', sniff,
+                         '扫描开始时不得直接禁用按钮，交给 syncOpButtons() 推导')
+
+    def test_scan_finish_reenables_scan_button(self):
+        js = self._js()
+        done = js[js.index('function onScanDone('):]
+        done = done[:done.index('function renderScanPanel(')]
+        self.assertIn('syncOpButtons()', done,
+                      '扫描收尾必须重算两个按钮，而不是只放开「读取模块信息」')
+        self.assertIn('STATE.scan.running = false', done,
+                      '收尾要先把"扫描在跑"置假，否则 syncOpButtons() 算出还是锁的')
+
+    def test_poll_failure_paths_also_reenable(self):
+        js = self._js()
+        for fn in ('function sniffPorts(', 'function pollScan('):
+            body = js[js.index(fn):]
+            # 下一个**顶层**函数（两空格缩进）为界：`.then(function (r)` 里也
+            # 有 "function "，不能拿它当边界。
+            body = body[:body.index('\n  function ')]
+            self.assertIn('syncOpButtons()', body,
+                          fn + ' 的失败分支也要放开按钮，否则一次网络抖动就要刷新页面')
+
+    def test_render_final_refresh_after_stop_polling(self):
+        """`render()` 末尾要再刷一次：任务刚结束时 `DETECT_UI.started` 是这一轮
+        才清零的，早刷的那一次算出来还是锁的，而紧接着就 `stopPolling()`。"""
+        js = self._js()
+        body = js[js.index('function render(snap)'):]
+        body = body[:body.index('function fetchSummary(')]
+        self.assertGreater(body.rindex('syncOpButtons()'), body.index('stopPolling()'),
+                           '最后一次重算必须发生在 stopPolling() 之后')
+
+
+class TestVendorFirstDetect(unittest.TestCase):
+    """扫描已认出端口厂牌时，「读取模块信息」先试这家的命令集。
+
+    真机：一块口扫出来是 Quectel（`$PQTM` 命令族），点识别却按字母序先问
+    lc29hbs / lg290p / um960 / zed_f9p…… 每问一家 2~4 秒，轮到对的那家之前
+    白等十几秒。厂牌是扫描已经拿到的事实，没有理由不用。
+
+    关键约束：**只排序不过滤**。厂牌可能被集成商改过、也可能是兼容固件，
+    押错了必须还能继续问别家，否则一块本来认得出的模块会被判成"无应答"。
+    """
+
+    def test_drivers_declare_vendor(self):
+        from rtkserver.calibration.drivers import driver_manager as dm
+
+        self.assertEqual(dm.drivers_for_vendor('Quectel'), ['lc29hbs', 'lg290p'])
+        self.assertEqual(dm.drivers_for_vendor('u-blox'), ['zed_f9p'],
+                         '扫描器写的是 u-blox，驱动声明必须同一套写法（归一化后可比）')
+        self.assertIn('um960', dm.drivers_for_vendor('Unicore'))
+        self.assertEqual(dm.drivers_for_vendor('Septentrio'), [],
+                         '没有对应驱动的厂牌要老实返回空表')
+        self.assertEqual(dm.drivers_for_vendor(''), [])
+
+    def test_vendor_key_normalises_spelling(self):
+        from rtkserver.calibration.drivers import driver_manager as dm
+
+        for variant in ('u-blox', 'U-BLOX', 'ublox', ' u blox '):
+            self.assertEqual(dm.vendor_key(variant), 'ublox')
+        self.assertEqual(dm.vendor_key(''), '')
+
+    def test_order_moves_vendor_first_without_dropping(self):
+        from rtkserver.calibration.drivers import driver_manager as dm
+
+        class _A:
+            VENDOR = 'Quectel'
+
+        class _B:
+            VENDOR = 'u-blox'
+
+        class _C:
+            VENDOR = ''
+
+        candidates = [('aaa', _A), ('bbb', _B), ('ccc', _C)]
+        ordered = dm._order_by_vendor(candidates, 'u-blox')
+        self.assertEqual([key for key, _cls in ordered], ['bbb', 'aaa', 'ccc'],
+                         '命中的挪到最前，其余保持原序（稳定排序）')
+        self.assertEqual(len(ordered), len(candidates), '排序不得丢候选')
+        self.assertEqual([key for key, _cls in dm._order_by_vendor(candidates, '')],
+                         ['aaa', 'bbb', 'ccc'], '没厂牌提示时顺序不变')
+
+    def test_match_driver_falls_back_after_vendor_hint(self):
+        """押错厂牌也得认出模块（排序不过滤的验收）。"""
+        from rtkserver.calibration.drivers import driver_manager as dm
+
+        # `_fake_channel()` 背后是一个只对 `$PQTM` 应答的假模块（LG290P）；
+        # 这里假装端口扫描说是 u-blox —— 押错也必须能退回去认出 LG290P。
+        channel = dm._fake_channel()
+        driver, _message, attempts = dm.match_driver(channel, prefer_vendor='u-blox')
+        self.assertIsNotNone(driver, '厂牌押错不能导致识别失败')
+        self.assertEqual(driver.MODEL_KEY, 'lg290p')
+        self.assertTrue(attempts, '排在前面的 u-blox 驱动要先被试过')
+        self.assertEqual(attempts[0][0], 'zed_f9p',
+                         '厂牌提示的驱动必须排第一，否则这条优化等于没做')
+
+    def test_service_reads_vendor_from_last_scan(self):
+        import threading
+
+        from rtkserver.calibration.service import CalibrationService
+
+        svc = CalibrationService.__new__(CalibrationService)
+        svc._scan_lock = threading.RLock()
+        svc._scan_state = {'ports': [{'port': 'COM14', 'vendor': 'Quectel'},
+                                     {'port': 'COM9', 'vendor': ''}]}
+        self.assertEqual(svc._scan_vendor('com14'), 'Quectel',
+                         '端口名比较要忽略大小写')
+        self.assertEqual(svc._scan_vendor(' COM14 '), 'Quectel')
+        self.assertEqual(svc._scan_vendor('COM9'), '')
+        self.assertEqual(svc._scan_vendor('COM1'), '', '没扫到的口不许瞎猜厂牌')
+
+    def test_worker_passes_vendor_hint_and_keeps_fallback(self):
+        import inspect as _inspect
+
+        from rtkserver.calibration.service import CalibrationService
+
+        src = _inspect.getsource(CalibrationService._worker)
+        self.assertIn('_scan_vendor(', src)
+        self.assertIn('prefer_vendor=prefer_vendor', src)
+        self.assertLess(src.index('_scan_vendor('), src.index('self._detect_module('),
+                        '厂牌要在识别之前取到')
+        # 手动选了型号就不该再按厂牌排序：候选表本来只有一条
+        self.assertIn("'' if only else self._scan_vendor(", src)
+
+        detect = _inspect.getsource(CalibrationService._detect_module)
+        self.assertIn('prefer_vendor=prefer_vendor', detect,
+                      '换档重试也要带上厂牌，否则一换波特率又回到全量探测')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

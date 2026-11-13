@@ -79,6 +79,27 @@ def visible_driver_ids():
                   if not getattr(cls, 'HIDDEN', False))
 
 
+def vendor_key(name):
+    """厂牌名归一化成可比较的键。
+
+    只留字母数字并转小写：`u-blox` / `U-BLOX` / `ublox` 归一到同一个键。
+    必须这么宽 —— 扫描器的厂牌来自四条互不相干的证据链（RTCM-1033 自述、
+    专属二进制协议、私有命令族、文本横幅），写法不保证一致；驱动里写的
+    是人看的名字（`u-blox`），设备自述里可能是 `u-blox AG`。
+    """
+    return ''.join(ch for ch in str(name or '').lower() if ch.isalnum())
+
+
+def drivers_for_vendor(vendor):
+    """这个厂牌下已注册的型号键（按 key 排序）。认不出/没驱动返回空列表。"""
+    load_builtin_drivers()
+    key = vendor_key(vendor)
+    if not key:
+        return []
+    return sorted(model_key for model_key, cls in _REGISTRY.items()
+                  if vendor_key(getattr(cls, 'VENDOR', '')) == key)
+
+
 def get_driver_by_id(model_key, channel=None):
     """按型号键取驱动实例。未知键返回 None（调用方决定是回退还是报错）。"""
     load_builtin_drivers()
@@ -179,12 +200,33 @@ def methods_of(model_key):
     return driver.methods()
 
 
-def match_driver(channel, only=None, timeout=None):
+def _order_by_vendor(candidates, vendor):
+    """把 `vendor` 这家厂牌的驱动挪到候选表最前面，其余保持原序。
+
+    **只排序、不过滤** —— 这一点是刻意的，不能改成"只试这家的"：
+    厂牌可能来自集成商改过的横幅、也可能是兼容固件（国产模块抄 Quectel 命令
+    但固件串不同）。押错了还得能继续问别家，否则一块本来认得出的模块会被
+    判成"没有驱动认领"。排序只要有一次押对，收益就是"省掉 4~5 个驱动的超时"。
+
+    用 `sorted` 而不是手工拼两个列表：Python 的排序是稳定的，给个 0/1 键
+    就够了，顺序在两组内部都不变，代码也就没有"拼错顺序"的余地。
+    """
+    key = vendor_key(vendor)
+    if not key:
+        return candidates
+    return sorted(candidates,
+                  key=lambda item: 0 if vendor_key(getattr(item[1], 'VENDOR', '')) == key else 1)
+
+
+def match_driver(channel, only=None, timeout=None, prefer_vendor=''):
     """依次发识别命令，返回第一个认领的驱动。
 
     参数：
-        only     只试这些型号键（用户已经手动选了型号时用，省掉 1~2 秒）
-        timeout  预留给"整轮探测超时"的参数（目前未用）
+        only          只试这些型号键（用户已经手动选了型号时用，省掉 1~2 秒）
+        timeout       预留给"整轮探测超时"的参数（目前未用）
+        prefer_vendor 端口扫描已经认出的厂牌（`'Quectel'` / `'u-blox'` …）。
+                      给了就先问这家的驱动，**仍然会回退**去问别家 ——
+                      见 `_order_by_vendor()` 为什么只排序不过滤。
     返回：
         (driver | None, message, attempts)
         attempts 是 [(model_key, 失败原因), ...]，失败时直接展示给用户，
@@ -201,6 +243,13 @@ def match_driver(channel, only=None, timeout=None):
 
     if channel is None or not getattr(channel, 'is_open', False):
         return None, '串口未打开，无法识别模块', []
+
+    before = [key for key, _cls in candidates]
+    candidates = _order_by_vendor(candidates, prefer_vendor)
+    after = [key for key, _cls in candidates]
+    if after != before:
+        logging.info(f'按扫描到的厂牌 {prefer_vendor} 调整识别顺序：'
+                     f'{"、".join(after)}（原顺序 {"、".join(before)}）')
 
     attempts = []
     for model_key, driver_class in candidates:

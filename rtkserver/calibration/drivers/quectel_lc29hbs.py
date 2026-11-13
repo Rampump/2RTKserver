@@ -197,6 +197,7 @@ class LC29HBSDriver(BaseDriver):
 
     MODEL_KEY = 'lc29hbs'
     DISPLAY_NAME = 'Quectel LC29H(BS)'
+    VENDOR = 'Quectel'
     # 固件串 `LC29HBSNR01A01S` 的前 6 位。不能写 'LC29H'：
     # LC29H(AA) 是流动站/基站双模模块，命令集不一样，两者必须分开认。
     MATCH_PREFIX = 'LC29HB'

@@ -439,6 +439,7 @@ class ZEDF9PDriver(BaseDriver):
 
     MODEL_KEY = 'zed_f9p'
     DISPLAY_NAME = 'u-blox ZED-F9P'
+    VENDOR = 'u-blox'
     # 本型号备份要读的报文名。**只列真的存在且可读的**（2026-11-13 真机逐条验过）：
     #   1006 在 F9P 上只能输入、不能输出（RTCM_INPUT_ONLY）；
     #   1033 没有配置键（F9P 不做天线描述，基准站要用 1230 补偿 GLONASS）；

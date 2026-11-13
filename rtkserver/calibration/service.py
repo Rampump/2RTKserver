@@ -804,7 +804,28 @@ class CalibrationService:
         }
 
     # ---------- 工作线程 ----------
-    def _detect_module(self, lease, only, allow_baud_scan):
+    def _scan_vendor(self, port):
+        """上一次端口扫描为这个口认出的厂牌。认不出返回 ''。
+
+        **为什么读后端自己留存的扫描结果，而不是让前端把厂牌当参数传上来**：
+        ① 这份结果是后端测出来的，前端只是它的一个视图，回传一圈等于凭空
+           多出一个"要不要信"的问题（老页面缓存、手改请求都能塞个假厂牌）；
+        ② 页面刷新后前端的扫描结果就没了，后端这份还在，照样能加速。
+
+        端口名比较忽略大小写与空白：Windows 上 `COM3` / `com3` 是同一个口，
+        前端预填时用的写法与扫描器返回的写法也不保证一致。
+        """
+        with self._scan_lock:
+            ports = list((self._scan_state or {}).get('ports') or [])
+        name = str(port or '').strip().lower()
+        if not name:
+            return ''
+        for item in ports:
+            if str(item.get('port') or '').strip().lower() == name:
+                return str(item.get('vendor') or '')
+        return ''
+
+    def _detect_module(self, lease, only, allow_baud_scan, prefer_vendor=''):
         """识别模块，带两级兜底（方案 §14 #3 / #4 / #25）。
 
         识别失败有三种完全不同的原因，对应的动作也不同，**不能让用户自己去猜**：
@@ -817,9 +838,14 @@ class CalibrationService:
 
         波特率枚举**只在用户没显式指定波特率时做**：用户明确填了 460800，
         却被悄悄改成 115200 去试，等于把用户的判断覆盖掉，而且还不告诉他。
+
+        `prefer_vendor` 是端口扫描已认出的厂牌：给了就先问这家的驱动。
+        真机上一次全量探测是「驱动数 × 每驱动 2~4 秒」，Quectel 的命令集排到
+        `unicore`/`ublox` 后面时白等十几秒很常见 —— 而扫描早就告诉了我们是哪家。
         """
         channel = lease.channel
-        driver, message, attempts = driver_manager.match_driver(channel, only=only)
+        driver, message, attempts = driver_manager.match_driver(
+            channel, only=only, prefer_vendor=prefer_vendor)
         if driver is not None:
             return driver, message, attempts, ''
 
@@ -833,7 +859,7 @@ class CalibrationService:
         #
         # ① 波特率不对：换档重开串口再识别（现场最常见的失败原因，优先做）
         if allow_baud_scan:
-            found = self._scan_bauds(lease, only)
+            found = self._scan_bauds(lease, only, prefer_vendor=prefer_vendor)
             if found is not None:
                 found_driver, found_baud = found
                 # 换对档位后，型号已由 `_scan_bauds` 里的 `only` 直接确认，
@@ -848,7 +874,8 @@ class CalibrationService:
         others = [key for key in driver_manager.supported_driver_ids()
                   if not only or key not in only]
         if only and others:
-            alt, _alt_message, _alt_attempts = driver_manager.match_driver(channel, only=others)
+            alt, _alt_message, _alt_attempts = driver_manager.match_driver(
+                channel, only=others, prefer_vendor=prefer_vendor)
             if alt is not None:
                 detected = {'id': alt.MODEL_KEY, 'name': alt.DISPLAY_NAME}
                 self._result['detected_module'] = detected
@@ -862,7 +889,7 @@ class CalibrationService:
         return None, self._detect_failure_text(
             channel, message, attempts, allow_baud_scan), attempts, ''
 
-    def _scan_bauds(self, lease, only):
+    def _scan_bauds(self, lease, only, prefer_vendor=''):
         """依次换波特率重开串口再识别。成功返回 `(driver, baud)`，全失败返回 None。
 
         候选档位的来源分两种：
@@ -905,7 +932,8 @@ class CalibrationService:
             except Exception as e:                   # noqa: BLE001 - 换档失败就试下一个
                 logging.debug(f'以 {baud} 重开串口失败：{e}')
                 continue
-            driver, message, _attempts = driver_manager.match_driver(channel, only=only)
+            driver, message, _attempts = driver_manager.match_driver(
+                channel, only=only, prefer_vendor=prefer_vendor)
             self._keepalive()        # 上一步最坏 9 秒，回来先喂一次再决定
             if driver is not None:
                 lease.baud = int(baud)
@@ -1059,8 +1087,30 @@ class CalibrationService:
             # 用户在前端选了型号就只问这一个（省 1~2 秒，且选错立刻报错）；
             # 没选（None）才挨个问 —— 全量探测只作为兜底，不是默认路径。
             only = [task.get('module')] if task.get('module') else None
-            self._set_stage('DETECT',
-                            f'识别模块型号（{"按所选型号 " + only[0] if only else "自动探测"}）')
+            # 自动探测时，端口扫描可能已经认出厂牌（RTCM-1033 自述 / UBX 帧 /
+            # `$PQTM` 命令族 / 横幅）。那就先问这家的驱动：真机上 Quectel 的
+            # 命令集排到 ublox 后面时，一次识别要白等十几秒才轮到它。
+            # 手动选了型号（only 非空）不需要这条：候选表本来就只有一条。
+            prefer_vendor = '' if only else self._scan_vendor(task.get('port'))
+            vendor_drivers = (driver_manager.drivers_for_vendor(prefer_vendor)
+                              if prefer_vendor else [])
+            if prefer_vendor:
+                self._result['vendor_hint'] = {'vendor': prefer_vendor,
+                                               'drivers': vendor_drivers}
+                logging.info(f'扫描已认出厂牌 {prefer_vendor}，'
+                             f'识别时优先试 {vendor_drivers or "（无对应驱动）"}')
+            if only:
+                detect_text = f'识别模块型号（按所选型号 {only[0]}）'
+            elif prefer_vendor and vendor_drivers:
+                detect_text = (f'识别模块型号（自动探测，扫描已认出 {prefer_vendor}，'
+                               f'优先试它的命令集）')
+            elif prefer_vendor:
+                # 认出厂牌但本程序没有它的驱动（例如 Septentrio / 未知厂牌）：
+                # 直说，比让用户看着进度条猜"到底在试什么"有用。
+                detect_text = f'识别模块型号（自动探测；扫描认出 {prefer_vendor}，但没有对应驱动）'
+            else:
+                detect_text = '识别模块型号（自动探测）'
+            self._set_stage('DETECT', detect_text)
             # 自动探测 + 未填波特率 = 全档枚举（8 档 × 6 驱动 ≈ 45 秒）。
             # 诊断任务默认**不**做这件事：前端已按扫描结果的 family 挡住非 GNSS
             # 端口，这里是第二道闸。要强行试（老设备/扫描误判）必须显式 force。
@@ -1070,7 +1120,7 @@ class CalibrationService:
                     and not task.get('force'):
                 allow_scan = False
             driver, message, attempts, note = self._detect_module(
-                lease, only, allow_baud_scan=allow_scan)
+                lease, only, allow_baud_scan=allow_scan, prefer_vendor=prefer_vendor)
             if note:
                 self._set_stage('DETECT', f'{message}（{note}）')
             if driver is None:

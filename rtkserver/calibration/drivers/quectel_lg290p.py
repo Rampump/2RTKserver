@@ -184,6 +184,7 @@ class LG290PDriver(BaseDriver):
 
     MODEL_KEY = 'lg290p'
     DISPLAY_NAME = 'Quectel LG290P'
+    VENDOR = 'Quectel'
     MATCH_PREFIX = 'LG290P'
     # 双模：§4.1 有 `PQTMCFGRCVRMODE` 的 1=移动站 / 2=基站，两边都能跑。
     # 4 种标定方式全支持。

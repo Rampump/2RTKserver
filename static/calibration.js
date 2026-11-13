@@ -984,8 +984,6 @@
 
   // 已扫到的结果按端口名索引，重扫时整体替换而不是追加。
   function sniffPorts() {
-    var btn = $('cal-scan');
-    if (btn) btn.disabled = true;
     STATE.scan = { running: true, ports: [], progress: [], summary: null, error: '' };
     // 进度与「读取模块信息」共用同一套 UI（见 progEls/startProg）：
     // 转圈 + 已用时间 + 一条按比例推进的进度条。真机上扫描 3 个口全无应答要
@@ -996,7 +994,12 @@
     // 口数这时还不知道（要 POST 回来），用 1 个口起算，后端首帧到达后再按实测修正。
     SCAN_UI.budget = (($('cal-baud') && /^\d+$/.test($('cal-baud').value.trim())) ? 6 : 30);
     startProg('scan', t('cal.scan.started'));
-    setOpBusy('scan', true);
+    // **不要在这里单独禁用按钮**：`STATE.scan.running` 已经是"扫描在跑"的唯一
+    // 真值，两个按钮的可用状态统一由 `syncOpButtons()` 推导。
+    // 原先这里直接禁用按钮、收尾只放开另一个（`setOpBusy('scan', false)`），
+    // 扫描按钮就再也没被放开 —— 而唯一会放开它的 `setFormLocked()` 只在状态
+    // 轮询里跑，没有标定任务时轮询早就停了。现场表现就是"扫完必须刷新页面"。
+    syncOpButtons();
     renderScanPanel();
     setPortHint(t('cal.scan.started'), 'is-info');
 
@@ -1040,7 +1043,7 @@
         SCAN_UI.lastElapsed = progElapsed('scan');
         failProg('scan', err.message);
         SCAN_UI.started = 0;
-        setOpBusy('scan', false);
+        syncOpButtons();
         renderScanPanel();
         setPortHint(t('cal.scan.failed') + ': ' + err.message, 'is-error');
       });
@@ -1080,7 +1083,7 @@
         SCAN_UI.lastElapsed = progElapsed('scan');
         failProg('scan', err.message);
         SCAN_UI.started = 0;
-        setOpBusy('scan', false);
+        syncOpButtons();
         renderScanPanel();
       });
   }
@@ -1126,7 +1129,8 @@
     // 先放开互斥，再写结果提示 —— 顺序反了的话，「读取模块信息」会在
     // 最后一行提示写完之前就变回可点，用户正好卡在这个缝里看到两个都可点。
     SCAN_UI.started = 0;
-    setOpBusy('scan', false);
+    STATE.scan.running = false;
+    syncOpButtons();
     finishProg('scan', t('cal.scan.done_ok', { elapsed: elapsed.toFixed(1) }), 1800, elapsed);
     if (!ports.length) {
       setPortHint(t('cal.scan.empty'), 'is-info');
@@ -1259,7 +1263,11 @@
       // 那行要留给扫描汇总（口数/耗时），否则用户扫完看不到结果。
       btn.title = t('cal.err.detect_not_gnss', { fam: familyLabel(fam) });
     } else {
-      btn.disabled = !!STATE.running;
+      // 家族闸门只是"这一格该不该点"的一半，另一半是串口占用：
+      // 扫描/识别任一条线在跑，这个按钮都必须锁住。以前这里只判 `STATE.running`
+      // （标定任务），于是"扫描在跑时它还是亮的"要靠 `setOpBusy()` 补一刀 ——
+      // 两处各写一半，谁先谁后就决定了按钮亮不亮。现在统一从这里推导。
+      btn.disabled = opLocked();
       btn.title = '';
     }
   }
@@ -1639,24 +1647,18 @@
   // 后端那层只能兜底，真正的互斥必须在点上按钮的那一刻就生效 ——
   // 让用户点了才弹"请先等它结束"，是最容易被当成"程序卡了"的交互。
   //
-  // 禁用清单：
-  //   扫描在跑 → 锁「读取模块信息」；
-  //   读取模块信息在跑 → 锁「扫描串口」。
-  // 「开始标定」不在这里锁：它由 status 轮询里的 setFormLocked() 管，
-  // 两条线都结束后自然会放开，这里再插一手会和轮询打架。
-  var BUSY_IDS = {
-    scan: ['cal-detect'],
-    detect: ['cal-scan']
-  };
-
-  // 只改"因为我们才禁用"的那几个，不碰输入框：扫描期间允许用户继续改串口/型号，
-  // 那是扫完之后马上要用的东西；而 setFormLocked() 会在标定任务开始时统一接管。
-  function setOpBusy(name, busy) {
-    (BUSY_IDS[name] || []).forEach(function (id) {
-      var el = $(id);
-      if (!el) return;
-      el.disabled = !!busy;
-    });
+  // **两个按钮的可用状态只有一个真源 `syncOpButtons()`**，它从三个状态量推导：
+  //   ① 标定任务在跑（`STATE.running`）
+  //   ② 扫描在跑（`STATE.scan.running`，由 POST 与轮询共同维护）
+  //   ③ 识别在跑（`DETECT_UI.started`，本页点过才有计时起点）
+  // 以前是"哪条线开始就 `setOpBusy(name, true)`、结束再 `setOpBusy(name, false)`"
+  // 的成对开关，而 `BUSY_IDS` 只列出**对方**、不含自己：扫描开始时手动
+  // `btn.disabled = true` 禁掉自己，收尾却只放开对方 —— 扫描按钮永久变灰，
+  // 而唯一会重置它的 `setFormLocked()` 只在状态轮询里跑，没有标定任务时
+  // 轮询早就停了。现场表现就是"扫完必须刷新页面才能再点"。
+  // 成对开关的错一个方向就是死锁，改成"每次从状态重算"就没有这个方向问题。
+  function opLocked() {
+    return !!STATE.running || scanRunning() || detectRunning();
   }
 
   function scanRunning() {
@@ -1665,7 +1667,7 @@
 
   function detectRunning() {
     // 本页点过按钮才有本地计时起点；页面刷新后后端仍在跑 DETECT，
-    // 但那时用户没有"我刚点的"这个上下文，靠 setFormLocked() 的 STATE.running 兜底。
+    // 但那时用户没有"我刚点的"这个上下文，靠 `STATE.running` 兜底。
     return !!DETECT_UI.started;
   }
 
@@ -1676,15 +1678,15 @@
     return scanRunning() || STATE.running;
   }
 
-  // 把两个按钮的可用状态刷成当前真值。**只在"没有本地操作在跑"时动按钮**：
-  // 本地操作有自己的一套开始/结束时机（POST 返回、轮询终止），
-  // 轮询每秒插一帧进来会把刚禁用的按钮又放开。
-  //
-  // `setFormLocked()` 已经把 `cal-scan` / `cal-detect` 一并按 STATE.running 设过一遍，
-  // 所以这里只补另一条线的那一半：没在跑的一方，视对方是否占着串口来定。
+  // 把两个按钮的可用状态刷成当前真值。**任何一条线的开始/结束都要调它**，
+  // 而不是各自去改 `disabled` —— 改一半、漏一半就是这一串真机 bug 的来源。
+  // 「开始标定」不在这里管：它由状态轮询里的 `setFormLocked()` 统一接管。
   function syncOpButtons() {
-    if (!SCAN_UI.started) setOpBusy('detect', !!STATE.running);
-    if (!DETECT_UI.started) setOpBusy('scan', !!STATE.running);
+    var scanBtn = $('cal-scan');
+    if (scanBtn) scanBtn.disabled = opLocked();
+    // `cal-detect` 还要过端口家族闸门（未知/噪声口点了必然白等 45 秒），
+    // 那个判断只在 refreshDetectGate 里，这里直接复用，不重写一遍。
+    refreshDetectGate();
   }
 
   function readModuleInfo() {
@@ -1701,18 +1703,17 @@
       return;
     }
     var baud = baudValue();
-    var btn = $('cal-detect');
-    if (btn) btn.disabled = true;
     showError('');
 
     // 先按"还不知道型号"的候选表起个提示，POST 回来后再用后端算的 plan 修正。
     // 这样即在后端慢半拍时，用户也能立刻看到东西在动。
-    // 顺序有讲究：**先占位再禁用**，否则 `detectRunning()` 还是 false，
-    // 「扫描串口」按钮不会被锁，用户正好在这几毫秒里点了它。
+    // 顺序有讲究：**先占位（`startDetectProgress` 里写 `DETECT_UI.started`）
+    // 再刷按钮**，否则 `detectRunning()` 还是 false，「扫描串口」按钮不会被锁，
+    // 用户正好在这几毫秒里点了它。
     DETECT_UI.plan = null;
     DETECT_UI.lastElapsed = 0;
     startDetectProgress(t('cal.detect.prepare'));
-    setOpBusy('detect', true);
+    syncOpButtons();
 
     fetch('/api/calibration/detect', {
       method: 'POST',
@@ -1734,8 +1735,7 @@
           failDetectProgress(res.body.error || t('cal.err.detect'));
           showError(res.body.error || t('cal.err.detect'));
           DETECT_UI.started = 0;
-          refreshDetectGate();
-          setOpBusy('detect', false);
+          syncOpButtons();
           return;
         }
         // 后端返回的预估：型号不同候选表不同，由后端算，前端不硬编码。
@@ -1749,8 +1749,7 @@
         failDetectProgress(t('cal.err.detect'), err.message);
         showError(t('cal.err.detect') + ': ' + err.message);
         DETECT_UI.started = 0;
-        refreshDetectGate();
-        setOpBusy('detect', false);
+        syncOpButtons();
       });
   }
 
@@ -1889,6 +1888,10 @@
     setFormLocked(STATE.running);
     // 页面刷新后本地的 DETECT_UI 是空的，但后端可能仍在跑 diagnose。
     // 这时「扫描串口」必须同样锁住 —— 两边抢的是同一个串口，与是不是本页点的无关。
+    // 注意：这里先刷一次是给"任务在跑"那一段用的；本轮末尾还会再刷一次，
+    // 因为上面那段可能刚好把 `DETECT_UI.started` 清零（任务刚结束），
+    // 那时按钮必须立刻放开，而不是等下一轮 —— 而下一轮在有结果之后就不再来了
+    // （`stopPolling()`），等下去就只能是"刷新页面"。
     syncOpButtons();
 
     var badge = $('cal-run-badge');
@@ -1957,6 +1960,10 @@
           .catch(function () { /* 取不到就留空，不影响标定 */ });
       }
     }
+    // 本轮最后一次刷按钮：这时 `STATE.running` 与 `DETECT_UI.started` 都是终值，
+    // 算出来的就是"接下来用户能点什么"。放在 `stopPolling()` 之后也没关系 ——
+    // 这条路径本来就不依赖轮询继续跑。
+    syncOpButtons();
   }
 
   // ---------------- 结果摘要 ----------------
