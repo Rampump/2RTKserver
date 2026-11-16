@@ -19,6 +19,8 @@ from ..calibration import service as calib
 from ..calibration import store
 from ..calibration.drivers import driver_manager
 from ..calibration.drivers.base import _normalize_method
+from ..calibration.writer import SETTLE_SECONDS as _SETTLE_SECONDS
+from ..calibration.writer import SETTLE_TIMEOUT as _SETTLE_TIMEOUT
 from ..calibration.writer import SURVEY_PROFILES as _SURVEY_PROFILES
 from ..core import state
 from ..core.config import get_config, save_config
@@ -241,6 +243,10 @@ def api_calibration_options():
             'cors_port': 8002,
             'svin_profile': 'standard',
             'method': 'cors',
+            # 取值前的静置观察（秒）。页面上"这次要停服多久"由它算，
+            # 前端不许再抄一份数字：标定节奏一调整，两边就会静默脱节。
+            'settle_seconds': _SETTLE_SECONDS,
+            'settle_timeout': _SETTLE_TIMEOUT,
         },
         'running': bool(snap.get('running')),
         'stage': snap.get('stage'),

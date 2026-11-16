@@ -182,6 +182,9 @@ Calibration design and field notes (mostly 中文):
   — framework overview, the upstream entry point to the three documents above
 - [docs/architecture-and-calibration-integration.zh.md](docs/architecture-and-calibration-integration.zh.md)
   — how the calibration package stays decoupled from the core
+- [docs/cors-settle-stage-optimization.zh.md](docs/cors-settle-stage-optimization.zh.md)
+  — why collecting right after the first fix is biased, and the settle-then-collect
+  design with bin/jump guards (**P0+P1 implemented**, see its 实施记录 section)
 - **Field reports** — real-hardware runs including the failures and root causes:
   [full-chain 2026-11-03](docs/lg290p-realdevice-fullchain-2026-11-03.en.md)
   ([中文](docs/lg290p-realdevice-fullchain-2026-11-03.zh.md)) ·

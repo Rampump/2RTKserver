@@ -68,6 +68,7 @@ STAGE_TEXT = {
     'GGA_WAIT': '等待定位',
     'CORS_CONNECT': '连接 CORS',
     'FIX_WAIT': '等待固定解',
+    'SETTLE': '静置观察',
     'COLLECT': '采集与滤波',
     'CORS_CLOSE': '断开 CORS',
     'SAVE': '保存到模块 NVM',
@@ -96,14 +97,26 @@ STAGE_TEXT_RESTORE = {
     'BACKUP': '读取备份',
 }
 
+# 进度百分比。**必须按最长那条链路（cors）的真实顺序单调递增** ——
+# 这张表是全流程共用的一张，四条路各自跳过一些步，但同一对阶段之间的
+# 先后关系不能颠倒。早先这张表是先后几轮改动各填各的，结果出现两处倒退：
+#   BACKUP(26) → ROVER_SETUP(24)   打开就掉 2%；
+#   COLLECT(60) → CORS_CLOSE(66) → WRITE_COORD(36)   采完掉 30%。
+# 用户看到进度条往回跳，只会以为任务重来了。顺序按 cors 链路排：
+#   PREPARE → HOLD → OPEN → DETECT → BACKUP → PREFLIGHT → ROVER_SETUP →
+#   NMEA_SETUP → GGA_WAIT → CORS_CONNECT → FIX_WAIT → SETTLE → COLLECT →
+#   CORS_CLOSE → WRITE_COORD → BASE_SETUP → MSG_SETUP → SAVE → RESTART →
+#   VERIFY_MODE → VERIFY_RTCM → INJECT → DONE
+# `SVIN_CFG`/`SVIN_WAIT` 只出现在 survey-in 一条路上（写坐标之前），
+# 落在 WRITE_COORD 前面即可；`OBSERVE`/`PLAN` 属于只读诊断，与标定互不重叠。
 STAGE_PROGRESS = {
     'IDLE': 0, 'PREPARE': 3, 'HOLD': 8, 'OPEN': 14, 'DETECT': 20,
-    'BACKUP': 26, 'PREFLIGHT': 26,
-    'WRITE_COORD': 36, 'BASE_SETUP': 46, 'MSG_SETUP': 56, 'SAVE': 64,
-    'SVIN_CFG': 30, 'SVIN_WAIT': 40,
-    'ROVER_SETUP': 24, 'NMEA_SETUP': 28, 'GGA_WAIT': 32, 'CORS_CONNECT': 36,
-    'FIX_WAIT': 40, 'COLLECT': 60, 'CORS_CLOSE': 66,
-    'RESTART': 72, 'VERIFY_MODE': 80, 'VERIFY_RTCM': 88, 'INJECT': 96,
+    'BACKUP': 24, 'PREFLIGHT': 26,
+    'ROVER_SETUP': 30, 'NMEA_SETUP': 34, 'GGA_WAIT': 36, 'CORS_CONNECT': 38,
+    'FIX_WAIT': 42, 'SETTLE': 50, 'COLLECT': 58, 'CORS_CLOSE': 66,
+    'SVIN_CFG': 30, 'SVIN_WAIT': 48,
+    'WRITE_COORD': 70, 'BASE_SETUP': 76, 'MSG_SETUP': 82, 'SAVE': 86,
+    'RESTART': 90, 'VERIFY_MODE': 93, 'VERIFY_RTCM': 96, 'INJECT': 98,
     'OBSERVE': 45, 'PLAN': 95,
     'DONE': 100, 'FAILED': 0, 'ABORTED': 0, 'INTERRUPTED': 0,
 }

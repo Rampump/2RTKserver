@@ -29,7 +29,7 @@ from ..paths import BASE_DIR
 # 与 2RTKserver.db 同级。放模块级而不是常量写死，是为了自测能整体改成临时文件。
 CALIBRATION_DB = os.path.join(BASE_DIR, 'calibration.db')
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # 每 SN 保留条数 / 全库上限（方案 §12.4）
 KEEP_PER_SN = 50
@@ -52,6 +52,7 @@ RECORD_FIELDS = (
     'ecef_x', 'ecef_y', 'ecef_z', 'accuracy',
     'lat', 'lon', 'height',
     'samples', 'duration',
+    'settle_seconds', 'rebase_events', 'bin_drift', 'trend_mm_per_h', 'need_resurvey',
     'apc_x', 'apc_y', 'apc_z',
     'arp_x', 'arp_y', 'arp_z',
     'gga_guard_used', 'gga_jump_dropped',
@@ -65,13 +66,14 @@ RECORD_FIELDS = (
 )
 
 _REAL_FIELDS = ('ecef_x', 'ecef_y', 'ecef_z', 'accuracy', 'lat', 'lon', 'height',
+                'settle_seconds', 'bin_drift', 'trend_mm_per_h',
                 'apc_x', 'apc_y', 'apc_z',
                 'arp_x', 'arp_y', 'arp_z',
                 'raw_sample_std_e', 'raw_sample_std_n', 'raw_sample_std_u',
                 'kalman_std_e', 'kalman_std_n', 'kalman_std_u',
                 'svin_mean_acc', 'verify_delta')
 _INT_FIELDS = ('samples', 'duration', 'verified', 'gga_guard_used', 'gga_jump_dropped',
-               'svin_valid', 'svin_obs_count')
+               'svin_valid', 'svin_obs_count', 'rebase_events', 'need_resurvey')
 _TEXT_FIELDS = ('module_sn', 'module_model', 'firmware', 'method', 'created_at', 'remark',
                 'nvm_state', 'task_id', 'cors_mountpoint_used')
 
@@ -237,6 +239,26 @@ _DDL_V6 = (
     'CREATE INDEX IF NOT EXISTS idx_module_info_seen ON module_info(last_seen_at DESC)',
 )
 
+# v7（2026-11-16）：记录"这次取值到底稳不稳"的证据。
+#
+# 背景（docs/cors-settle-stage-optimization.zh.md）：模块刚报质量位 4 的那一刻
+# 模糊度才刚固定，坐标之后还会继续收敛、甚至整簇平移。老逻辑一到 4 就开始取平均，
+# 写进模块的基准站坐标偏几厘米，而记录里的 σ 还很漂亮 —— 事后完全无法分辨。
+# 现在采集前有静置观察（SETTLE）、采集期有分箱跳变防护，下面这几个数就是
+# "稳没稳"的原始证据，必须进库，否则复查时只能靠回忆当时天气。
+#   settle_seconds   静置观察实际耗时（0 = 未观察，例如超时降级）
+#   rebase_events    采集期整簇跳变（基准换源 / 重固定）次数
+#   bin_drift        箱均值 3D 极差（米）—— 双峰/多团最直接的证据
+#   trend_mm_per_h   箱均值线性趋势（mm/h）—— 单调慢漂用 σ 看不出来
+#   need_resurvey    1 = 建议复测（漂移超门限或跳变过多）
+_DDL_V7 = (
+    'ALTER TABLE calibration_records ADD COLUMN settle_seconds REAL',
+    'ALTER TABLE calibration_records ADD COLUMN rebase_events INTEGER',
+    'ALTER TABLE calibration_records ADD COLUMN bin_drift REAL',
+    'ALTER TABLE calibration_records ADD COLUMN trend_mm_per_h REAL',
+    'ALTER TABLE calibration_records ADD COLUMN need_resurvey INTEGER',
+)
+
 _MIGRATIONS = {
     1: _DDL_V1,
     2: _DDL_V2,
@@ -244,6 +266,7 @@ _MIGRATIONS = {
     4: _DDL_V4,
     5: _DDL_V5,
     6: _DDL_V6,
+    7: _DDL_V7,
 }
 
 # 初始型号表。**能力矩阵的权威来源是驱动（drivers/*.py 的 CAPS）**，

@@ -7327,5 +7327,376 @@ class TestVendorFirstDetect(unittest.TestCase):
                       '换档重试也要带上厂牌，否则一换波特率又回到全量探测')
 
 
+class TestSettleBeforeCollect(unittest.TestCase):
+    """固定解之后必须先静置观察，再开始取值（2026-11-16 现场反馈）。
+
+    现场：模块刚跳到质量位 4 时坐标还在收敛，之后 1~3 分钟继续漂、偶尔整簇平移。
+    老逻辑"连续 30 秒固定解 → 立刻 1 Hz 采样"，把收敛段一起平均进最终值，
+    写进模块的基准站坐标偏几厘米 —— 而它会**被播发**，下游流动站跟着整体偏移，
+    记录里的 σ 还很好看（双峰把 σ 撑大，3σ 一个点都剔不掉）。
+    """
+
+    def _source(self):
+        import inspect
+
+        from rtkserver.calibration import writer as w
+        return inspect.getsource(w.CoordinateWriter._step_cors_fix_and_collect)
+
+    def test_constants_are_module_level(self):
+        """观察期参数必须是模块级常量，否则离线自测要真等两分钟。"""
+        from rtkserver.calibration import writer as w
+
+        for name in ('SETTLE_SECONDS', 'SETTLE_TIMEOUT', 'SETTLE_BIN_SECONDS',
+                     'SETTLE_BIN_DIFF_MAX', 'SETTLE_SPREAD_MAX', 'SETTLE_TREND_MAX',
+                     'COLLECT_BIN_SECONDS', 'JUMP_TOL_H', 'AGE_OF_DIFF_WARN'):
+            self.assertTrue(hasattr(w, name), f'缺少常量 {name}')
+        self.assertGreater(w.SETTLE_SECONDS, 0)
+        self.assertGreater(w.SETTLE_TIMEOUT, w.SETTLE_SECONDS,
+                           '观察上限必须大于达标窗口，否则永远走超时降级')
+
+    def test_settle_sits_between_fix_wait_and_collect(self):
+        src = self._source()
+        self.assertIn("_stage('SETTLE'", src)
+        self.assertLess(src.index("_stage('SETTLE'"), src.index("_begin_collect(now)"),
+                        '先观察、再采集')
+        fix = src[src.index("if accepted and fix_since >= hold_needed:"):]
+        fix = fix[:fix.index('continue')]
+        self.assertIn('settle_started = now', fix,
+                      '固定解达标后要进 SETTLE，不能直接 collect_started')
+        self.assertNotIn('collect_started = now', fix)
+
+    def test_settle_failure_degrades_instead_of_failing(self):
+        """观察超时不能失败：源本身 5 cm 级或天线在风里时，等下去也不会变稳。"""
+        src = self._source()
+        self.assertIn('SETTLE_TIMEOUT', src)
+        timeout_block = src[src.index('observed >= SETTLE_TIMEOUT'):]
+        timeout_block = timeout_block[:timeout_block.index('_begin_collect(now')]
+        self.assertIn('_warn', timeout_block, '超时要明确告警')
+        self.assertNotIn('raise WriteFailed', timeout_block,
+                         '静置超时是"环境结论"，不是失败')
+
+    def test_no_early_break_on_converged(self):
+        """不再"σ 达标就收工"：60 个样本 ≈ 1 分钟，正好是漂得最厉害的那一段。"""
+        src = self._source()
+        self.assertNotIn('if converged://n                break', src)
+        tail = src[src.index('if elapsed >= eff_duration'):]
+        tail = tail[:tail.index('break')]
+        self.assertIn('COLLECT_MAX_DURATION', tail, '兜底上限仍在')
+
+    def test_collect_drops_samples_before_jump(self):
+        from rtkserver.calibration import writer as w
+
+        src = self._source()
+        self.assertIn('rebase_events += 1', src)
+        self.assertIn('samples.clear()', src)
+        self.assertIn('collect_bins.rebase()', src)
+        # 门限必须是厘米级，不能和 cors.py 的 500 m 防抖混为一谈
+        self.assertLess(w.JUMP_TOL_H, 0.1)
+        self.assertGreater(w.CORS_POLL_INTERVAL, 0)
+
+    def test_settle_loss_restarts_the_timer(self):
+        """观察期内失锁一次必须让窗口**和计时器**一起重来。
+
+        这两件事曾经脱节：计数器只统计、计时器不清零，靠 `settle_restarts == 0`
+        把问题盖住 —— 而那条判据让"中途失锁一次"变成永远不可能达标
+        （计数只增不减），一次闪断就把整次标定推进必然超时降级。
+        """
+        src = self._source()
+        block = src[src.index('if point is None:'):]
+        block = block[:block.index('else:')]
+        self.assertIn('settle_stable_since = None', block,
+                      '失锁后计时器必须清零，否则一次闪断就永远达不了标')
+        self.assertNotIn('settle_restarts == 0', src,
+                         'S4 由"窗口被重置"这个事实保证，不再挂一条恒假的布尔条件')
+
+    def test_settle_time_budget_is_reachable(self):
+        """达标时间必须**严格小于**超时上限，否则这道门永远只会走降级。
+
+        最早达标 = 分箱预热（趋势要 3 个箱）+ 连续观察。原设计 120 + 180 没算
+        预热的 60 秒，达标最早也在 180 秒，正好压在超时线上 —— 现场实测
+        干净环境刚好卡线、真实收敛段必然降级，等于观察期从来没生效。
+        """
+        from rtkserver.calibration import writer as w
+
+        warmup = w.SETTLE_MIN_BINS * w.SETTLE_BIN_SECONDS
+        self.assertGreater(
+            w.SETTLE_TIMEOUT, warmup + w.SETTLE_SECONDS,
+            '超时上限必须大于「预热 + 连续观察」，否则永远等不到达标')
+        self.assertGreaterEqual(
+            w.SETTLE_MIN_BINS, 3,
+            '趋势拟合至少要 3 个箱；窗口回退保留 2 箱会让 trend 永远返回 None（死锁）')
+
+    def test_trim_keeps_trend_computable(self):
+        """判据被打破时窗口回退到 SETTLE_MIN_BINS 箱，趋势必须仍然算得出来。"""
+        from rtkserver.calibration import writer as w
+
+        tracker = w._BinTracker(w.SETTLE_BIN_SECONDS)
+        for i in range(int(w.SETTLE_MIN_BINS) + 2):
+            for k in range(20):                 # 每箱 20 个点
+                tracker.add(i * w.SETTLE_BIN_SECONDS + k, (1.0 + i * 1e-4, 0.0, 0.0))
+        self.assertGreaterEqual(tracker.count, 3)
+        tracker.trim(w.SETTLE_MIN_BINS)
+        self.assertEqual(tracker.count, w.SETTLE_MIN_BINS)
+        self.assertIsNotNone(tracker.trend_span,
+                             '回退后的箱数必须够拟合趋势，否则判据永远不满足')
+
+    def test_age_of_diff_is_optional(self):
+        """不是每个模块都发 Age of Diff：缺字段必须照常跑，且不得参与门限。"""
+        from rtkserver.calibration import writer as w
+
+        src = self._source()
+        self.assertIn("gga.get('age')", src)
+        # 准入判据里不许出现 age
+        for marker in ('fixed = (quality == FIX_QUALITY_REQUIRED',
+                       'float_ok = (quality == FLOAT_QUALITY_ALLOWED'):
+            block = src[src.index(marker):]
+            block = block[:block.index('\n            )') + 1 if '\n            )' in block else 400]
+            self.assertNotIn('age', block, f'{marker} 里不许拿差分龄当门禁')
+        collected = w._BinTracker(10.0)
+        self.assertEqual(collected.summary()['bins'], 0)
+
+
+class TestBinTracker(unittest.TestCase):
+    """分箱统计：双峰靠极差抓、慢漂靠趋势抓，单点噪声不该影响判断。"""
+
+    def _feed(self, tracker, points, dt=1.0):
+        t = 0.0
+        for point in points:
+            tracker.add(t, point)
+            t += dt
+        tracker.finish()
+
+    def test_double_peak_shows_in_spread(self):
+        from rtkserver.calibration.writer import _BinTracker
+
+        tracker = _BinTracker(width=20.0)
+        points = [(1000.0, 0, 0)] * 60 + [(1000.04, 0, 0)] * 60
+        self._feed(tracker, points)
+        self.assertGreater(tracker.spread, 0.03, '两簇相距 4 cm，极差必须体现出来')
+        # 3σ 对双峰失效，是因为它用全段均值算 σ —— 这里用箱均值，两簇就是两团
+        self.assertGreaterEqual(tracker.count, 5)
+
+    def test_slow_drift_shows_in_trend(self):
+        from rtkserver.calibration.writer import _BinTracker
+
+        tracker = _BinTracker(width=20.0)
+        self._feed(tracker, [(1000.0 + i * 0.00017, 0, 0) for i in range(120)])
+        self.assertIsNotNone(tracker.trend_span)
+        self.assertGreater(tracker.trend_span, 0.01,
+                           '120 秒漂 2 cm，趋势判据必须能抓到（σ 判据抓不到）')
+
+    def test_noise_averages_out_in_bins(self):
+        from rtkserver.calibration.writer import _BinTracker
+
+        tracker = _BinTracker(width=20.0)
+        self._feed(tracker, [(1000.0 + ((i % 5) - 2) * 0.003, 0, 0) for i in range(120)])
+        self.assertLess(tracker.spread, 0.001, '箱均值把白噪声抹平后不该有极差')
+
+    def test_reset_rebase_and_trim(self):
+        from rtkserver.calibration.writer import _BinTracker
+
+        tracker = _BinTracker(width=1.0)
+        self._feed(tracker, [(1000.0, 0, 0)] * 5)
+        self.assertGreater(tracker.count, 0)
+        tracker.trim(2)
+        self.assertLessEqual(tracker.count, 2)
+        tracker.reset()
+        self.assertEqual(tracker.count, 0)
+        tracker.add(0.0, (1.0, 2.0, 3.0))
+        self.assertEqual(tracker.count, 0, '未闭合的箱不进均值序列')
+
+
+class TestSettleRecordFields(unittest.TestCase):
+    """稳定性证据要进库（v7），否则事后只能靠回忆当时天气。"""
+
+    def test_schema_version_and_columns(self):
+        from rtkserver.calibration import store
+
+        self.assertGreaterEqual(store.SCHEMA_VERSION, 7)
+        self.assertIn(7, store._MIGRATIONS)
+        for column in ('settle_seconds', 'rebase_events', 'bin_drift',
+                       'trend_mm_per_h', 'need_resurvey'):
+            self.assertIn(column, store.RECORD_FIELDS, f'RECORD_FIELDS 缺 {column}')
+        self.assertIn('bin_drift', store._REAL_FIELDS)
+        self.assertIn('rebase_events', store._INT_FIELDS)
+
+    def test_build_record_maps_stability(self):
+        from rtkserver.calibration.writer import CoordinateWriter, WritePlan
+
+        plan = WritePlan.build_cors(host='h', port=8002, mountpoint='MP', duration=180)
+        plan.arp = (-2519265.0514, 4849534.9045, 3277834.6432)
+        plan.apc = plan.arp
+        writer = CoordinateWriter(None)
+        writer.result = {'cors': {'samples': 180, 'duration_seconds': 190,
+                                  'sigma3d': 0.004, 'settle_seconds': 120.0,
+                                  'rebase_events': 1, 'bin_drift': 0.018,
+                                  'trend_mm_per_h': 4.5, 'need_resurvey': True}}
+        record = writer.build_record(plan)
+        self.assertEqual(record['settle_seconds'], 120.0)
+        self.assertEqual(record['rebase_events'], 1)
+        self.assertEqual(record['bin_drift'], 0.018)
+        self.assertEqual(record['trend_mm_per_h'], 4.5)
+        self.assertEqual(record['need_resurvey'], 1)
+
+    def test_manual_method_leaves_columns_null(self):
+        from rtkserver.calibration.writer import CoordinateWriter, WritePlan
+
+        plan = WritePlan.build(ecef=(-2519265.0514, 4849534.9045, 3277834.6432))
+        plan.arp = plan.apc
+        writer = CoordinateWriter(None)
+        writer.result = {'cors': {}}
+        record = writer.build_record(plan)
+        self.assertIsNone(record['bin_drift'],
+                          '没走采集链的路径要留 NULL，写 0 会被读成"很稳"')
+        self.assertIsNone(record['need_resurvey'])
+
+
+class TestSettleSurfacesInUi(unittest.TestCase):
+    """SETTLE 是新阶段：阶段表、进度映射、前端步骤条、中英文案四处都要有。"""
+
+    def _read(self, *parts):
+        with io.open(os.path.join(REPO_ROOT, *parts), encoding='utf-8') as handle:
+            return handle.read()
+
+    def test_service_stage_tables(self):
+        from rtkserver.calibration import service
+
+        self.assertEqual(service.STAGE_TEXT.get('SETTLE'), '静置观察')
+        self.assertIn('SETTLE', service.STAGE_PROGRESS)
+        self.assertLess(service.STAGE_PROGRESS['FIX_WAIT'],
+                        service.STAGE_PROGRESS['SETTLE'])
+        self.assertLess(service.STAGE_PROGRESS['SETTLE'],
+                        service.STAGE_PROGRESS['COLLECT'])
+
+    def test_frontend_plan_steps_both_paths(self):
+        js = self._read('static', 'calibration.js')
+        body = js[js.index('function planSteps()'):]
+        body = body[:body.index('function ', 10)]
+        self.assertEqual(body.count("'FIX_WAIT', 'SETTLE', 'COLLECT'"), 2,
+                         '只测与一键标定两条路径的步骤条都要有 SETTLE')
+
+    def test_i18n_has_stage_text(self):
+        text = self._read('static', 'i18n.js')
+        self.assertEqual(text.count("'cal.stage.SETTLE'"), 2, '中英各一条')
+
+
+class TestFrontendMatchesBackendFlow(unittest.TestCase):
+    """前端展示与后端实际流程/耗时的一致性。
+
+    这一组锁的都是"页面说的和后端做的不是一回事"的缺陷 —— 它们不会让程序报错，
+    只会让人按错的前提去安排窗口、读错状态。
+    """
+
+    def _read(self, *parts):
+        with io.open(os.path.join(REPO_ROOT, *parts), encoding='utf-8') as handle:
+            return handle.read()
+
+    def test_every_backend_stage_has_i18n(self):
+        """后端 STAGE_TEXT 里每个阶段都必须有中英文案。
+
+        缺一条的直接后果：英文界面下这一阶段的标题回退成后端的中文
+        `stage_text`，界面一半英文一半中文（PREFLIGHT 就一直是这样）。
+        """
+        import re
+        from rtkserver.calibration import service
+
+        text = self._read('static', 'i18n.js')
+        missing = []
+        for stage in service.STAGE_TEXT:
+            key = "'cal.stage.%s'" % stage
+            if text.count(key) != 2:            # 中英各一条
+                missing.append(stage)
+        self.assertEqual(missing, [], '这些阶段缺中英文案（各需 2 条）')
+        self.assertIn("'cal.stage.PREFLIGHT'", text)
+
+    def test_progress_bar_never_goes_backwards(self):
+        """四条链路各自的阶段顺序上，进度百分比必须严格递增。
+
+        这张表共用，四条路各跳过一些步，但同一对阶段的先后不能颠倒 ——
+        早先的版本在 cors 链路上有两处倒退（BACKUP 26 → ROVER_SETUP 24、
+        COLLECT 66 → WRITE_COORD 36），页面上进度条会往回跳，看着像任务重来了。
+        """
+        from rtkserver.calibration import service
+
+        chains = {
+            'cors': ('PREPARE', 'HOLD', 'OPEN', 'DETECT', 'BACKUP', 'PREFLIGHT',
+                     'ROVER_SETUP', 'NMEA_SETUP', 'GGA_WAIT', 'CORS_CONNECT',
+                     'FIX_WAIT', 'SETTLE', 'COLLECT', 'CORS_CLOSE', 'WRITE_COORD',
+                     'BASE_SETUP', 'MSG_SETUP', 'SAVE', 'RESTART', 'VERIFY_MODE',
+                     'VERIFY_RTCM', 'INJECT'),
+            'external_rover': ('PREPARE', 'HOLD', 'OPEN', 'DETECT', 'BACKUP', 'PREFLIGHT',
+                               'ROVER_SETUP', 'NMEA_SETUP', 'GGA_WAIT', 'CORS_CONNECT',
+                               'FIX_WAIT', 'SETTLE', 'COLLECT', 'CORS_CLOSE', 'INJECT'),
+            'survey_in': ('PREPARE', 'HOLD', 'OPEN', 'DETECT', 'BACKUP', 'SVIN_CFG',
+                          'SVIN_WAIT', 'WRITE_COORD', 'BASE_SETUP', 'MSG_SETUP', 'SAVE',
+                          'RESTART', 'VERIFY_MODE', 'VERIFY_RTCM', 'INJECT'),
+            'manual': ('PREPARE', 'HOLD', 'OPEN', 'DETECT', 'BACKUP', 'COLLECT',
+                       'WRITE_COORD', 'BASE_SETUP', 'MSG_SETUP', 'SAVE', 'RESTART',
+                       'VERIFY_MODE', 'VERIFY_RTCM', 'INJECT'),
+        }
+        for name, chain in chains.items():
+            values = [service.STAGE_PROGRESS[stage] for stage in chain]
+            for before, after in zip(values, values[1:]):
+                self.assertLess(before, after,
+                                f'{name} 链路里进度出现倒退：{values}')
+
+    def test_plan_steps_cover_hold_and_preflight(self):
+        """步骤条要画出 HOLD 与 PREFLIGHT，否则比真实流程少两步、卡住时对不上号。"""
+        js = self._read('static', 'calibration.js')
+        body = js[js.index('function planSteps()'):]
+        body = body[:body.index('function ', 10)]
+        self.assertEqual(body.count("'PREPARE', 'HOLD'"), 4,
+                         '四条路径都要有 HOLD（等数据面让出串口）')
+        self.assertEqual(body.count("'BACKUP', 'PREFLIGHT'"), 2,
+                         '只有走 CORS 采集链路的两条路径有 PREFLIGHT')
+
+    def test_measure_only_plan_has_no_restart(self):
+        """只测不写不重启模块：切流动站是仅内存的，步骤条不许画 RESTART。"""
+        js = self._read('static', 'calibration.js')
+        body = js[js.index('function planSteps()'):]
+        body = body[:body.index('function ', 10)]
+        measure = body[body.index("if (method === 'external_rover')"):]
+        measure = measure[:measure.index('return')]
+        self.assertNotIn("'RESTART'", measure,
+                         '只测坐标的链路一次都不重启模块，画出来等于说"会动你的模块"')
+
+    def test_duration_hint_matches_no_early_stop(self):
+        """采集已经改成"采满时长"，文案不许再说"提前收敛会自动停"。"""
+        text = self._read('static', 'i18n.js')
+        for phrase in ('提前收敛会自动停', 'stops early once converged'):
+            self.assertNotIn(phrase, text)
+
+    def test_confirm_estimate_counts_settle(self):
+        """停服估算必须把静置观察算进去，否则页面会比真实耗时少报两分钟。"""
+        js = self._read('static', 'calibration.js')
+        self.assertIn('settleSeconds()', js)
+        self.assertIn('durationSeconds(payload.duration)', js)
+        text = self._read('static', 'i18n.js')
+        self.assertEqual(text.count("'cal.confirm.stop'"), 2)
+        self.assertIn('{settle}', text)
+        self.assertNotIn('? 600', js, '采集秒数不许再在前端写死')
+
+    def test_options_expose_settle_seconds(self):
+        """静置时长由后端下发：前端不该自己记 120 这个数。"""
+        from rtkserver.calibration import writer
+
+        src = self._read('rtkserver', 'web', 'api_calibration.py')
+        self.assertIn("'settle_seconds': _SETTLE_SECONDS", src)
+        self.assertEqual(writer.SETTLE_SECONDS, 120.0)
+
+    def test_timeline_does_not_grow_per_second(self):
+        """阶段流水按"阶段+进入时刻"去重建行，进度消息改写末行。
+
+        按完整消息去重时，静置观察 120 秒 + 采集 300 秒会往 240px 的列表里
+        灌四百多行同一阶段的进度快照。
+        """
+        js = self._read('static', 'calibration.js')
+        body = js[js.index('function appendTimeline(snap)'):]
+        body = body[:body.index('function ', 10)]
+        self.assertIn("snap.stage_at", body)
+        self.assertIn('STATE.lastRowText', body)
+        self.assertNotIn("(snap.message || '')", body)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

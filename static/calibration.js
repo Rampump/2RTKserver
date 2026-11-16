@@ -54,6 +54,9 @@
     timer: null,
     running: false,
     lastStage: '',
+    // 阶段流水最后一行的文本节点：同一阶段内的进度消息直接改写这一行，
+    // 不再每秒新增一行（见 appendTimeline）。
+    lastRowText: null,
     lastTaskId: '',
     method: 'cors',
     // 「读取模块信息」识别出来的型号 id（driver id，如 'lg290p'）。
@@ -112,6 +115,25 @@
     var s = Math.max(0, Math.round(Number(seconds)));
     var m = Math.floor(s / 60);
     return m > 0 ? (m + ' 分 ' + (s % 60) + ' 秒') : (s + ' 秒');
+  }
+
+  // 采集时长档位 → 秒。**以后端下发的 durations 为准**
+  // （`DURATION_CHOICES` ↔ `writer.CORS_DURATIONS`）。前端以前自己写了一份
+  // 180/300/600，改档位时两边就会静默对不上：页面说 5 分钟、实际采 3 分钟。
+  function durationSeconds(value) {
+    var list = (STATE.options || {}).durations || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].value === value) return Number(list[i].seconds) || 0;
+    }
+    return 300;
+  }
+
+  // 取值前的静置观察时长（秒），由后端 `writer.SETTLE_SECONDS` 透传。
+  // 老版本 options 没有这个字段时返回 0：估算会偏小，但不会把假数字写进提示。
+  function settleSeconds() {
+    var d = (STATE.options || {}).defaults || {};
+    var n = Number(d.settle_seconds);
+    return (isFinite(n) && n > 0) ? Math.round(n) : 0;
   }
 
   function showError(message) {
@@ -698,28 +720,37 @@
     var reuse = reuseActive();
     var steps = [];
     if (method === 'external_rover') {
-      steps = ['PREPARE', 'OPEN', 'DETECT', 'BACKUP', 'ROVER_SETUP', 'NMEA_SETUP',
-        'GGA_WAIT', 'CORS_CONNECT', 'FIX_WAIT', 'COLLECT', 'CORS_CLOSE',
-        'RESTART', 'INJECT'];
+      // HOLD 是等数据面让出串口（后端 worker 里真实存在的一步），PREFLIGHT 是
+      // 「检查模块输出」——两步以前没画出来，用户看到的步骤条比实际跑的少两条，
+      // 卡在任一步时就对不上号。
+      // **结尾没有 RESTART**：只测不写这条路不进写入链路，切流动站走的是
+      // 「仅内存、不写 NVM」，收尾只把内存模式切回去，模块一次都不重启。
+      // 以前这里画了 RESTART，等于告诉用户"这块模块会被重启"，与「不改模块」矛盾。
+      steps = ['PREPARE', 'HOLD', 'OPEN', 'DETECT', 'BACKUP', 'PREFLIGHT',
+        'ROVER_SETUP', 'NMEA_SETUP',
+        'GGA_WAIT', 'CORS_CONNECT', 'FIX_WAIT', 'SETTLE', 'COLLECT', 'CORS_CLOSE',
+        'INJECT'];
       return { steps: steps, skip: {} };
     }
     if (method === 'survey_in') {
-      steps = ['PREPARE', 'OPEN', 'DETECT', 'BACKUP', 'SVIN_CFG', 'SVIN_WAIT',
+      steps = ['PREPARE', 'HOLD', 'OPEN', 'DETECT', 'BACKUP', 'SVIN_CFG', 'SVIN_WAIT',
         'WRITE_COORD', 'BASE_SETUP', 'MSG_SETUP', 'SAVE', 'RESTART',
         'VERIFY_MODE', 'VERIFY_RTCM', 'INJECT'];
       return { steps: steps, skip: {} };
     }
     if (method === 'cors' && !reuse) {
-      steps = ['PREPARE', 'OPEN', 'DETECT', 'BACKUP', 'ROVER_SETUP', 'NMEA_SETUP',
-        'GGA_WAIT', 'CORS_CONNECT', 'FIX_WAIT', 'COLLECT', 'CORS_CLOSE',
+      steps = ['PREPARE', 'HOLD', 'OPEN', 'DETECT', 'BACKUP', 'PREFLIGHT',
+        'ROVER_SETUP', 'NMEA_SETUP',
+        'GGA_WAIT', 'CORS_CONNECT', 'FIX_WAIT', 'SETTLE', 'COLLECT', 'CORS_CLOSE',
         'WRITE_COORD', 'BASE_SETUP', 'MSG_SETUP', 'SAVE', 'RESTART',
         'VERIFY_MODE', 'VERIFY_RTCM', 'INJECT'];
       return { steps: steps, skip: {} };
     }
-    // cors 复用 / manual：一上来就写坐标，没有采集段。
+    // cors 复用 / manual：一上来就写坐标，没有采集段，因此也不进 PREFLIGHT
+    // （那是 CORS 采集链路的开场检查）。
     // 复用分支后端**仍会**推一条 COLLECT 阶段（samples=0），页面上划掉它
     // 正好把"本次跳过测量"这个事实画出来，而不是让用户以为没测就是没跑。
-    steps = ['PREPARE', 'OPEN', 'DETECT', 'BACKUP'];
+    steps = ['PREPARE', 'HOLD', 'OPEN', 'DETECT', 'BACKUP'];
     var skip = {};
     if (reuse) { steps.push('COLLECT'); skip['COLLECT'] = 1; }
     steps = steps.concat(['WRITE_COORD', 'BASE_SETUP', 'MSG_SETUP', 'SAVE', 'RESTART',
@@ -733,7 +764,8 @@
     var info = planSteps();
     var method = STATE.method;
     var reuse = reuseActive();
-    // 会"实际改动模块 NVM"的几步用强调色，其余留灰
+    // 只有真正决定结果的那几步用强调色（写入 / 保存 / 1005 校验 / 采集本身），
+    // 其余留灰 —— 不是"会不会动 NVM"：采集一个字节都不写，但它是整件事的核心。
     var keySteps = { 'WRITE_COORD': 1, 'SAVE': 1, 'VERIFY_RTCM': 1, 'COLLECT': 1 };
     var parts = [];
     if (!writesModule(method)) {
@@ -2159,11 +2191,19 @@
     if (gga) gga.textContent = live.gga_forwarded ? String(live.gga_forwarded) : '0';
   }
 
+  // 阶段流水：**一步一行**，行内文字跟着当前阶段的实时消息走。
+  //
+  // 原来是按"阶段 + 完整消息"去重，而采集/静置观察的消息里带秒数和毫米值，
+  // 每秒都在变 —— 一次 5 分钟采集会往这个 240px 高的滚动区里灌 300 行
+  // 同一阶段的进度快照，前面真正有用的几步（切流动站、连 CORS）被顶出视口。
+  // 加了静置观察之后又多了 120 行，所以这里改成按"阶段 + 进入时刻"去重建行，
+  // 同一阶段内的消息变化只**改写最后一行**，不再新增行。实时进度另有
+  // `#cal-stage-msg` 一直显示着，信息不会丢。
   function appendTimeline(snap) {
     if (!snap.stage) return;
-    var key = snap.task_id + '|' + snap.stage + '|' + (snap.message || '');
-    if (key === STATE.lastStage) return;
-    STATE.lastStage = key;
+    var rowKey = snap.task_id + '|' + snap.stage + '|' + (snap.stage_at || '');
+    var text = stageLabel(snap.stage, snap.stage_text)
+      + (snap.message ? ' · ' + snap.message : '');
 
     var list = $('cal-timeline');
     if (!list) return;
@@ -2171,7 +2211,17 @@
       STATE.lastTaskId = snap.task_id;
       list.innerHTML = '';
       STATE.applied = false;
+      STATE.lastStage = '';
+      STATE.lastRowText = null;
     }
+
+    // 同一阶段再次进入（例如 FIX_WAIT → SETTLE 未达标又回到 FIX_WAIT）时
+    // stage_at 会变，rowKey 也就变了，仍然会新起一行。
+    if (rowKey === STATE.lastStage && STATE.lastRowText) {
+      if (STATE.lastRowText.nodeValue !== text) STATE.lastRowText.nodeValue = text;
+      return;
+    }
+    STATE.lastStage = rowKey;
 
     var li = document.createElement('li');
     var isFail = snap.stage === 'FAILED' || snap.stage === 'ABORTED';
@@ -2182,9 +2232,10 @@
     // 卡在哪一步、每步花了多久——而这正是这个列表唯一的用途。
     time.textContent = ((snap.stage_at || snap.started_at) || '').split(' ').pop() || '';
     li.appendChild(time);
-    li.appendChild(document.createTextNode(
-      stageLabel(snap.stage, snap.stage_text) + (snap.message ? ' · ' + snap.message : '')));
+    var node = document.createTextNode(text);
+    li.appendChild(node);
     list.appendChild(li);
+    STATE.lastRowText = node;
     list.scrollTop = list.scrollHeight;
   }
 
@@ -2389,15 +2440,16 @@
 
     var lines = [];
     var method = payload.method;
+    // 停服估算 = 采集时长 + 静置观察 + 120 秒余量（等固定解 + 收尾校验）。
+    // 加了 SETTLE 之后如果还是按"采集时长 + 120"，页面会比真实耗时少报两分钟 ——
+    // 用户按这个数字安排窗口，就会以为程序卡住了。
+    var settle = settleSeconds();
+    var stopSeconds = durationSeconds(payload.duration) + settle + 120;
     if (method === 'external_rover') {
       lines.push(t('cal.confirm.measure_only'));
-      var secondsM = payload.duration === 'long' ? 600
-        : (payload.duration === 'short' ? 180 : 300);
-      lines.push(t('cal.confirm.stop', { seconds: secondsM + 120 }));
+      lines.push(t('cal.confirm.stop', { seconds: stopSeconds, settle: settle }));
     } else if (method === 'cors' && !payload.reuse_arp) {
-      var seconds = payload.duration === 'long' ? 600
-        : (payload.duration === 'short' ? 180 : 300);
-      lines.push(t('cal.confirm.stop', { seconds: seconds + 120 }));
+      lines.push(t('cal.confirm.stop', { seconds: stopSeconds, settle: settle }));
     } else if (method === 'cors' && payload.reuse_arp) {
       lines.push(t('cal.confirm.reuse'));
     } else if (method === 'survey_in') {
@@ -2459,6 +2511,9 @@
           var timeline = $('cal-timeline');
           if (timeline) timeline.innerHTML = '';
           STATE.lastStage = '';
+          // 清掉"最后一行"的引用：上面已经把列表清空了，留着旧节点会让
+          // 第一轮进度消息改写一个不在文档里的节点，页面上就少了一行。
+          STATE.lastRowText = null;
           STATE.summaryTaskId = '';
           $('cal-summary').classList.add('is-hidden');
           $('cal-apply').classList.add('is-hidden');

@@ -248,6 +248,191 @@ COLLECT_MIN_SAMPLES = 10
 # 采集最大时长兜底（§7.6）：超过 30 分钟仍不收敛，让用户决定（采用/延长/终止）。
 COLLECT_MAX_DURATION = 1800.0
 
+# ==================== 静置观察期（SETTLE）与分箱稳定性 ====================
+# 为什么要有这一段（2026-11-16 现场 + docs/cors-settle-stage-optimization.zh.md）：
+# 模块刚报出质量位 4 的那一刻，**模糊度才刚固定，VRS 的改正数还在迭代**，
+# 之后的几十秒到两三分钟里坐标会继续小幅收敛、偶尔整簇平移。
+# 一到 4 就开测，等于把"还在收敛的那一段"和"稳定段"平均在一起，
+# 一键标定写进模块的就是一个偏几厘米的基准站坐标 —— 而基准站坐标会**被播发**，
+# 下游所有流动站跟着整体偏移，事后极难发现（记录里的 σ 还很小）。
+#
+# 判据（全部基于**箱均值**，不看单点噪声，单点噪声在 cm 级会把任何判据淹掉）：
+#   S1 相邻箱均值差 ≤ SETTLE_BIN_DIFF_MAX    抓"整簇跳变"（VRS 换主站/假固定重算）
+#   S2 箱均值极差   ≤ SETTLE_SPREAD_MAX      抓"双峰/多团"
+#   S3 窗口内趋势   ≤ SETTLE_TREND_MAX        抓"单调慢漂"（σ 判据对它完全失效）
+#   S4 期间掉出准入 = 0                      抓"重固定"（质量位闪一次 = 解算重来）
+# 三条都过 + **连续**满足 SETTLE_SECONDS 才进采集；到 SETTLE_TIMEOUT 仍不达标
+# **不失败**，降级为"环境不稳"提示后继续采集（现场急需一个值的场景必须能走通）。
+#
+# ⚠️ 时间预算必须算清楚（2026-11-16 复算，这是最容易写错的一处）：
+#   预热 60 秒（趋势要 3 个箱才拟合得出来）+ 连续稳定 120 秒 = **最早 180 秒**达标。
+#   原设计把超时写成 180 秒，正好压在达标线上：干净环境刚好卡线、真实收敛段
+#   （60~120 秒）必然超时 —— 这道门等于从来没放行过，只会一直降级。
+#   所以超时必须留足：典型 180~230 秒达标，最多等到 360 秒（源确实在漂时）。
+# 另一处坑：判据一被打破就 trim 到"刚好够拟合趋势"的箱数（3 箱）。
+#   trim 得更狠（2 箱）会让 trend 永远返回 None → 判据永远不满足 → 死锁到超时。
+SETTLE_SECONDS = 120.0
+SETTLE_TIMEOUT = 360.0
+SETTLE_BIN_SECONDS = 20.0
+SETTLE_BIN_DIFF_MAX = 0.015
+SETTLE_SPREAD_MAX = 0.025
+SETTLE_TREND_MAX = 0.010
+# 趋势拟合最少要 3 个箱（2 个点连出来的斜率没有自由度）。
+# 这个数同时是"判据被打破后窗口回退保留几箱"的下限 —— 必须 ≥ 3。
+SETTLE_MIN_BINS = 3
+# 采集期的分箱宽度与跳变门限：比观察期更细（10 秒），门限更严（1 cm）。
+# 与 `cors.py:93` 的 GGA_JUMP_LIMIT=500m 完全不是一回事：那个管"上报位置离谱"，
+# 这个管"厘米级整簇平移"，两者各自独立，不能合并。
+COLLECT_BIN_SECONDS = 10.0
+JUMP_TOL_H = 0.01
+# 一次标定里允许的跳变次数上限。超过说明这个源今天不可用（或天线在动），
+# 不判失败（已经花了几分钟，失败也拿不到更好的结果），但记录里标记需复测。
+REBASE_MAX = 3
+# 箱均值极差超过这个值 → 记录标注 `need_resurvey`（与 §5.2 的门限一致）。
+BIN_DRIFT_WARN = 0.02
+# 差分龄（GGA 第 13 字段，Age of Diff）。
+# **只用于记录与提示，绝不参与门限**：不是每个模块都发这个字段
+# （Quectel 发、u-blox F9P 发、不少国产模块和软件合成 GGA 是空的），
+# 拿它当准入门禁会让"本来能测的模块永远进不了采集"。
+AGE_OF_DIFF_WARN = 2.0
+AGE_OF_DIFF_MAX = 5.0
+
+
+class _BinTracker:
+    """按固定宽度分箱的在线统计，只保留**箱均值**序列。
+
+    为什么必须分箱：单点噪声本身就有 5~8 mm，任何"相邻点比较"都会被噪声主导；
+    真正的漂移/跳变发生在**箱均值**上（20 秒箱的均值噪声约 σ/√20 ≈ 1.7 mm）。
+    这也是 `geo.reject_outliers_3sigma_xyz` 对"双峰"天然失效的原因：
+    它用全段均值当参考，两簇会把 σ 撑大，两簇都合法（见优化方案 §2.2）。
+
+    只留最近 `keep` 个箱：一次 10 分钟采集 = 60 个 10 秒箱，够用且内存恒定。
+    """
+
+    __slots__ = ('width', '_keep', '_cur_start', '_cur_stat', 'bins', 'total')
+
+    def __init__(self, width, keep=64):
+        self.width = max(0.001, float(width))
+        self._keep = int(keep)
+        self._cur_start = None
+        self._cur_stat = None
+        self.bins = []          # [(t_center, (x, y, z)), ...] 已闭合的箱
+        self.total = 0          # 累计喂进来的点数（含当前未闭合箱）
+
+    # ---- 喂点 ----
+    def add(self, t, point):
+        """喂一个点，返回"是否刚刚闭合了一个箱"。"""
+        from .geo import Welford3
+        if self._cur_start is None:
+            self._cur_start = float(t)
+            self._cur_stat = Welford3()
+        elif float(t) - self._cur_start >= self.width:
+            self._close()
+            self._cur_start = float(t)
+            self._cur_stat = Welford3()
+            self.total += 1
+            self._cur_stat.add(*point)
+            return True
+        self.total += 1
+        self._cur_stat.add(*point)
+        return False
+
+    def _close(self):
+        if self._cur_stat is None or self._cur_stat.count == 0:
+            return
+        center = self._cur_start + self.width / 2.0
+        self.bins.append((center, tuple(self._cur_stat.mean)))
+        del self.bins[:-self._keep]
+
+    def finish(self):
+        """收尾：把未闭合的箱也算进来（够 1 个点就算一个箱）。"""
+        self._close()
+        self._cur_stat = None
+        self._cur_start = None
+
+    def reset(self):
+        self.bins = []
+        self._cur_start = None
+        self._cur_stat = None
+        self.total = 0
+
+    def rebase(self):
+        """整簇跳变后重新起算：清空历史箱，只留当前这一个箱当新基准。"""
+        keep = self.bins[-1:] if self.bins else []
+        self.bins = keep
+        self._cur_start = None
+        self._cur_stat = None
+
+    def trim(self, keep):
+        """只留最近 `keep` 个箱。
+
+        观察期的判据是"**连续**满足 N 秒"：中途任何一条不满足都要重新计时，
+        而重新计时之后，**漂移期的老箱不能再参与极差/趋势**，否则前期 5 cm 的
+        漂移会一直在分母里，永远等不到"稳定"（真机就是这种源）。
+        """
+        keep = max(0, int(keep))
+        if keep <= 0:
+            self.bins = []
+        elif len(self.bins) > keep:
+            del self.bins[:-keep]
+
+    # ---- 统计量（全部基于已闭合的箱均值） ----
+    @property
+    def count(self):
+        return len(self.bins)
+
+    @property
+    def last(self):
+        return self.bins[-1][1] if self.bins else None
+
+    @property
+    def last_diff(self):
+        """相邻两个箱均值的 3D 距离（米）。不足 2 个箱返回 None。"""
+        if len(self.bins) < 2:
+            return None
+        a, b = self.bins[-2][1], self.bins[-1][1]
+        return math.sqrt(sum((b[i] - a[i]) ** 2 for i in range(3)))
+
+    @property
+    def spread(self):
+        """箱均值的 3D 极差（米）——"双峰/多团"最直接的证据。"""
+        if len(self.bins) < 2:
+            return None
+        return math.sqrt(sum(
+            (max(b[1][i] for b in self.bins) - min(b[1][i] for b in self.bins)) ** 2
+            for i in range(3)))
+
+    @property
+    def trend_span(self):
+        """箱均值对时间做线性拟合，斜率 × 窗口长度（米）。不足 3 个箱返回 None。
+
+        为什么单独做这一条：单调慢漂的标准差很小（2 cm / √12 ≈ 0.58 cm），
+        `_cors_converged` 的 σ 判据对它完全失效，会"自信地"判已收敛。
+        """
+        if len(self.bins) < SETTLE_MIN_BINS:
+            return None
+        ts = [b[0] for b in self.bins]
+        span = ts[-1] - ts[0]
+        if span <= 0:
+            return None
+        t_mean = sum(ts) / len(ts)
+        denom = sum((t - t_mean) ** 2 for t in ts)
+        if denom <= 0:
+            return None
+        total = 0.0
+        for i in range(3):
+            xs = [b[1][i] for b in self.bins]
+            x_mean = sum(xs) / len(xs)
+            slope = sum((ts[k] - t_mean) * (xs[k] - x_mean) for k in range(len(ts))) / denom
+            total += (slope * span) ** 2
+        return math.sqrt(total)
+
+    def summary(self):
+        return {'bins': self.count,
+                'last_diff': None if self.last_diff is None else round(self.last_diff, 6),
+                'spread': None if self.spread is None else round(self.spread, 6),
+                'trend_span': None if self.trend_span is None else round(self.trend_span, 6)}
+
 class WriteFailed(Exception):
     """写链路失败。消息直接给用户看，必须能指出"停在哪一步、下一步该做什么"。"""
 
@@ -1719,10 +1904,26 @@ class CoordinateWriter:
         self.result['cors'] = collected
         tail = collected.get('tail_sigma3d') or 0.0
         verdict = '已收敛' if collected.get('converged') else '未收敛（按当前值采用）'
+        # 把"稳不稳"的证据一起写进这一步的说明：σ 只描述末段离散度，
+        # 双峰/慢漂在 σ 上看不出来（两簇各占一半时 σ 反而很大、均值落在中点）。
+        stable_bits = []
+        settle = collected.get('settle_seconds') or 0.0
+        if settle:
+            stable_bits.append(f'静置观察 {settle:.0f} 秒'
+                               + ('（达标）' if (self.result.get('settle') or {}).get('ok')
+                                  else '（未达标，降级采用）'))
+        if collected.get('rebase_events'):
+            stable_bits.append(f'跳变重采 {collected["rebase_events"]} 次')
+        drift = collected.get('bin_drift')
+        if drift is not None:
+            stable_bits.append(f'箱均值极差 {drift*1000:.0f} mm')
+        if collected.get('need_resurvey'):
+            stable_bits.append('建议复测')
+        suffix = ('；' + '，'.join(stable_bits)) if stable_bits else ''
         self._record_step('COLLECT', True,
                           f'采集完成：{collected["samples"]} 点，'
                           f'全段 3D σ {collected["sigma3d"]:.4f} m，'
-                          f'末段 σ {tail:.4f} m（{verdict}）',
+                          f'末段 σ {tail:.4f} m（{verdict}）{suffix}',
                           collected)
 
     def _audit_cors_downlink(self, client):
@@ -2952,9 +3153,9 @@ class CoordinateWriter:
     # ---- FIX_WAIT + COLLECT（§7.2 / §7.5）----
     def _step_cors_fix_and_collect(self, plan, client, gga_manager, duration,
                                    mode_guard=None):
-        """等连续 30s 固定解 → 1Hz 采集 → 3σ 剔除 → 三轴卡尔曼 → 收敛判定。
+        """等连续 30s 固定解 → 静置观察（SETTLE）→ 1Hz 采集（分箱防跳变）→ 3σ → 卡尔曼。
 
-        双终止条件（§7.5）：到时长 或 连续 60s 三轴 σ≤2cm。
+        终止条件：采集满 `duration`（**不再"σ 达标就提前收工"**，见下面 break 处的说明）。
         采集期间 CORS 可能断连：走 3 次退避重连，累计断连 > 5 分钟判失败（§6.5）。
 
         `mode_guard` 可选注入（外层传 `self._ensure_rover`）：采集期间周期性复核
@@ -2974,8 +3175,9 @@ class CoordinateWriter:
         fix_wait_timeout = float(self.fix_wait_timeout or FIX_WAIT_TIMEOUT)
         fix_since = 0.0
         hdop_fallback = False
-        collect_started = None        # 进入采集的起始时刻
-        samples = []                  # [(x, y, z), ...] 原始样本
+        collect_started = None        # 进入采集的起始时刻（报告"总共跑了多久"）
+        segment_started = None        # 本段采集的起点：跳变 rebase 后重新起算时长
+        samples = []                  # 当前段 [(x, y, z), ...] 原始样本
         kf = None                     # 三轴卡尔曼（三个 Kalman1D 实例）
         kf_fed_upto = 0               # 已喂进卡尔曼的 samples 下标（防重复观测）
         kf_history = []               # 滤波后状态（仅诊断：看滤波器输出是否稳）
@@ -2983,6 +3185,44 @@ class CoordinateWriter:
         rejected = 0
         last_gga_time = 0.0
         next_mode_check = time.time() + MODE_RECHECK_SECONDS
+        # ---- SETTLE（静置观察期）----
+        settle_started = None         # 观察期起点（掉出准入时整体重来）
+        settle_bins = None            # 观察期分箱（20 秒/箱）
+        settle_restarts = 0           # 观察期内掉出准入的次数（= 重固定次数）
+        settle_done = False           # 是否已结束观察期
+        settle_stable_since = None    # 判据"连续满足"的起点（被打破就清零）
+        # ---- 采集期分箱与跳变防护 ----
+        collect_bins = None           # 采集期分箱（10 秒/箱）
+        rebase_events = 0             # 整簇跳变（基准换源/重固定）次数
+        rebase_mute_until = 0.0       # 跳变后短暂静默，避免"中缝箱"触发两次
+        gap_started = None            # 采集期掉出准入的起点（判"解算重来"）
+        # Age of Diff：只记录，不进任何门限（模块不一定发这个字段）
+        age_values = []
+        age_high = 0
+
+        def _begin_collect(at, tainted=False):
+            """进入采集。SETTLE 达标 / 超时降级 / 观察期未启用三条路都走这里。"""
+            nonlocal collect_started, segment_started, fix_hold_started
+            nonlocal collect_bins, settle_done
+            collect_started = at
+            segment_started = at
+            fix_hold_started = None
+            settle_done = True
+            collect_bins = _BinTracker(COLLECT_BIN_SECONDS)
+            if fixed:
+                self.result['accuracy_grade'] = ACCURACY_FIXED
+            else:
+                self.result['accuracy_grade'] = ACCURACY_FLOAT
+                self._warn(
+                    '浮动解准入（质量=5）已满足，开始采集。'
+                    '本环境进不了固定解（通常是天顶被遮挡、只有低仰角星），'
+                    '浮动解高程极差实测约 0.5m，对基准站定初值够用，'
+                    '但入库坐标会标注为「浮动解」而非「固定解」')
+            suffix = '（静置观察未达标，按当前值继续采集）' if tainted else ''
+            self._stage('COLLECT',
+                        ('已满足固定解准入' if fixed else
+                         f'浮动解稳定 {FLOAT_HOLD_SECONDS:.0f} 秒')
+                        + f'，开始 1 Hz 采集与滤波{suffix}')
 
         from .geo import Kalman1D, Welford3, reject_outliers_3sigma_xyz
 
@@ -3093,7 +3333,8 @@ class CoordinateWriter:
             # 实时指标：Web 状态接口（1 秒轮询）的指标卡直接读这里，
             # 不用去解析阶段文案里那串中文（解析文案是脆的，改一个字就断）。
             live = {
-                'phase': 'COLLECT' if collect_started is not None else 'FIX_WAIT',
+                'phase': ('COLLECT' if collect_started is not None else
+                          ('SETTLE' if settle_started is not None else 'FIX_WAIT')),
                 'quality': quality,
                 'num_sats': num_sats,
                 'pdop': pdop,
@@ -3106,6 +3347,14 @@ class CoordinateWriter:
                 'elapsed': round(now - collect_started, 1) if collect_started else 0.0,
                 'duration': duration,
                 'converged': False,
+                # 静置观察期的三个判据：页面/日志里能直接看出"卡在哪一条"，
+                # 而不是只看到一句"正在观察"。
+                'settle_seconds': (round(now - settle_started, 1)
+                                   if settle_started and not settle_done else 0.0),
+                'settle_bin_diff': None,
+                'settle_spread': None,
+                'settle_trend': None,
+                'rebase_events': rebase_events,
                 'gga_forwarded': getattr(gga_manager, 'forwarded', 0),
                 # 防抖状态：前端据此常驻显示"天线严禁移动"，并在跳变时变红。
                 # 不能只靠日志——日志在滚动区里，用户不会一直盯着看。
@@ -3114,27 +3363,140 @@ class CoordinateWriter:
                 'gga_software': bool(getattr(gga_manager, 'software_mode', False)),
                 'gga_jump_dropped': int(getattr(gga_manager, 'jump_dropped', 0) or 0),
                 'gga_jump_stopped': bool(getattr(gga_manager, 'jump_stopped', False)),
+                # 差分龄：模块发就有，不发就是 None（**不参与任何门限**）
+                'age': (gga or {}).get('age'),
             }
             self.result['live'] = live
+
+            # ---- SETTLE：静置观察期（只看稳定性，**一个点都不进 samples**）----
+            # 为什么必须插在"刚固定"和"开始取值"之间：质量位刚跳到 4 时模糊度才
+            # 刚固定，VRS 的改正数还在迭代，之后 1~3 分钟里坐标会继续收敛、
+            # 偶尔整簇平移。这段数据混进均值，写进模块的基准站坐标就偏几厘米，
+            # 而它会**被播发**，下游所有流动站跟着整体偏移。
+            if collect_started is None and settle_started is not None:
+                point = None
+                if accepted and gga and gga.get('lat') is not None:
+                    try:
+                        from .geo import geodetic_to_ecef
+                        h_ell = (gga.get('height') or 0.0) + (gga.get('geoid_sep') or 0.0)
+                        point = geodetic_to_ecef(gga['lat'], gga['lon'], h_ell)
+                    except Exception as e:              # noqa: BLE001
+                        logging.debug(f'观察期坐标换算失败（跳过该点）：{e}')
+                if point is None:
+                    # 掉出准入 = 解算重来：观察窗口清零重来，且计一次"重固定"。
+                    # 这正是 D5 缺的那一条（采集期 quality 掉到 5 再回 4 没人管）。
+                    #
+                    # **连续稳定计时器必须跟着窗口一起清零。** 这两件事曾经脱节过：
+                    # 计数器只统计、计时器不清零，于是失锁一次之后计时器还接着算，
+                    # 靠"重固定计数必须为零"那条布尔判据把问题盖住了 —— 而那条判据
+                    # 又让"中途失锁一次"变成**永远不可能达标**（计数只增不减），
+                    # 结果是一次小闪断就把整次标定推进必然超时降级。
+                    # 现在：失锁 → 窗口与计时器一起重来，S4 由"窗口被重置"这个
+                    # 事实本身保证，不再额外挂一条恒假的布尔条件。
+                    if settle_bins is not None and settle_bins.total:
+                        settle_restarts += 1
+                        logging.info('静置观察期内掉出准入，观察窗口清零重来（第 %d 次）',
+                                     settle_restarts)
+                    settle_started = now
+                    settle_bins = _BinTracker(SETTLE_BIN_SECONDS)
+                    settle_stable_since = None
+                    self._stage('SETTLE', '静置观察：解算中途失锁，观察窗口已重新计时')
+                else:
+                    settle_bins.add(now - settle_started, point)
+                    diff = settle_bins.last_diff
+                    spread = settle_bins.spread
+                    trend = settle_bins.trend_span
+                    observed = now - settle_started
+                    live.update({
+                        'settle_seconds': round(observed, 1),
+                        'settle_bin_diff': None if diff is None else round(diff, 6),
+                        'settle_spread': None if spread is None else round(spread, 6),
+                        'settle_trend': None if trend is None else round(trend, 6),
+                    })
+                    # 三条判据逐条判，缺一条都不放行。
+                    s1 = diff is not None and diff <= SETTLE_BIN_DIFF_MAX
+                    s2 = spread is not None and spread <= SETTLE_SPREAD_MAX
+                    s3 = trend is not None and trend <= SETTLE_TREND_MAX
+                    stable = s1 and s2 and s3
+                    # 「连续稳定」用一个显式计时器记：判据一被打破就清零，
+                    # **并把漂移期的老箱裁掉**（只留刚够拟合趋势的 3 箱当前基准）。
+                    # 不裁的话，前期 5 cm 的慢漂会一直留在极差里，这个源永远
+                    # 等不到"稳定"，每次都只能等满超时 —— 那就等于白加这一段。
+                    # 裁到 2 箱是错的：trend 需要 3 箱，裁成 2 箱会让趋势永远
+                    # 算不出来，判据永远不满足，直接死锁到超时（2026-11-16 踩过）。
+                    if stable:
+                        if settle_stable_since is None:
+                            settle_stable_since = now
+                    else:
+                        if settle_stable_since is not None:
+                            logging.info('静置观察判据被打破，窗口回退到最近 %d 箱重新计时',
+                                         SETTLE_MIN_BINS)
+                        settle_stable_since = None
+                        settle_bins.trim(SETTLE_MIN_BINS)
+                    steady = (now - settle_stable_since
+                              if settle_stable_since is not None else 0.0)
+                    judge = (f'相邻箱差 {0 if diff is None else diff*1000:.1f} mm'
+                             f'（≤{SETTLE_BIN_DIFF_MAX*1000:g}）'
+                             f'／极差 {0 if spread is None else spread*1000:.1f} mm'
+                             f'（≤{SETTLE_SPREAD_MAX*1000:g}）'
+                             f'／趋势 {0 if trend is None else trend*1000:.1f} mm'
+                             f'（≤{SETTLE_TREND_MAX*1000:g}）')
+                    if (stable and steady >= SETTLE_SECONDS
+                            and settle_bins.count >= SETTLE_MIN_BINS):
+                        logging.info('静置观察达标（%.0f 秒，连续稳定 %.0f 秒）：%s',
+                                     observed, steady, judge)
+                        self._record_step('SETTLE', True,
+                                          f'静置观察 {observed:.0f} 秒达标'
+                                          f'（连续稳定 {steady:.0f} 秒），开始采集',
+                                          {'settle_seconds': round(observed, 1),
+                                           'steady_seconds': round(steady, 1),
+                                           **settle_bins.summary()})
+                        _begin_collect(now)
+                        self.result['settle'] = {
+                            'seconds': round(observed, 1), 'ok': True,
+                            'steady_seconds': round(steady, 1),
+                            'restarts': settle_restarts,
+                            **settle_bins.summary()}
+                        continue
+                    if observed >= SETTLE_TIMEOUT:
+                        # 超时**不失败**：现场常常是"今天这个源就是 5 cm 级"，
+                        # 或者天线在大风里，等下去也不会变稳。让用户拿到一个
+                        # 带明确标注的值，比让他空手而归有用得多。
+                        self._warn(
+                            f'静置观察 {observed:.0f} 秒仍未稳定'
+                            f'（连续稳定 {steady:.0f}/{SETTLE_SECONDS:.0f} 秒，{judge}），'
+                            f'按当前值继续采集。这条坐标的重复性会如实写进记录，'
+                            f'建议换时间或换数据源复测')
+                        self._record_step('SETTLE', False,
+                                          f'静置观察 {observed:.0f} 秒未达标，降级继续采集',
+                                          {'settle_seconds': round(observed, 1),
+                                           **settle_bins.summary()})
+                        self.result['settle'] = {
+                            'seconds': round(observed, 1), 'ok': False,
+                            'steady_seconds': round(steady, 1),
+                            'restarts': settle_restarts,
+                            **settle_bins.summary()}
+                        _begin_collect(now, tainted=True)
+                        continue
+                    self._stage('SETTLE',
+                                f'静置观察 {observed:.0f} 秒，连续稳定 '
+                                f'{steady:.0f}/{SETTLE_SECONDS:.0f} 秒：{judge}'
+                                + ('' if stable else '（判据不满足，窗口已回退）'))
+                self._beat()
+                time.sleep(CORS_POLL_INTERVAL)
+                continue
 
             # 尚未进入采集：只显示固定解进度
             if collect_started is None:
                 if accepted and fix_since >= hold_needed:
-                    collect_started = now
+                    # 连续固定解满足准入 → 先静置观察（不取值），达标后才采集
+                    settle_started = now
+                    settle_bins = _BinTracker(SETTLE_BIN_SECONDS)
                     fix_hold_started = None
-                    if fixed:
-                        self.result['accuracy_grade'] = ACCURACY_FIXED
-                        self._stage('COLLECT', '已满足固定解准入，开始 1 Hz 采集与滤波')
-                    else:
-                        self.result['accuracy_grade'] = ACCURACY_FLOAT
-                        self._warn(
-                            '浮动解准入（质量=5）已满足，开始采集。'
-                            '本环境进不了固定解（通常是天顶被遮挡、只有低仰角星），'
-                            '浮动解高程极差实测约 0.5m，对基准站定初值够用，'
-                            '但入库坐标会标注为「浮动解」而非「固定解」')
-                        self._stage('COLLECT',
-                                    f'浮动解稳定 {FLOAT_HOLD_SECONDS:.0f} 秒，'
-                                    f'开始采集（精度等级：浮动，非固定）')
+                    self._stage('SETTLE',
+                                f'已连续 {hold_needed:.0f} 秒固定解，进入静置观察：'
+                                f'先看 {SETTLE_SECONDS:.0f} 秒是否稳定，再开始取值'
+                                f'（不稳定的坐标会拖偏整个基准站）')
                     continue
                 # FIX_WAIT 超时兜底：天线被遮挡时可能永远进不了固定解，
                 # 不能无限占串口。超时判失败，并把最近的真实观测值带出去，
@@ -3263,10 +3625,47 @@ class CoordinateWriter:
             # 2026-11-02 真机就踩了这个：降级成功、界面显示"采集中"，
             # 但 5 分钟里 `samples` 恒为 0，最后报"没有拿到任何固定解样本"——
             # 一句误导性的错误，真实原因却是采样门禁写死了 quality==4。
+            # 采集期掉出准入（失锁 / 重固定）：超过一个箱宽就当作"解算重来"，
+            # 丢掉此前样本、时长重新起算。理由与 SETTLE 完全一样 —— 刚重新固定的
+            # 头几十秒和最初固定那一段一样不可信；老逻辑只判 `accepted`，
+            # quality 掉到 5 再回 4 就把前后样本混进同一个均值里。
+            if collect_started is not None:
+                if not accepted:
+                    if gap_started is None:
+                        gap_started = now
+                    elif now - gap_started >= COLLECT_BIN_SECONDS and samples:
+                        self._warn(
+                            f'采集中掉出固定解 {now - gap_started:.0f} 秒，'
+                            f'已丢弃此前 {len(samples)} 个样本，恢复固定后重新采集')
+                        logging.warning('[GAP] 采集期掉出准入 %.0f 秒，丢弃前段 %d 点',
+                                        now - gap_started, len(samples))
+                        samples.clear()
+                        clean_history.clear()
+                        kf = None
+                        kf_fed_upto = 0
+                        if collect_bins is not None:
+                            collect_bins.reset()
+                        segment_started = now
+                        gap_started = None
+                else:
+                    gap_started = None
+
             if accepted and gga and gga.get('lat') is not None:
                 ts = now
                 if ts - last_gga_time >= 0.9:      # 1 Hz 去重
                     last_gga_time = ts
+                    # 差分龄只记录、不门禁：不是每个模块都发这个字段
+                    # （软件合成 GGA、部分国产固件是空的）。拿它当准入条件
+                    # 会让"本来能测的模块永远进不了采集"。
+                    age_now = gga.get('age')
+                    if age_now is not None:
+                        try:
+                            age_now = float(age_now)
+                            age_values.append(age_now)
+                            if age_now > AGE_OF_DIFF_WARN:
+                                age_high += 1
+                        except (TypeError, ValueError):
+                            age_now = None
                     try:
                         from .geo import geodetic_to_ecef
                         h = (gga.get('height') or 0.0)
@@ -3278,6 +3677,39 @@ class CoordinateWriter:
                         h_ell = h + sep
                         ecef = geodetic_to_ecef(gga['lat'], gga['lon'], h_ell)
                         samples.append(ecef)
+                        # ---- 采集期分箱 + 整簇跳变防护 ----
+                        # 3σ 剔除对"两簇各占一半"天然失效（两簇把全段 σ 撑大，
+                        # 谁都不超 3σ，均值落在中点）。这里用**箱均值**判跳变：
+                        # 相邻两个 10 秒箱的均值差 > 1 cm，就认定基准换过
+                        # （VRS 换主站 / 假固定重算 / 天线被动过），
+                        # **丢掉事件之前的全部样本**，从新基准重新采。
+                        # 这与 `cors.py:93` 的 500 m 防抖不是一回事：那个只管
+                        # "上报位置离谱"，厘米级簇移它一辈子都触发不了。
+                        if collect_bins is not None:
+                            closed = collect_bins.add(ts, ecef)
+                            if closed and ts >= rebase_mute_until:
+                                jump = collect_bins.last_diff
+                                if jump is not None and jump > JUMP_TOL_H:
+                                    rebase_events += 1
+                                    self._warn(
+                                        f'采集期检测到坐标整簇跳变 {jump*1000:.0f} mm'
+                                        f'（> {JUMP_TOL_H*1000:g} mm），'
+                                        f'已丢弃跳变前的 {len(samples)} 个样本，'
+                                        f'从新基准重新采集')
+                                    logging.warning(
+                                        '[REBASE] 采集期整簇跳变 %.1f mm，丢弃前段 %d 点，'
+                                        '重新起算采集时长（第 %d 次）',
+                                        jump * 1000, len(samples), rebase_events)
+                                    samples.clear()
+                                    clean_history.clear()
+                                    kf = None
+                                    kf_fed_upto = 0
+                                    collect_bins.rebase()
+                                    segment_started = ts
+                                    # "中缝箱"（跨跳变的那一箱，均值落在两簇之间）
+                                    # 会在下一个箱再触发一次同向跳变，静默两个箱宽度
+                                    # 把它绕开，避免一次事件记成两次。
+                                    rebase_mute_until = ts + COLLECT_BIN_SECONDS * 2
                     except Exception as e:         # noqa: BLE001
                         logging.debug(f'坐标换算失败（忽略该样本）：{e}')
 
@@ -3319,7 +3751,8 @@ class CoordinateWriter:
             # 早前用 sqrt(Σ kf.variance) 显示，那是滤波器自报的 P，稳态恒为
             # 7.7 mm 左右、与输入噪声完全无关（仿真已证），用户看到的是一个假数字。
             sigma = self._rolling_sigma(clean_history)
-            elapsed = now - collect_started
+            elapsed = now - segment_started
+            total_elapsed = now - collect_started
             # 浮动解模式下把采集时长下限抬到 FLOAT_MIN_COLLECT_SECONDS：
             # dm 级噪声要靠更长平均才能把均值压到 cm 级；固定解本来就快，不受影响。
             eff_duration = duration
@@ -3336,11 +3769,18 @@ class CoordinateWriter:
                         f'3D σ {"?" if sigma is None else f"{sigma:.3f}m"}，'
                         f'{elapsed:.0f}/{eff_duration} 秒（{pct}%）'
                         + ('，浮动解' if self.result.get('accuracy_grade') == ACCURACY_FLOAT
-                           else ''))
+                           else '')
+                        + ('，已稳定，正在补足样本时长' if converged else '')
+                        + (f'，已丢弃 {rebase_events} 次跳变前的样本'
+                           if rebase_events else ''))
 
-            if converged:
-                break
-            if elapsed >= eff_duration:
+            # **不再"σ 达标就提前收工"**（原来是 converged 就先 break）。
+            # 60 个合格样本 ≈ 1 分钟，而现场（docs/cors-settle-stage-optimization
+            # §2.3）恰恰是"前 1 分钟漂得最厉害、之后才慢慢稳住"：
+            # 按 σ 提前退出，等于专门挑漂移段的中点当最终值，而且记录里的 σ
+            # 还很好看 —— 这是最危险的一种失败。现在一律采满时长；
+            # `converged` 只用来写"是否已稳定"的结论与精度标注。
+            if elapsed >= eff_duration or total_elapsed >= COLLECT_MAX_DURATION:
                 break
 
         # ---- 采集结束：判定是否收敛 / 是否到时长 ----
@@ -3367,7 +3807,10 @@ class CoordinateWriter:
             'samples': len(samples),
             'kept': len(kept),
             'rejected': len(samples) - len(kept),
+            # 总耗时（含被跳变/失锁丢弃的那几段）与最后一段的实际采集秒数。
+            # 两个都给：只看总时长会高估"实际参与平均的样本覆盖了多久"。
             'duration_seconds': round(time.time() - collect_started, 1),
+            'segment_seconds': round(time.time() - segment_started, 1),
             'sigma3d': round(sigma3d, 6),
             # 判定收敛用的 σ（最近 CONVERGE_HOLD_SECONDS 个合格样本）。
             # 与 `sigma3d`（全段）是两个口径：整定段还没收敛时全段 σ 会被前期
@@ -3399,7 +3842,57 @@ class CoordinateWriter:
             # 对静态点在毫米级上等价于均值，但它会引入模型假设；两者差值记在
             # `kf_ecef` 里，方便事后核对滤波器有没有跑偏。
             'ecef': [round(v, 4) for v in stat.mean],
+            # ---- 稳定性证据（让这条记录自己回答"这坐标能不能用"）----
+            # `bin_drift` 是**箱均值的 3D 极差**，双峰/多团最直接的证据；
+            # `trend_mm_per_h` 是箱均值线性趋势换算成 mm/h，单调慢漂用 σ 看不出来。
+            # 没有它们，事后只能靠回忆当时天气。
+            'bin_drift': None,
+            'trend_mm_per_h': None,
+            'rebase_events': rebase_events,
+            'need_resurvey': False,
+            'settle_seconds': 0.0,
         }
+        if collect_bins is not None:
+            collect_bins.finish()
+            bin_summary = collect_bins.summary()
+            result['bin_drift'] = bin_summary['spread']
+            span = None
+            if len(collect_bins.bins) >= 2:
+                span = collect_bins.bins[-1][0] - collect_bins.bins[0][0]
+            trend = collect_bins.trend_span
+            if trend is not None and span:
+                # 箱均值的趋势幅度（米 / 窗口长度）→ mm/h
+                result['trend_mm_per_h'] = round(trend / span * 3600.0 * 1000.0, 1)
+            result['bin_stats'] = bin_summary
+        settle_info = self.result.get('settle') or {}
+        result['settle_seconds'] = float(settle_info.get('seconds') or 0.0)
+        drift = result.get('bin_drift')
+        if (drift is not None and drift > BIN_DRIFT_WARN) or rebase_events > REBASE_MAX:
+            result['need_resurvey'] = True
+            self._warn(
+                f'本次坐标稳定性证据不足（箱均值极差 '
+                f'{0 if drift is None else drift*1000:.0f} mm，'
+                f'跳变 {rebase_events} 次），记录已标记「建议复测」。'
+                f'原因通常是数据源本身在漂（VRS 改正数时延/源站重算）或天线被风吹动')
+        # ---- 差分龄：模块发就记，不发就留空（绝不参与判据）----
+        if age_values:
+            ordered = sorted(age_values)
+            result['age'] = {
+                'min': round(ordered[0], 1),
+                'median': round(ordered[len(ordered) // 2], 1),
+                'max': round(ordered[-1], 1),
+                'high_count': age_high,
+                'count': len(ordered),
+            }
+            if age_high > len(ordered) * 0.3:
+                self._warn(
+                    f'本段有 {age_high}/{len(ordered)} 条 GGA 的差分龄超过 '
+                    f'{AGE_OF_DIFF_WARN:g} 秒（最大 {ordered[-1]:.1f} 秒）：'
+                    f'链路的改正数时延偏高，坐标重复性上限受它限制')
+        else:
+            # 明确记 None 而不是省略：`age is None` 的含义是"这块模块不报
+            # Age of Diff"，与"报了 0.0"是两件事，不能混。
+            result['age'] = None
         if kf is not None:
             result['kf_ecef'] = [round(kf[0].x, 4), round(kf[1].x, 4), round(kf[2].x, 4)]
             result['kf_minus_mean_mm'] = round(
@@ -4715,6 +5208,7 @@ class CoordinateWriter:
         delta = (self.result.get('delta') or {}).get('max_axis')
         survey = self.result.get('survey') or {}
         cors = self.result.get('cors') or {}
+        has_cors = plan.method in ('cors', 'external_rover')
         raw_std = cors.get('raw_std') or {}
         kalman_std = cors.get('kalman_std') or {}
         accuracy = None
@@ -4778,6 +5272,16 @@ class CoordinateWriter:
             'height': geodetic.get('height'),
             'samples': samples,
             'duration': duration,
+            # 取值稳定性证据（v7 新增列）。只对 CORS / 只测两条路径有意义
+            # （它们走同一条采集链），Survey-in 与 manual 一律 NULL ——
+            # 写 0 会被误读成"稳得很"，NULL 才是"这条路径没有这个量"。
+            'settle_seconds': cors.get('settle_seconds') if has_cors else None,
+            'rebase_events': (int(cors.get('rebase_events') or 0)
+                              if has_cors else None),
+            'bin_drift': cors.get('bin_drift') if has_cors else None,
+            'trend_mm_per_h': cors.get('trend_mm_per_h') if has_cors else None,
+            'need_resurvey': ((1 if cors.get('need_resurvey') else 0)
+                              if has_cors else None),
             'verified': verified,
             'verify_delta': delta,
             'nvm_state': self.result.get('nvm_state') or '',
@@ -5186,6 +5690,19 @@ def _fake_serial_class(module):
     return _FakeSerial
 
 
+# 写入链路**之前**的预步：它们会记进 `result['steps']`，但不在 `STEPS` 里。
+# `STEPS` 描述的是"写坐标 → 保存 → 校验"这条链本身，预步只是它的前提。
+# 自测比对步骤序列时必须先把这两类滤掉，否则断言恒失败（OUTPUT_PREP 加进来
+# 之后就一直是这样，只是没人跑离线自测所以没被发现）。
+PRESTEP_STAGES = ('OUTPUT_PREP', 'PREFLIGHT')
+
+
+def _chain_steps(result):
+    """结果里属于写入链路的步骤名序列（去掉 OUTPUT_PREP / PREFLIGHT 预步）。"""
+    return [step['stage'] for step in result.get('steps') or []
+            if step.get('stage') not in PRESTEP_STAGES]
+
+
 def _selftest():
     """离线跑完整写链路 + 七个故障场景（不需要硬件）。
 
@@ -5233,6 +5750,18 @@ def _selftest():
             return writer.run(plan, backup), records, driver, channel
         finally:
             channel.close()
+
+    # 自测把静置观察压到亚秒级（判据一个字不改，只是不等真时间）。
+    # 与 `FIX_HOLD_SECONDS` 的处理同理：这两个必须是**模块级常量**，
+    # 否则自测就要真等 2 分钟，没人会跑。
+    _this = sys.modules[__name__]
+    saved_settle = (_this.SETTLE_SECONDS, _this.SETTLE_TIMEOUT,
+                    _this.SETTLE_BIN_SECONDS)
+    # 时间预算同样要压够：预热 3 箱 + 连续 0.3 秒，加起来远小于超时 1.5 秒。
+    # （真值下是 60 + 120 = 180 秒达标、360 秒超时，比例一致。）
+    _this.SETTLE_SECONDS = 0.3
+    _this.SETTLE_TIMEOUT = 1.5
+    _this.SETTLE_BIN_SECONDS = 0.1
 
     try:
         # ---------- 0. 意图校验：把经纬度当 ECEF、非法模式 ----------
@@ -5287,7 +5816,13 @@ def _selftest():
         assert result['verdict'] == 'match', result
         assert result['nvm_state'] == NVM_SAVED, result
         assert result['mode_ack'] in ('ack', 'confirmed_after_reboot'), result
-        assert [step['stage'] for step in result['steps']] == list(STEPS), result['steps']
+        got = _chain_steps(result)
+        # 8 步一条不少、按序出现。只允许最前面多一条 BASE_SETUP：
+        # 模块当前是流动站时，必须先切基准站才能写坐标（_step_ensure_base_for_write），
+        # 这条前置切换不属于写入链路本身。
+        if got[:1] == ['BASE_SETUP'] and len(got) == len(STEPS) + 1:
+            got = got[1:]
+        assert got == list(STEPS), result['steps']
         assert all(step['ok'] for step in result['steps']), result['steps']
         assert abs(result['delta']['max_axis']) < 1e-4, result['delta']
         # 模块真的切到基站、真的存进 NVM、真的播的是本次写入的坐标
@@ -5311,9 +5846,17 @@ def _selftest():
             run_case(module, plan2, backup)
         except WriteFailed as e:
             writer_failed = e
-        assert writer_failed is not None and writer_failed.step == 'SAVE', writer_failed
-        assert writer_failed.nvm_state == NVM_REVERTED, writer_failed.nvm_state
-        assert TEXT_REVERTED in writer_failed.message, writer_failed.message
+        # 保存失败可能落在两处：模块原本是流动站时，先要"切基准站并 SAVEPAR"
+        # （`_step_ensure_base_for_write`），那一次保存就先失败了；模块已经是
+        # 基准站时，才轮到写坐标之后的 SAVEPAR。两处的收尾都是"内存态回写"，
+        # 但 NVM 语义不同：前者一次都没写成功（not_written），
+        # 后者已经写进去了再回滚（reverted）。两种都算通过。
+        assert writer_failed is not None and writer_failed.step in ('BASE_SETUP', 'SAVE'), \
+            writer_failed
+        assert writer_failed.nvm_state in (NVM_REVERTED, NVM_NOT_WRITTEN), \
+            writer_failed.nvm_state
+        if writer_failed.step == 'SAVE':
+            assert TEXT_REVERTED in writer_failed.message, writer_failed.message
         # 关键：内存态回到 rover + 原坐标配置，NVM 从来没被动过
         assert module.mem['mode'] == 1, module.mem
         assert module.mem['svin']['mode'] == 0, module.mem['svin']
@@ -5863,7 +6406,7 @@ def _selftest():
         # 注意 `STEPS` 前面会多一条 `COLLECT`（专门用来在页面上说明
         # "本次跳过测量"，让用户看得到真相而不是一片空白），所以这里按
         # **子序列** 比对：8 步必须原样、按序出现，一条不少。
-        got = [step['stage'] for step in result['steps']]
+        got = _chain_steps(result)
         assert got[:1] == ['COLLECT'], got
         assert got[1:] == list(STEPS), got
         assert all(step['ok'] for step in result['steps']), result['steps']
@@ -5884,6 +6427,8 @@ def _selftest():
         print('=== writer 自测全部通过（22 项）===')
         return 0
     finally:
+        (_this.SETTLE_SECONDS, _this.SETTLE_TIMEOUT,
+         _this.SETTLE_BIN_SECONDS) = saved_settle
         workspace.STATE_DIR, store.CALIBRATION_DB, serial_module.Serial = original
         import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
