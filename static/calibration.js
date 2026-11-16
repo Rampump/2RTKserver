@@ -136,6 +136,14 @@
     return (isFinite(n) && n > 0) ? Math.round(n) : 0;
   }
 
+  // 主簇不足时程序自动延长的那一段（后端 `EXTEND_SECONDS`）。
+  // 以前页面估算停服时间时没算它，长档会比真实耗时少报两分钟。
+  function extendSeconds() {
+    var d = (STATE.options || {}).defaults || {};
+    var n = Number(d.extend_seconds);
+    return (isFinite(n) && n > 0) ? Math.round(n) : 0;
+  }
+
   function showError(message) {
     var box = $('cal-global-error');
     if (!box) return;
@@ -801,6 +809,34 @@
       return;
     }
     var accuracy = record.accuracy ? (Number(record.accuracy) * 100).toFixed(1) + ' cm' : '—';
+    // 精度指标必须分开显示（§17 ⑤）：`raw_rms_*` 是**参与取值的那批样本**的
+    // 离散度（= 这条坐标有多准），`source_spread*` 是整个数据源的（= 源在跳多少）。
+    // 以前只露一个 `accuracy`，用户看到 2 cm 就以为"测得不准"，
+    // 其实那是两簇相距 4 cm 撑出来的，主簇自己可能只有 4 mm。
+    var quality = [];
+    var mmText = function (v) {
+      var n = Number(v);
+      return isFinite(n) ? (n * 1000).toFixed(1) + ' mm' : '—';
+    };
+    if (record.raw_rms_h != null) {
+      quality.push(t('cal.history.h') + ' ' + mmText(record.raw_rms_h));
+    }
+    if (record.raw_rms_v != null) {
+      quality.push(t('cal.history.v') + ' ' + mmText(record.raw_rms_v));
+    }
+    if (record.cluster_ratio != null) {
+      quality.push(t('cal.history.cluster') + ' ' +
+        Math.round(Number(record.cluster_ratio) * 100) + '%');
+    }
+    if (record.source_spread != null &&
+        (record.raw_rms_h == null || Number(record.source_spread) > Number(record.raw_rms_h) * 1.5)) {
+      quality.push(t('cal.history.source') + ' ' + mmText(record.source_spread));
+    }
+    var confKey = 'cal.conf.' + String(record.coord_confidence || '');
+    var confText = record.coord_confidence
+      ? (hasKey(confKey) ? t(confKey) : record.coord_confidence) : '';
+    if (confText) quality.push(t('cal.history.conf') + ' ' + confText);
+    if (record.need_resurvey) quality.push(t('cal.history.resurvey'));
     var methodKey = 'cal.method.short.' + String(record.method || '');
     var methodText = hasKey(methodKey) ? t(methodKey) : (record.method || '—');
     // 两组坐标都显示：ECEF 是真正写进模块、真正播发出去的那组数，
@@ -820,6 +856,7 @@
             ' · ' + escapeHtml(record.module_model || '—') +
           '</div>' +
           (geo ? '<div class="h-sn">' + escapeHtml(geo) + '</div>' : '') +
+          (quality.length ? '<div class="h-sn">' + escapeHtml(quality.join(' · ')) + '</div>' : '') +
           '<div class="h-sn">' +
             'X ' + escapeHtml(fmtNum(record.ecef_x, 4, '')) +
             '  Y ' + escapeHtml(fmtNum(record.ecef_y, 4, '')) +
@@ -2440,11 +2477,12 @@
 
     var lines = [];
     var method = payload.method;
-    // 停服估算 = 采集时长 + 静置观察 + 120 秒余量（等固定解 + 收尾校验）。
-    // 加了 SETTLE 之后如果还是按"采集时长 + 120"，页面会比真实耗时少报两分钟 ——
-    // 用户按这个数字安排窗口，就会以为程序卡住了。
+    // 停服估算 = 采集时长 + 预热观察 + 120 秒余量（等固定解 + 收尾校验）+ 120 秒延长。
+    // 延长那 120 秒必须算进来：主簇不够时程序会自己再采一次，长档实际最长
+    // 60 + 300 + 120 + 120 = 600 秒，页面若显示 480 秒，用户会以为程序卡住了。
     var settle = settleSeconds();
-    var stopSeconds = durationSeconds(payload.duration) + settle + 120;
+    var stopSeconds = durationSeconds(payload.duration) + settle + 120
+                      + (extendSeconds() || 120);
     if (method === 'external_rover') {
       lines.push(t('cal.confirm.measure_only'));
       lines.push(t('cal.confirm.stop', { seconds: stopSeconds, settle: settle }));

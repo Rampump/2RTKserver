@@ -29,7 +29,7 @@ from ..paths import BASE_DIR
 # 与 2RTKserver.db 同级。放模块级而不是常量写死，是为了自测能整体改成临时文件。
 CALIBRATION_DB = os.path.join(BASE_DIR, 'calibration.db')
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 10
 
 # 每 SN 保留条数 / 全库上限（方案 §12.4）
 KEEP_PER_SN = 50
@@ -53,6 +53,10 @@ RECORD_FIELDS = (
     'lat', 'lon', 'height',
     'samples', 'duration',
     'settle_seconds', 'rebase_events', 'bin_drift', 'trend_mm_per_h', 'need_resurvey',
+    'cluster_ratio', 'solve_mode', 'mean_vs_median_mm', 'coverage', 'coord_confidence',
+    'raw_rms_h', 'raw_rms_v',
+    'drift_limit', 'bin_step_median', 'consensus_tol',
+    'window_seconds', 'used_span_seconds', 'source_spread', 'source_spread_v',
     'apc_x', 'apc_y', 'apc_z',
     'arp_x', 'arp_y', 'arp_z',
     'gga_guard_used', 'gga_jump_dropped',
@@ -66,7 +70,11 @@ RECORD_FIELDS = (
 )
 
 _REAL_FIELDS = ('ecef_x', 'ecef_y', 'ecef_z', 'accuracy', 'lat', 'lon', 'height',
-                'settle_seconds', 'bin_drift', 'trend_mm_per_h',
+                'settle_seconds', 'bin_drift', 'trend_mm_per_h', 'cluster_ratio',
+                'mean_vs_median_mm', 'coverage', 'raw_rms_h', 'raw_rms_v',
+                'drift_limit', 'bin_step_median', 'consensus_tol',
+                'window_seconds', 'used_span_seconds',
+                'source_spread', 'source_spread_v',
                 'apc_x', 'apc_y', 'apc_z',
                 'arp_x', 'arp_y', 'arp_z',
                 'raw_sample_std_e', 'raw_sample_std_n', 'raw_sample_std_u',
@@ -75,7 +83,8 @@ _REAL_FIELDS = ('ecef_x', 'ecef_y', 'ecef_z', 'accuracy', 'lat', 'lon', 'height'
 _INT_FIELDS = ('samples', 'duration', 'verified', 'gga_guard_used', 'gga_jump_dropped',
                'svin_valid', 'svin_obs_count', 'rebase_events', 'need_resurvey')
 _TEXT_FIELDS = ('module_sn', 'module_model', 'firmware', 'method', 'created_at', 'remark',
-                'nvm_state', 'task_id', 'cors_mountpoint_used')
+                'nvm_state', 'task_id', 'cors_mountpoint_used',
+                'solve_mode', 'coord_confidence')
 
 
 class StoreError(Exception):
@@ -259,6 +268,40 @@ _DDL_V7 = (
     'ALTER TABLE calibration_records ADD COLUMN need_resurvey INTEGER',
 )
 
+# v8：主簇占比。v7 记的是"稳不稳"的原始证据，但事后求解改成"按主簇取中位数"
+# 之后，最该记的其实是"这段数据里到底有没有主簇"——占比低就说明坐标是勉强取的。
+_DDL_V8 = (
+    'ALTER TABLE calibration_records ADD COLUMN cluster_ratio REAL',
+)
+
+# v9：把"这条坐标是怎么来的、能不能信"落库。
+# v8 只记了 `cluster_ratio`，于是事后翻记录分不清"主簇取值"和"勉强退化取值"——
+# 而这两者对基准站是完全不同的结论（§14 P2）。同时补 ENU 口径的水平/垂直 RMS：
+# 老的 raw_sample_std_e/n/u 存的是 ECEF 的 X/Y/Z，拿它比"垂直 2~5 cm"必然看错。
+_DDL_V9 = (
+    'ALTER TABLE calibration_records ADD COLUMN solve_mode TEXT',
+    'ALTER TABLE calibration_records ADD COLUMN mean_vs_median_mm REAL',
+    'ALTER TABLE calibration_records ADD COLUMN coverage REAL',
+    'ALTER TABLE calibration_records ADD COLUMN coord_confidence TEXT',
+    'ALTER TABLE calibration_records ADD COLUMN raw_rms_h REAL',
+    'ALTER TABLE calibration_records ADD COLUMN raw_rms_v REAL',
+)
+
+# v10（§17 ⑥/⑧）：把"判定依据"也落库。
+# 之前只存结论（need_resurvey=1），不存基线（drift_limit / step_median），
+# 事后翻记录分不清是"漂移超基线"、"覆盖率不足"还是"没主簇"—— 三种情况的
+# 处理办法完全不同（换挂载点 / 换时间 / 换位置），归因不了就只能整条丢弃。
+# `source_spread*` 是全段离散度：与 raw_rms_* 同口径、不同 population。
+_DDL_V10 = (
+    'ALTER TABLE calibration_records ADD COLUMN drift_limit REAL',
+    'ALTER TABLE calibration_records ADD COLUMN bin_step_median REAL',
+    'ALTER TABLE calibration_records ADD COLUMN consensus_tol REAL',
+    'ALTER TABLE calibration_records ADD COLUMN window_seconds REAL',
+    'ALTER TABLE calibration_records ADD COLUMN used_span_seconds REAL',
+    'ALTER TABLE calibration_records ADD COLUMN source_spread REAL',
+    'ALTER TABLE calibration_records ADD COLUMN source_spread_v REAL',
+)
+
 _MIGRATIONS = {
     1: _DDL_V1,
     2: _DDL_V2,
@@ -267,6 +310,9 @@ _MIGRATIONS = {
     5: _DDL_V5,
     6: _DDL_V6,
     7: _DDL_V7,
+    8: _DDL_V8,
+    9: _DDL_V9,
+    10: _DDL_V10,
 }
 
 # 初始型号表。**能力矩阵的权威来源是驱动（drivers/*.py 的 CAPS）**，

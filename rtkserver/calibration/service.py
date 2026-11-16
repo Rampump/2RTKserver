@@ -68,7 +68,7 @@ STAGE_TEXT = {
     'GGA_WAIT': '等待定位',
     'CORS_CONNECT': '连接 CORS',
     'FIX_WAIT': '等待固定解',
-    'SETTLE': '静置观察',
+    'SETTLE': '预热观察',
     'COLLECT': '采集与滤波',
     'CORS_CLOSE': '断开 CORS',
     'SAVE': '保存到模块 NVM',
@@ -1871,10 +1871,10 @@ def _write_advice(result, verdict, failed):
             return '已恢复为标定前的配置，可以直接重试；若反复失败请看上面的失败步骤'
         return '没有改动模块配置，可以直接重试'
     if method == 'external_rover':
-        # 只测不写：结论就是"坐标"，模块的持久配置没动。下一步是用户自己的事，
-        # 必须把"拿这个坐标去设基准站"和"别动天线"两句话说清楚。
-        return ('坐标测量完成：本次没有向模块写入任何配置（NVM 未改动）。'
-                '可以用上面这组 ECEF / 经纬度手动把基准站模块设为固定坐标；'
+        # 只测不写：结论就是"坐标"（已在 headline 里给出），模块的持久配置没动。
+        # 下一步是用户自己的事，必须把"拿这个坐标去设基准站"和"别动天线"说清楚。
+        return ('本次没有向模块写入任何配置（NVM 未改动），结果已存进标定记录；'
+                '可以用上面这组坐标手动把基准站模块设为固定坐标。'
                 '天线位置已经确定，搬动或转动过就必须重新测')
     if verdict == 'warning':
         return '1005 偏差在 5~50 cm，模块可能做了内部平滑；坐标可用，建议在流动站侧核对一次'
@@ -1911,7 +1911,40 @@ def _summarize_write(result, plan, failed=''):
     elif plan.kind == 'restore':
         headline = '还原完成：模块已回到标定前的配置'
     elif plan.method == 'external_rover':
-        headline = '坐标测量完成：模块的持久配置未被修改，可用该坐标手动把基准站设为固定站'
+        # **只测不写的结论就是坐标本身**，所以坐标必须写在结论第一行。
+        # 老文案只说"持久配置未被修改"，用户得往下翻记录才看得到测出来的是什么，
+        # 现场最容易发生的误会就是"测完了吗？结果在哪？"。
+        geo = plan_info.get('geodetic') or {}
+        ecef = plan.arp or plan.apc or plan_info.get('arp') or plan_info.get('apc') or []
+        # `result['plan']` 是**坐标解出来之前**拍的快照，`geodetic` 往往是空的
+        # （真机第一次就踩到：结论回退到"配置未被修改"，坐标一个字都没显示）。
+        # 所以这里直接拿 plan 上的 ARP/APC 现算一次经纬度。
+        if (geo.get('lat') is None or geo.get('lon') is None) and ecef:
+            try:
+                from .geo import ecef_to_geodetic
+                lat, lon, height = ecef_to_geodetic(*ecef)
+                geo = {'lat': lat, 'lon': lon, 'height': height}
+            except Exception:                   # noqa: BLE001 - 回显失败不该拦住结论
+                geo = {}
+        if geo.get('lat') is not None and geo.get('lon') is not None:
+            headline = (f'坐标测量完成：纬度 {geo["lat"]:.9f}°，'
+                        f'经度 {geo["lon"]:.9f}°，'
+                        f'椭球高 {float(geo.get("height") or 0.0):.3f} m')
+            if len(ecef) == 3:
+                headline += (f'（ECEF {ecef[0]:.4f}, {ecef[1]:.4f}, {ecef[2]:.4f}）')
+            # 精度紧跟着坐标给：用户看完成结论时第一件事就是问"这组数有多准"。
+            # 这里的数是**参与取值的那批样本**在 ENU 下的水平/垂直 RMS，
+            # 不是全段（全段那个数被另一簇撑大，反映的是"源在跳多少"，见 §17 ②）。
+            cors_stat = result.get('cors') or {}
+            bits = []
+            if cors_stat.get('raw_rms_h') is not None:
+                bits.append(f'水平 {float(cors_stat["raw_rms_h"]) * 1000:.1f} mm')
+            if cors_stat.get('raw_rms_v') is not None:
+                bits.append(f'垂直 {float(cors_stat["raw_rms_v"]) * 1000:.1f} mm')
+            if bits:
+                headline += f'；取值精度（主簇内）：{"、".join(bits)}'
+        else:
+            headline = '坐标测量完成：模块的持久配置未被修改，可用该坐标手动把基准站设为固定站'
     elif (result.get('cors') or {}).get('reused'):
         # 复用历史坐标不是一次新标定：措辞里不能出现"标定完成"，否则用户会以为
         # 我们刚测了一遍，下次天线搬了也不会想起来要重测。

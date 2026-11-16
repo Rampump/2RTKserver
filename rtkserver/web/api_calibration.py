@@ -19,8 +19,9 @@ from ..calibration import service as calib
 from ..calibration import store
 from ..calibration.drivers import driver_manager
 from ..calibration.drivers.base import _normalize_method
-from ..calibration.writer import SETTLE_SECONDS as _SETTLE_SECONDS
-from ..calibration.writer import SETTLE_TIMEOUT as _SETTLE_TIMEOUT
+from ..calibration.writer import CORS_DURATIONS as _CORS_DURATIONS
+from ..calibration.writer import EXTEND_SECONDS as _EXTEND_SECONDS
+from ..calibration.writer import WARMUP_SECONDS as _WARMUP_SECONDS
 from ..calibration.writer import SURVEY_PROFILES as _SURVEY_PROFILES
 from ..core import state
 from ..core.config import get_config, save_config
@@ -38,11 +39,12 @@ _METHOD_LABEL = {
 # 也能处理"自由文本里的 password=xxx"）
 _SECRET_KEY_RE = re.compile(r'(pass(word|wd)?|secret|token)\s*[=:]\s*(\S+)', re.I)
 
-# 采集时长三档（与 writer.CORS_DURATIONS 对应，这里只给前端做下拉）
+# 采集时长三档：**秒数直接从 writer 取**，不再手抄。
+# 手抄过一次，writer 已经收到 2/3/5 分钟，这里还留着 180/300/600，
+# 页面于是显示"5 分钟"、实际只采集 3 分钟 —— 用户按显示等，等到的是提前结束。
 DURATION_CHOICES = [
-    {'value': 'short', 'seconds': 180},
-    {'value': 'standard', 'seconds': 300},
-    {'value': 'long', 'seconds': 600},
+    {'value': key, 'seconds': seconds}
+    for key, seconds in _CORS_DURATIONS.items()
 ]
 
 # Survey-in 档位**直接从 writer 取**，不再手抄一份。
@@ -243,10 +245,14 @@ def api_calibration_options():
             'cors_port': 8002,
             'svin_profile': 'standard',
             'method': 'cors',
-            # 取值前的静置观察（秒）。页面上"这次要停服多久"由它算，
-            # 前端不许再抄一份数字：标定节奏一调整，两边就会静默脱节。
-            'settle_seconds': _SETTLE_SECONDS,
-            'settle_timeout': _SETTLE_TIMEOUT,
+            # 取值前的预热观察（秒，固定时长、不做判据）。页面上"这次要停服多久"
+            # 由它算，前端不许再抄一份数字：标定节奏一调整，两边就会静默脱节。
+            # 键名沿用 `settle_seconds`（前端与老配置都按这个读），语义已改为预热。
+            'settle_seconds': _WARMUP_SECONDS,
+            'warmup_seconds': _WARMUP_SECONDS,
+            # 主簇不足时自动延长的一次（秒）。页面的"停服大概多久"必须把它算进去，
+            # 否则长档实际最长 60+300+120+120=600 秒、页面只报 480 秒。
+            'extend_seconds': _EXTEND_SECONDS,
         },
         'running': bool(snap.get('running')),
         'stage': snap.get('stage'),

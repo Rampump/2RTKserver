@@ -7327,13 +7327,14 @@ class TestVendorFirstDetect(unittest.TestCase):
                       '换档重试也要带上厂牌，否则一换波特率又回到全量探测')
 
 
-class TestSettleBeforeCollect(unittest.TestCase):
-    """固定解之后必须先静置观察，再开始取值（2026-11-16 现场反馈）。
+class TestWarmupBeforeCollect(unittest.TestCase):
+    """固定解之后先预热 60 秒，再采满时长，最后按主簇取值（2026-11-16 真机反馈）。
 
-    现场：模块刚跳到质量位 4 时坐标还在收敛，之后 1~3 分钟继续漂、偶尔整簇平移。
-    老逻辑"连续 30 秒固定解 → 立刻 1 Hz 采样"，把收敛段一起平均进最终值，
-    写进模块的基准站坐标偏几厘米 —— 而它会**被播发**，下游流动站跟着整体偏移，
-    记录里的 σ 还很好看（双峰把 σ 撑大，3σ 一个点都剔不掉）。
+    现场日志原文：**"采集 68 点（剔除 1），3D σ 0.004m，72/600 秒（12%），
+    已丢弃 2 次跳变前的样本"**。模块本身非常稳（3D σ=4 mm），真正的问题是
+    **每次整簇平移都把已完成的工作清零**：这个源每 ~30 秒平移一次，
+    于是样本永远攒不到时长，观察期也永远攒不够"连续 120 秒稳定"。
+    所以判决搬到事后（`_solve_collect`），采集期只记录。
     """
 
     def _source(self):
@@ -7343,117 +7344,281 @@ class TestSettleBeforeCollect(unittest.TestCase):
         return inspect.getsource(w.CoordinateWriter._step_cors_fix_and_collect)
 
     def test_constants_are_module_level(self):
-        """观察期参数必须是模块级常量，否则离线自测要真等两分钟。"""
+        """预热/求解参数必须是模块级常量，否则离线自测要真等一分钟。"""
         from rtkserver.calibration import writer as w
 
-        for name in ('SETTLE_SECONDS', 'SETTLE_TIMEOUT', 'SETTLE_BIN_SECONDS',
-                     'SETTLE_BIN_DIFF_MAX', 'SETTLE_SPREAD_MAX', 'SETTLE_TREND_MAX',
-                     'COLLECT_BIN_SECONDS', 'JUMP_TOL_H', 'AGE_OF_DIFF_WARN'):
+        for name in ('WARMUP_SECONDS', 'COLLECT_BIN_SECONDS', 'JUMP_TOL_H',
+                     'CONSENSUS_ABS_TOL', 'CLUSTER_MIN_RATIO', 'LAST_SEG_MIN',
+                     'EXTEND_SECONDS', 'EXTEND_MAX'):
             self.assertTrue(hasattr(w, name), f'缺少常量 {name}')
-        self.assertGreater(w.SETTLE_SECONDS, 0)
-        self.assertGreater(w.SETTLE_TIMEOUT, w.SETTLE_SECONDS,
-                           '观察上限必须大于达标窗口，否则永远走超时降级')
+        self.assertEqual(w.WARMUP_SECONDS, 60.0)
+        self.assertEqual(w.EXTEND_MAX, 1, '延长只做一次，否则时间没有上界')
+        worst = (w.WARMUP_SECONDS + max(w.CORS_DURATIONS.values())
+                 + w.EXTEND_SECONDS + 120)
+        self.assertLessEqual(worst, 600.0, f'最坏耗时 {worst:g}s 超过 10 分钟')
 
-    def test_settle_sits_between_fix_wait_and_collect(self):
+    def test_warmup_is_fixed_but_handoff_needs_a_point(self):
+        """预热本身没有判据，**但交接要确认当前还有点**（§14 P0-1）。
+
+        老行为"到点无条件进采集"会把"交接瞬间刚好失锁"变成一次整档的空采集，
+        最后报"查账号/挂载点/天线"——归因完全错了。所以：
+          1. 预热时长固定，仍然没有"稳不稳"的判据、也不是超时门；
+          2. 到点先看最近 `HANDOFF_FRESH_SECONDS` 内有没有合格点；
+          3. 没有就站在预热里等，最多再等 `COLLECT_BIN_SECONDS`，超了才失败，
+             且文案必须说"预热结束瞬间失锁，未能开始采集"。
+        """
+        from rtkserver.calibration import writer as w
+
         src = self._source()
         self.assertIn("_stage('SETTLE'", src)
-        self.assertLess(src.index("_stage('SETTLE'"), src.index("_begin_collect(now)"),
-                        '先观察、再采集')
-        fix = src[src.index("if accepted and fix_since >= hold_needed:"):]
-        fix = fix[:fix.index('continue')]
-        self.assertIn('settle_started = now', fix,
-                      '固定解达标后要进 SETTLE，不能直接 collect_started')
-        self.assertNotIn('collect_started = now', fix)
+        self.assertIn('observed >= WARMUP_SECONDS', src)
+        self.assertNotIn('SETTLE_TIMEOUT', src,
+                         '预热本身就是固定时长，不该再有"超时门"')
+        self.assertTrue(hasattr(w, 'HANDOFF_FRESH_SECONDS'))
+        block = src[src.index('observed >= WARMUP_SECONDS'):]
+        block = block[:block.index('# 尚未进入采集')]
+        self.assertIn('HANDOFF_FRESH_SECONDS', block, '交接必须确认当前还有点')
+        self.assertIn('settle_last_point_at', block)
+        self.assertIn('_begin_collect(now)', block, '恢复有点之后才进采集')
+        self.assertIn('raise WriteFailed', block,
+                      '宽限期内一直没点要明确失败，不能空转整档')
+        self.assertIn('没有合格解', block)
+        # 失败文案不许再把责任推给账号/挂载点/天线
+        self.assertIn('不是账号', src)
 
-    def test_settle_failure_degrades_instead_of_failing(self):
-        """观察超时不能失败：源本身 5 cm 级或天线在风里时，等下去也不会变稳。"""
+    def test_warmup_gap_counted_per_interval(self):
+        """预热期失锁**按区间计数**，不按 0.2 秒轮询累加（§14 P1-4）。"""
         src = self._source()
-        self.assertIn('SETTLE_TIMEOUT', src)
-        timeout_block = src[src.index('observed >= SETTLE_TIMEOUT'):]
-        timeout_block = timeout_block[:timeout_block.index('_begin_collect(now')]
-        self.assertIn('_warn', timeout_block, '超时要明确告警')
-        self.assertNotIn('raise WriteFailed', timeout_block,
-                         '静置超时是"环境结论"，不是失败')
+        start = src.index('if collect_started is None and settle_started is not None:')
+        end = src.index('# 尚未进入采集', start)
+        warm = src[start:end]
+        self.assertIn('settle_in_gap', warm)
+        self.assertIn('if not settle_in_gap:', warm,
+                      '只有从"有点"进入"失锁"时才 +1')
+        self.assertNotIn('settle_restarts += 1\n                    self._stage',
+                         warm)
+        self.assertIn('_stage_settle', warm,
+                      'SETTLE 文案要按内容去重，不能每轮重写同一句')
 
-    def test_no_early_break_on_converged(self):
-        """不再"σ 达标就收工"：60 个样本 ≈ 1 分钟，正好是漂得最厉害的那一段。"""
+    def test_warmup_keeps_no_samples(self):
+        """预热期的点一个都不许进 samples：丢的是样本，不是时间。"""
         src = self._source()
-        self.assertNotIn('if converged://n                break', src)
-        tail = src[src.index('if elapsed >= eff_duration'):]
-        tail = tail[:tail.index('break')]
-        self.assertIn('COLLECT_MAX_DURATION', tail, '兜底上限仍在')
+        start = src.index('if collect_started is None and settle_started is not None:')
+        end = src.index('# 尚未进入采集', start)
+        warm = src[start:end]
+        self.assertNotIn('samples.append', warm)
+        self.assertNotIn('settle_stable_since', warm, '不再有"连续稳定计时器"')
 
-    def test_collect_drops_samples_before_jump(self):
+    def test_collect_never_discards_samples(self):
+        """采集期只记事件：跳变与失锁都不许清空样本、不许重算时长。"""
         from rtkserver.calibration import writer as w
 
         src = self._source()
-        self.assertIn('rebase_events += 1', src)
-        self.assertIn('samples.clear()', src)
-        self.assertIn('collect_bins.rebase()', src)
-        # 门限必须是厘米级，不能和 cors.py 的 500 m 防抖混为一谈
-        self.assertLess(w.JUMP_TOL_H, 0.1)
-        self.assertGreater(w.CORS_POLL_INTERVAL, 0)
+        self.assertNotIn('samples.clear()', src, '清一次就等于把已采到的时长全部作废')
+        self.assertNotIn('collect_bins.rebase()', src)
+        self.assertNotIn('segment_started = ', src)
+        self.assertIn('rebase_events += 1', src, '整簇平移仍要计数（只记事件）')
+        self.assertIn('gap_events.append', src)
+        self.assertLess(w.JUMP_TOL_H, 0.1, '门限是厘米级，不是 500m 那个防抖')
 
-    def test_settle_loss_restarts_the_timer(self):
-        """观察期内失锁一次必须让窗口**和计时器**一起重来。
-
-        这两件事曾经脱节：计数器只统计、计时器不清零，靠 `settle_restarts == 0`
-        把问题盖住 —— 而那条判据让"中途失锁一次"变成永远不可能达标
-        （计数只增不减），一次闪断就把整次标定推进必然超时降级。
-        """
+    def test_duration_uses_total_budget(self):
+        """时长只认 `collect_started`，不再有"最后一段"的概念。"""
         src = self._source()
-        block = src[src.index('if point is None:'):]
-        block = block[:block.index('else:')]
-        self.assertIn('settle_stable_since = None', block,
-                      '失锁后计时器必须清零，否则一次闪断就永远达不了标')
-        self.assertNotIn('settle_restarts == 0', src,
-                         'S4 由"窗口被重置"这个事实保证，不再挂一条恒假的布尔条件')
-
-    def test_settle_time_budget_is_reachable(self):
-        """达标时间必须**严格小于**超时上限，否则这道门永远只会走降级。
-
-        最早达标 = 分箱预热（趋势要 3 个箱）+ 连续观察。原设计 120 + 180 没算
-        预热的 60 秒，达标最早也在 180 秒，正好压在超时线上 —— 现场实测
-        干净环境刚好卡线、真实收敛段必然降级，等于观察期从来没生效。
-        """
-        from rtkserver.calibration import writer as w
-
-        warmup = w.SETTLE_MIN_BINS * w.SETTLE_BIN_SECONDS
-        self.assertGreater(
-            w.SETTLE_TIMEOUT, warmup + w.SETTLE_SECONDS,
-            '超时上限必须大于「预热 + 连续观察」，否则永远等不到达标')
-        self.assertGreaterEqual(
-            w.SETTLE_MIN_BINS, 3,
-            '趋势拟合至少要 3 个箱；窗口回退保留 2 箱会让 trend 永远返回 None（死锁）')
-
-    def test_trim_keeps_trend_computable(self):
-        """判据被打破时窗口回退到 SETTLE_MIN_BINS 箱，趋势必须仍然算得出来。"""
-        from rtkserver.calibration import writer as w
-
-        tracker = w._BinTracker(w.SETTLE_BIN_SECONDS)
-        for i in range(int(w.SETTLE_MIN_BINS) + 2):
-            for k in range(20):                 # 每箱 20 个点
-                tracker.add(i * w.SETTLE_BIN_SECONDS + k, (1.0 + i * 1e-4, 0.0, 0.0))
-        self.assertGreaterEqual(tracker.count, 3)
-        tracker.trim(w.SETTLE_MIN_BINS)
-        self.assertEqual(tracker.count, w.SETTLE_MIN_BINS)
-        self.assertIsNotNone(tracker.trend_span,
-                             '回退后的箱数必须够拟合趋势，否则判据永远不满足')
+        self.assertIn('elapsed = now - collect_started', src)
+        self.assertNotIn('elapsed = now - segment_started', src)
+        self.assertIn('extra_seconds', src, '延长要并入预算，否则进度条会倒退')
+        self.assertIn('_solve_collect(', src)
 
     def test_age_of_diff_is_optional(self):
         """不是每个模块都发 Age of Diff：缺字段必须照常跑，且不得参与门限。"""
-        from rtkserver.calibration import writer as w
-
         src = self._source()
         self.assertIn("gga.get('age')", src)
-        # 准入判据里不许出现 age
         for marker in ('fixed = (quality == FIX_QUALITY_REQUIRED',
                        'float_ok = (quality == FLOAT_QUALITY_ALLOWED'):
             block = src[src.index(marker):]
             block = block[:block.index('\n            )') + 1 if '\n            )' in block else 400]
             self.assertNotIn('age', block, f'{marker} 里不许拿差分龄当门禁')
-        collected = w._BinTracker(10.0)
-        self.assertEqual(collected.summary()['bins'], 0)
+
+
+class TestSolveCollect(unittest.TestCase):
+    """事后稳健求解：主簇中位数、永不失败、时间有界。"""
+
+    X0 = -2519265.05
+
+    def _series(self, pattern, noise=0.006, seed=1):
+        """按 [(秒数, 相对 X0 的偏移), ...] 造一条 1 Hz 序列。"""
+        import random
+
+        random.seed(seed)
+        times, points, stamp = [], [], 0.0
+        for seconds, offset in pattern:
+            for _ in range(int(seconds)):
+                stamp += 1.0
+                times.append(stamp)
+                points.append((self.X0 + offset + random.gauss(0, noise),
+                               random.gauss(0, noise), random.gauss(0, noise)))
+        return points, times
+
+    def test_median_beats_mean_on_bimodal_source(self):
+        """70% 时间停在 A、30% 停在 B（相距 4 cm）：中位数落在 A，均值偏 1.2 cm。"""
+        from rtkserver.calibration.writer import _solve_collect
+
+        points, times = self._series([(126, 0.0), (54, 0.04)])
+        solution = _solve_collect(points, times)
+        self.assertEqual(solution['mode'], 'cluster')
+        error = abs(solution['ecef'][0] - self.X0) * 1000
+        self.assertLess(error, 8.0, f'主簇中位数应落在 A 上，实测偏 {error:.1f} mm')
+        mean_x = sum(p[0] for p in points) / len(points)
+        self.assertGreater(abs(mean_x - self.X0) * 1000, 10.0,
+                           '均值会被 30% 的 B 拖偏 —— 这正是不能再用均值的理由')
+
+    def test_clean_source_gives_main_cluster(self):
+        from rtkserver.calibration.writer import _solve_collect
+
+        points, times = self._series([(180, 0.0)])
+        solution = _solve_collect(points, times)
+        self.assertEqual(solution['mode'], 'cluster')
+        self.assertAlmostEqual(solution['cluster_ratio'], 1.0)
+        self.assertFalse(solution['need_resurvey'])
+        self.assertLess(abs(solution['ecef'][0] - self.X0) * 1000, 3.0)
+
+    def test_jump_does_not_discard_earlier_samples(self):
+        """平移之前的样本必须参与统计：主簇取占多数的那一簇。"""
+        from rtkserver.calibration.writer import _solve_collect
+
+        points, times = self._series([(120, 0.0), (60, 0.04)])
+        solution = _solve_collect(points, times)
+        self.assertEqual(solution['mode'], 'cluster')
+        self.assertGreater(solution['used'], 100, '跳变前的样本不能被丢掉')
+        self.assertLess(abs(solution['ecef'][0] - self.X0) * 1000, 8.0)
+
+    def test_ambiguous_source_extends_then_falls_back(self):
+        """两簇各占一半：不猜。先要求延长，延长后仍模糊就取全体中位数 + 标复测。"""
+        from rtkserver.calibration.writer import _solve_collect
+
+        points, times = self._series([(30, 0.0), (30, 0.04), (30, 0.0),
+                                      (30, 0.04), (30, 0.0), (30, 0.04)])
+        first = _solve_collect(points, times, allow_extend=True)
+        self.assertEqual(first['mode'], 'extend')
+        self.assertFalse(first['ok'])
+        final = _solve_collect(points, times, allow_extend=False)
+        self.assertTrue(final['ok'], '任何情况都要给出坐标，永不失败')
+        self.assertEqual(final['mode'], 'all')
+        self.assertTrue(final['need_resurvey'])
+
+    def test_short_series_still_returns_a_value(self):
+        from rtkserver.calibration.writer import _solve_collect
+
+        points, times = self._series([(20, 0.0)])
+        solution = _solve_collect(points, times)
+        self.assertTrue(solution['ok'])
+        self.assertIsNotNone(solution['ecef'])
+        self.assertTrue(solution['need_resurvey'], '样本结构不足必须如实标出来')
+
+    def test_no_samples_reports_empty(self):
+        from rtkserver.calibration.writer import _solve_collect
+
+        solution = _solve_collect([], [])
+        self.assertFalse(solution['ok'])
+        self.assertEqual(solution['mode'], 'empty')
+        self.assertIsNone(solution['ecef'])
+
+    def test_longest_run_prefers_contiguous_bins(self):
+        from rtkserver.calibration.writer import _longest_run
+
+        self.assertEqual(_longest_run([1, 2, 3, 7, 8]), [1, 2, 3])
+        self.assertEqual(_longest_run([5]), [5])
+        self.assertEqual(_longest_run([]), [])
+
+    def test_coverage_exposes_partial_window(self):
+        """只采到 40 秒（窗口 180 秒）不许报"主簇 100%、没事"（§14 P0-2）。"""
+        from rtkserver.calibration import writer as w
+
+        points, times = self._series([(40, 0.0)], noise=0.004)
+        solution = w._solve_collect(points, times, allow_extend=False,
+                                    window_seconds=180)
+        self.assertIsNotNone(solution['coverage'])
+        self.assertLess(solution['coverage'], w.COVERAGE_MIN)
+        self.assertTrue(solution['need_resurvey'], '大面积丢点必须标出来')
+        self.assertIn('覆盖', solution['reason'])
+        # 给了窗口就必须能被别人算出来：cover 秒数 = 有效箱数 × 箱宽
+        self.assertAlmostEqual(solution['used_span_seconds'],
+                               solution['coverage'] * 180, delta=12.0)
+
+    def test_coverage_full_window_is_clean(self):
+        from rtkserver.calibration import writer as w
+
+        points, times = self._series([(180, 0.0)], noise=0.004)
+        solution = w._solve_collect(points, times, allow_extend=False,
+                                    window_seconds=180)
+        self.assertAlmostEqual(solution['coverage'], 1.0, places=2)
+        self.assertFalse(solution['need_resurvey'])
+
+    def test_low_sampling_rate_reports_rate_not_structure(self):
+        """0.15 Hz 要说"采样率不足"，不能说"没有主簇"（§14.6）。"""
+        from rtkserver.calibration import writer as w
+
+        points, times = [], []
+        stamp = 0.0
+        for _ in range(27):                     # 180 秒 × 0.15 Hz
+            points.append((self.X0, 0.0, 0.0))
+            times.append(stamp)
+            stamp += 1 / 0.15
+        solution = w._solve_collect(points, times, allow_extend=False,
+                                    window_seconds=180)
+        self.assertEqual(solution['mode'], 'all')
+        self.assertIn('采样率', solution['reason'])
+        self.assertLess(solution['hz'], w.MIN_SOLVE_HZ)
+        self.assertTrue(solution['need_resurvey'])
+
+    def test_bin_width_adapts_to_sampling_rate(self):
+        """低采样率把箱放宽，而不是把箱全判掉。"""
+        from rtkserver.calibration import writer as w
+
+        points, times = [], []
+        stamp = 0.0
+        for _ in range(180):                    # 180 秒 × 0.6 Hz
+            points.append((self.X0, 0.0, 0.0))
+            times.append(stamp)
+            stamp += 1 / 0.6
+        solution = w._solve_collect(points, times)
+        self.assertGreater(solution['bin_width'], w.SOLVE_BIN_SECONDS - 1e-9)
+        self.assertGreaterEqual(solution['bins'], 3, '放宽箱宽后仍要能分出箱')
+
+    def test_mean_vs_median_measures_legacy_mean_error(self):
+        """`mean_vs_median_mm` 必须量"全体均值 vs 主簇中位数"，不是主簇内部（P1-2）。"""
+        from rtkserver.calibration.writer import _solve_collect
+
+        points, times = self._series([(126, 0.0), (54, 0.04)])
+        solution = _solve_collect(points, times)
+        mean_x = sum(p[0] for p in points) / len(points)
+        legacy_error = abs(mean_x - solution['ecef'][0]) * 1000
+        self.assertAlmostEqual(solution['mean_vs_median_mm'], legacy_error, delta=0.5)
+        self.assertGreater(solution['mean_vs_median_mm'], 8.0,
+                           '两簇各占 70/30 时老算法要偏 1 cm 上下')
+
+    def test_segment_seconds_split(self):
+        """`used_span_seconds` / `window_seconds` 两个字段语义不许再混（P1-3）。"""
+        from rtkserver.calibration.writer import _solve_collect
+
+        points, times = self._series([(180, 0.0)], noise=0.004)
+        solution = _solve_collect(points, times, allow_extend=False,
+                                  window_seconds=180)
+        self.assertEqual(solution['window_seconds'], 180)
+        self.assertAlmostEqual(solution['used_span_seconds'], 180.0, delta=12.0)
+        self.assertAlmostEqual(solution['segment_seconds'],
+                               solution['used_span_seconds'], delta=1e-6,
+                               msg='老字段统一成"参与取值的样本覆盖时长"')
+
+    def test_drift_limit_follows_own_noise_baseline(self):
+        """漂移门限按本段箱差中位数放大：H2~3 cm 的模块不该恒判"建议复测"。"""
+        from rtkserver.calibration import writer as w
+
+        self.assertAlmostEqual(w._drift_limit(None), w.BIN_DRIFT_WARN)
+        self.assertAlmostEqual(w._drift_limit(0.001), w.BIN_DRIFT_WARN,
+                               msg='干净模块走绝对下限')
+        self.assertAlmostEqual(w._drift_limit(0.016), 8 * 0.016,
+                               msg='H2~3cm 模块按本段步长的 8 倍放宽')
 
 
 class TestBinTracker(unittest.TestCase):
@@ -7492,18 +7657,126 @@ class TestBinTracker(unittest.TestCase):
         self._feed(tracker, [(1000.0 + ((i % 5) - 2) * 0.003, 0, 0) for i in range(120)])
         self.assertLess(tracker.spread, 0.001, '箱均值把白噪声抹平后不该有极差')
 
-    def test_reset_rebase_and_trim(self):
+    def test_reset_clears_bins(self):
+        """`_BinTracker` 只做统计：没有 trim/rebase（那两招属于"清零重算"，已删除）。"""
         from rtkserver.calibration.writer import _BinTracker
 
         tracker = _BinTracker(width=1.0)
         self._feed(tracker, [(1000.0, 0, 0)] * 5)
         self.assertGreater(tracker.count, 0)
-        tracker.trim(2)
-        self.assertLessEqual(tracker.count, 2)
         tracker.reset()
         self.assertEqual(tracker.count, 0)
         tracker.add(0.0, (1.0, 2.0, 3.0))
         self.assertEqual(tracker.count, 0, '未闭合的箱不进均值序列')
+        self.assertFalse(hasattr(tracker, 'trim'))
+        self.assertFalse(hasattr(tracker, 'rebase'))
+
+
+class TestPrecisionPopulation(unittest.TestCase):
+    """精度算在**参与取值**的样本上；算不出来给 None（§17 ②③④①）。
+
+    这几条针对的是"轴系修对了、但量谁没改"这个坑：两簇相距 4 cm、各占一半时，
+    全段水平 σ = 20 mm，而主簇自己只有 4 mm。页面上的数字必须是后者。
+    """
+
+    X0 = -2519265.05
+
+    def _series(self, pattern, noise=0.004, seed=7):
+        import random
+
+        random.seed(seed)
+        times, points, stamp = [], [], 0.0
+        for seconds, offset in pattern:
+            for _ in range(int(seconds)):
+                stamp += 1.0
+                times.append(stamp)
+                points.append((self.X0 + offset + random.gauss(0, noise),
+                               random.gauss(0, noise), random.gauss(0, noise)))
+        return points, times
+
+    def test_picked_is_only_the_main_cluster(self):
+        from rtkserver.calibration.writer import _solve_collect
+
+        points, times = self._series([(126, 0.0), (54, 0.04)])
+        solution = _solve_collect(points, times)
+        self.assertEqual(solution['mode'], 'cluster')
+        picked = solution.get('picked')
+        self.assertIsNotNone(picked, '求解器必须交回"参与取值的样本"，否则精度只能算全段')
+        self.assertLess(len(picked), len(points), '另一簇的样本不该参与精度统计')
+        self.assertGreater(len(picked), 100)
+        # 交回来的点必须真的以 A 簇为主（不是随手 copy 一份全段）。
+        # 允许少数跨簇边界的点：跨越平移的那一箱均值落在两簇之间，本来就归属模糊。
+        near_a = sum(1 for p in picked if abs(p[0] - self.X0) < 0.02)
+        self.assertGreater(near_a / float(len(picked)), 0.85)
+
+    def test_picked_falls_back_to_all_when_no_cluster_analysis(self):
+        from rtkserver.calibration.writer import _solve_collect
+
+        points, times = self._series([(25, 0.0)])       # 只有 25 秒 → 有效箱 <3
+        solution = _solve_collect(points, times)
+        self.assertEqual(solution['mode'], 'all')
+        self.assertEqual(len(solution['picked']), len(points))
+
+    def test_no_cluster_analysis_reports_none_not_perfect(self):
+        """采样率不足 / 有效箱 <3：`cluster_ratio` 必须是 None，不能填 1.0（§17 ③）。
+
+        填 1.0 等于把"没算"写成"算完了而且很好"，上游会写"主簇占 100% 的箱"。
+        """
+        from rtkserver.calibration.writer import _solve_collect
+
+        # 0.25 Hz：低于 MIN_SOLVE_HZ，走"采样率不足"分支
+        slow_points = [(self.X0 + (i % 3) * 1e-4, 0.0, 0.0) for i in range(46)]
+        slow_times = [i * 4.0 for i in range(46)]
+        slow = _solve_collect(slow_points, slow_times, window_seconds=180)
+        self.assertEqual(slow['mode'], 'all')
+        self.assertIsNone(slow['cluster_ratio'], '没做簇分析就不能报占比')
+        self.assertIsNone(slow['consensus_bins'])
+        self.assertTrue(slow['need_resurvey'])
+
+        # 1 Hz 但只有 25 秒：有效箱凑不到 3 个
+        points, times = self._series([(25, 0.0)])
+        few = _solve_collect(points, times, window_seconds=180)
+        self.assertEqual(few['mode'], 'all')
+        self.assertIsNone(few['cluster_ratio'])
+        self.assertIsNone(few['consensus_bins'])
+
+    def test_std_gives_none_not_zero(self):
+        """样本不足时 σ 是"没算出来"，不是"0 = 完美"（§17 ④）。"""
+        from rtkserver.calibration.writer import _enu_std, _std
+
+        self.assertIsNone(_std([1.0]))
+        self.assertIsNone(_std([]))
+        self.assertAlmostEqual(_std([1.0, 3.0]), 1.41421356, places=6)
+        self.assertEqual(_enu_std([(self.X0, 0.0, 0.0)], (self.X0, 0.0, 0.0), 25.0, 110.0),
+                         (None, None, None))
+
+    def test_writer_stats_use_value_population(self):
+        """`raw_std`/`raw_rms_*`/`accuracy` 必须用 `chosen_points`；全段另出 source_spread。"""
+        import inspect
+
+        from rtkserver.calibration import writer
+
+        src = inspect.getsource(writer)
+        self.assertIn("chosen_points = solution.pop('picked'", src)
+        # 精度走 picked，全段只进 source_spread —— 两个调用必须在，且分别对应
+        self.assertIn('std_e, std_n, std_u = _enu_std(chosen_points', src)
+        self.assertIn('src_e, src_n, src_u = _enu_std(samples', src)
+        self.assertIn("'source_spread'", src)
+        self.assertIn("'source_sigma3d'", src)
+
+    def test_kalman_std_is_enu(self):
+        """滤波输出的三轴 σ 必须和 raw_std 同轴系；P 对角线老老实实叫 ECEF（§17 ①）。"""
+        import inspect
+
+        from rtkserver.calibration import writer
+
+        src = inspect.getsource(writer)
+        start = src.index("result['kalman_std']")
+        block = src[start - 1200:start + 400]
+        self.assertIn('_enu_std(kf_series', block)
+        self.assertIn("'kalman_p_std_ecef'", src)
+        # 老写法：把 ECEF 方差直接标成 e/n/u
+        self.assertNotIn("'e': round(math.sqrt(max(0.0, kf[0].variance)), 6)", src)
 
 
 class TestSettleRecordFields(unittest.TestCase):
@@ -7512,13 +7785,74 @@ class TestSettleRecordFields(unittest.TestCase):
     def test_schema_version_and_columns(self):
         from rtkserver.calibration import store
 
-        self.assertGreaterEqual(store.SCHEMA_VERSION, 7)
+        self.assertGreaterEqual(store.SCHEMA_VERSION, 10)
         self.assertIn(7, store._MIGRATIONS)
+        self.assertIn(8, store._MIGRATIONS)
+        self.assertIn(9, store._MIGRATIONS)
+        self.assertIn(10, store._MIGRATIONS)
         for column in ('settle_seconds', 'rebase_events', 'bin_drift',
-                       'trend_mm_per_h', 'need_resurvey'):
+                       'trend_mm_per_h', 'need_resurvey', 'cluster_ratio',
+                       'solve_mode', 'mean_vs_median_mm', 'coverage',
+                       'coord_confidence', 'raw_rms_h', 'raw_rms_v'):
             self.assertIn(column, store.RECORD_FIELDS, f'RECORD_FIELDS 缺 {column}')
         self.assertIn('bin_drift', store._REAL_FIELDS)
         self.assertIn('rebase_events', store._INT_FIELDS)
+        self.assertIn('cluster_ratio', store._REAL_FIELDS)
+        self.assertIn('solve_mode', store._TEXT_FIELDS,
+                      '事后要能分清"主簇取值"和"勉强退化取值"')
+        self.assertIn('coord_confidence', store._TEXT_FIELDS)
+
+    def test_v10_stores_decision_thresholds(self):
+        """v10：判定依据必须入库。只存结论（need_resurvey=1）归因不了成因（§17 ⑥）。"""
+        from rtkserver.calibration import store
+
+        for column in ('drift_limit', 'bin_step_median', 'consensus_tol',
+                       'window_seconds', 'used_span_seconds',
+                       'source_spread', 'source_spread_v'):
+            self.assertIn(column, store.RECORD_FIELDS, f'RECORD_FIELDS 缺 {column}')
+            self.assertIn(column, store._REAL_FIELDS, f'{column} 应该是 REAL（可为 NULL）')
+
+    def test_build_record_maps_decision_thresholds(self):
+        from rtkserver.calibration.writer import CoordinateWriter, WritePlan
+
+        plan = WritePlan.build_cors(host='h', port=8002, mountpoint='MP', duration=180)
+        plan.arp = (-2519265.0514, 4849534.9045, 3277834.6432)
+        plan.apc = plan.arp
+        writer = CoordinateWriter(None)
+        writer.result = {'cors': {'samples': 180, 'duration_seconds': 190,
+                                  'sigma3d': 0.004, 'drift_limit': 0.032,
+                                  'bin_step_median': 0.004, 'consensus_tol': 0.03,
+                                  'window_seconds': 180.0, 'used_span_seconds': 170.0,
+                                  'source_spread': 0.021, 'source_spread_v': 0.035}}
+        record = writer.build_record(plan)
+        self.assertAlmostEqual(record['drift_limit'], 0.032)
+        self.assertAlmostEqual(record['bin_step_median'], 0.004)
+        self.assertAlmostEqual(record['consensus_tol'], 0.03)
+        self.assertAlmostEqual(record['window_seconds'], 180.0)
+        self.assertAlmostEqual(record['used_span_seconds'], 170.0)
+        self.assertAlmostEqual(record['source_spread'], 0.021)
+        self.assertAlmostEqual(record['source_spread_v'], 0.035)
+
+    def test_build_record_maps_confidence(self):
+        """v9：可信度与覆盖率必须跟着记录走，否则事后只剩一个 cluster_ratio。"""
+        from rtkserver.calibration.writer import CoordinateWriter, WritePlan
+
+        plan = WritePlan.build_cors(host='h', port=8002, mountpoint='MP', duration=180)
+        plan.arp = (-2519265.0514, 4849534.9045, 3277834.6432)
+        plan.apc = plan.arp
+        writer = CoordinateWriter(None)
+        writer.result = {'cors': {'samples': 180, 'duration_seconds': 190,
+                                  'sigma3d': 0.004, 'solve_mode': 'last_segment',
+                                  'mean_vs_median_mm': 12.5, 'coverage': 0.42,
+                                  'coord_confidence': 'unfit',
+                                  'raw_rms_h': 0.021, 'raw_rms_v': 0.033}}
+        record = writer.build_record(plan)
+        self.assertEqual(record['solve_mode'], 'last_segment')
+        self.assertEqual(record['coord_confidence'], 'unfit')
+        self.assertAlmostEqual(record['coverage'], 0.42)
+        self.assertAlmostEqual(record['mean_vs_median_mm'], 12.5)
+        self.assertAlmostEqual(record['raw_rms_h'], 0.021)
+        self.assertAlmostEqual(record['raw_rms_v'], 0.033)
 
     def test_build_record_maps_stability(self):
         from rtkserver.calibration.writer import CoordinateWriter, WritePlan
@@ -7528,11 +7862,13 @@ class TestSettleRecordFields(unittest.TestCase):
         plan.apc = plan.arp
         writer = CoordinateWriter(None)
         writer.result = {'cors': {'samples': 180, 'duration_seconds': 190,
-                                  'sigma3d': 0.004, 'settle_seconds': 120.0,
+                                  'sigma3d': 0.004, 'settle_seconds': 60.0,
                                   'rebase_events': 1, 'bin_drift': 0.018,
-                                  'trend_mm_per_h': 4.5, 'need_resurvey': True}}
+                                  'trend_mm_per_h': 4.5, 'need_resurvey': True,
+                                  'cluster_ratio': 0.72}}
         record = writer.build_record(plan)
-        self.assertEqual(record['settle_seconds'], 120.0)
+        self.assertEqual(record['settle_seconds'], 60.0)
+        self.assertEqual(record['cluster_ratio'], 0.72)
         self.assertEqual(record['rebase_events'], 1)
         self.assertEqual(record['bin_drift'], 0.018)
         self.assertEqual(record['trend_mm_per_h'], 4.5)
@@ -7561,7 +7897,7 @@ class TestSettleSurfacesInUi(unittest.TestCase):
     def test_service_stage_tables(self):
         from rtkserver.calibration import service
 
-        self.assertEqual(service.STAGE_TEXT.get('SETTLE'), '静置观察')
+        self.assertEqual(service.STAGE_TEXT.get('SETTLE'), '预热观察')
         self.assertIn('SETTLE', service.STAGE_PROGRESS)
         self.assertLess(service.STAGE_PROGRESS['FIX_WAIT'],
                         service.STAGE_PROGRESS['SETTLE'])
@@ -7667,7 +8003,7 @@ class TestFrontendMatchesBackendFlow(unittest.TestCase):
             self.assertNotIn(phrase, text)
 
     def test_confirm_estimate_counts_settle(self):
-        """停服估算必须把静置观察算进去，否则页面会比真实耗时少报两分钟。"""
+        """停服估算必须把预热观察算进去，否则页面会比真实耗时少报一分钟。"""
         js = self._read('static', 'calibration.js')
         self.assertIn('settleSeconds()', js)
         self.assertIn('durationSeconds(payload.duration)', js)
@@ -7676,19 +8012,20 @@ class TestFrontendMatchesBackendFlow(unittest.TestCase):
         self.assertIn('{settle}', text)
         self.assertNotIn('? 600', js, '采集秒数不许再在前端写死')
 
-    def test_options_expose_settle_seconds(self):
-        """静置时长由后端下发：前端不该自己记 120 这个数。"""
+    def test_options_expose_warmup_seconds(self):
+        """预热时长由后端下发：前端不该自己记 60 这个数。"""
         from rtkserver.calibration import writer
 
         src = self._read('rtkserver', 'web', 'api_calibration.py')
-        self.assertIn("'settle_seconds': _SETTLE_SECONDS", src)
-        self.assertEqual(writer.SETTLE_SECONDS, 120.0)
+        self.assertIn("'settle_seconds': _WARMUP_SECONDS", src)
+        self.assertEqual(writer.WARMUP_SECONDS, 60.0)
+        self.assertEqual(writer.SETTLE_SECONDS, writer.WARMUP_SECONDS)
 
     def test_timeline_does_not_grow_per_second(self):
         """阶段流水按"阶段+进入时刻"去重建行，进度消息改写末行。
 
-        按完整消息去重时，静置观察 120 秒 + 采集 300 秒会往 240px 的列表里
-        灌四百多行同一阶段的进度快照。
+        按完整消息去重时，预热观察 60 秒 + 采集 300 秒会往 240px 的列表里
+        灌三百多行同一阶段的进度快照。
         """
         js = self._read('static', 'calibration.js')
         body = js[js.index('function appendTimeline(snap)'):]
@@ -7696,6 +8033,96 @@ class TestFrontendMatchesBackendFlow(unittest.TestCase):
         self.assertIn("snap.stage_at", body)
         self.assertIn('STATE.lastRowText', body)
         self.assertNotIn("(snap.message || '')", body)
+
+
+class TestPatchAuditFixes(unittest.TestCase):
+    """§14 的七条整改：每一条都要有能拦住回退的断言。"""
+
+    def _source(self):
+        import inspect
+
+        from rtkserver.calibration import writer
+        return inspect.getsource(writer)
+
+    def _read(self, *parts):
+        path = os.path.join(REPO_ROOT, *parts)
+        with open(path, 'r', encoding='utf-8') as handle:
+            return handle.read()
+
+    def test_converged_needs_cluster_drift_and_coverage(self):
+        """`converged` 不许再等于 `mode=='cluster'`（P1-1）。"""
+        from rtkserver.calibration import writer as w
+
+        src = self._source()
+        self.assertIn('drift_ok', src)
+        self.assertIn('coverage_ok', src)
+        self.assertIn("mode') == 'cluster' and drift_ok and coverage_ok", src)
+        self.assertTrue(hasattr(w, 'COVERAGE_MIN'))
+        self.assertTrue(hasattr(w, 'DRIFT_STEP_FACTOR'))
+
+    def test_coord_confidence_is_separate_key(self):
+        """精度等级与坐标可信度必须是两个键，不能一个字段两套语义（P1-1）。"""
+        src = self._source()
+        for value in ("'trusted'", "'borderline'", "'unfit'"):
+            self.assertIn(value, src, f'缺少可信度取值 {value}')
+        self.assertIn("'coord_confidence': coord_confidence", src)
+        # `accuracy_grade` 只按质量位定，不许掺结构判据
+        block = src[src.index("'accuracy_grade': (ACCURACY_GRADE_CENTIMETER"):
+                    src.index("'rtk_quality'")]
+        self.assertNotIn('cluster_ratio', block)
+        self.assertNotIn('converged', block)
+
+    def test_rebase_does_not_drive_need_resurvey(self):
+        """跳变次数只做诊断，不再决定"建议复测"（P0-3）。"""
+        src = self._source()
+        self.assertNotIn('rebase_events > REBASE_MAX', src)
+        start = src.index('drift = result.get(\'bin_drift\')')
+        block = src[start:start + 1600]
+        # 只看代码行，注释里会提到历史写法
+        code = '\n'.join(line for line in block.splitlines()
+                         if not line.strip().startswith('#'))
+        self.assertIn('drift_limit', code)
+        self.assertNotIn('rebase_events', code,
+                         '箱漂移已经能表达"有没有多簇"，跳变次数别再掺进来')
+
+    def test_jump_tolerance_follows_module_noise(self):
+        """平移门限按前 3 个箱的箱差中位数定标（P0-3）。"""
+        from rtkserver.calibration import writer as w
+
+        src = self._source()
+        self.assertIn('JUMP_TOL_FACTOR', src)
+        self.assertIn('JUMP_TOL_LOCK_BINS', src)
+        self.assertIn('step_median', src)
+        self.assertEqual(w.JUMP_TOL_LOCK_BINS, 3)
+        self.assertGreater(w.JUMP_TOL_FACTOR, 1.0)
+
+    def test_measure_only_headline_carries_coordinate(self):
+        """只测模式的结论第一行必须是坐标本身（现场最容易问"结果在哪"）。"""
+        import inspect
+
+        from rtkserver.calibration import service
+
+        src = inspect.getsource(service._summarize_write)
+        self.assertIn('纬度', src)
+        self.assertIn('经度', src)
+        self.assertIn('椭球高', src)
+        self.assertIn('ECEF', src)
+
+    def test_stop_estimate_includes_extension(self):
+        """页面停服估算要算上延长的 120 秒（P2）。"""
+        js = self._read('static', 'calibration.js')
+        self.assertIn('function extendSeconds()', js)
+        self.assertIn('extendSeconds()', js[js.index('function confirmLines'):]
+                      if 'function confirmLines' in js else js)
+        api = self._read('rtkserver', 'web', 'api_calibration.py')
+        self.assertIn("'extend_seconds': _EXTEND_SECONDS", api)
+
+    def test_on_slow_copy_matches_new_criterion(self):
+        """「未收敛即失败」的文案不许再写 σ > 2 cm（P2）。"""
+        zh = self._read('static', 'i18n.js')
+        self.assertNotIn("'cal.on_slow': '未收敛时（σ > 2 cm）'", zh)
+        self.assertNotIn('If not converged (σ > 2 cm)', zh)
+        self.assertIn('主簇中位数', zh)
 
 
 if __name__ == '__main__':
