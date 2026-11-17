@@ -19,6 +19,7 @@ from ..calibration import service as calib
 from ..calibration import store
 from ..calibration.drivers import driver_manager
 from ..calibration.drivers.base import _normalize_method
+from ..calibration.writer import CORS_COMPLETION_RESERVE_SECONDS as _CORS_COMPLETION_RESERVE_SECONDS
 from ..calibration.writer import CORS_DURATIONS as _CORS_DURATIONS
 from ..calibration.writer import EXTEND_SECONDS as _EXTEND_SECONDS
 from ..calibration.writer import WARMUP_SECONDS as _WARMUP_SECONDS
@@ -251,8 +252,10 @@ def api_calibration_options():
             'settle_seconds': _WARMUP_SECONDS,
             'warmup_seconds': _WARMUP_SECONDS,
             # 主簇不足时自动延长的一次（秒）。页面的"停服大概多久"必须把它算进去，
-            # 否则长档实际最长 60+300+120+120=600 秒、页面只报 480 秒。
+            # xlong 档实际最长 60+900+120+120=1200 秒，普通长档为 600 秒。
             'extend_seconds': _EXTEND_SECONDS,
+            # 页面停服估算的固定收尾余量，避免前后端各写一份 120。
+            'completion_reserve_seconds': _CORS_COMPLETION_RESERVE_SECONDS,
         },
         'running': bool(snap.get('running')),
         'stage': snap.get('stage'),

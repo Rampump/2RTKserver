@@ -7344,18 +7344,27 @@ class TestWarmupBeforeCollect(unittest.TestCase):
         return inspect.getsource(w.CoordinateWriter._step_cors_fix_and_collect)
 
     def test_constants_are_module_level(self):
-        """预热/求解参数必须是模块级常量，否则离线自测要真等一分钟。"""
+        """预热/求解参数必须是模块级常量，且最长档仍有明确总上限。"""
         from rtkserver.calibration import writer as w
 
         for name in ('WARMUP_SECONDS', 'COLLECT_BIN_SECONDS', 'JUMP_TOL_H',
                      'CONSENSUS_ABS_TOL', 'CLUSTER_MIN_RATIO', 'LAST_SEG_MIN',
-                     'EXTEND_SECONDS', 'EXTEND_MAX'):
+                     'EXTEND_SECONDS', 'EXTEND_MAX',
+                     'CORS_COMPLETION_RESERVE_SECONDS'):
             self.assertTrue(hasattr(w, name), f'缺少常量 {name}')
         self.assertEqual(w.WARMUP_SECONDS, 60.0)
         self.assertEqual(w.EXTEND_MAX, 1, '延长只做一次，否则时间没有上界')
-        worst = (w.WARMUP_SECONDS + max(w.CORS_DURATIONS.values())
-                 + w.EXTEND_SECONDS + 120)
-        self.assertLessEqual(worst, 600.0, f'最坏耗时 {worst:g}s 超过 10 分钟')
+        self.assertEqual(w.CORS_DURATIONS.get('xlong'), 900,
+                         'xlong 是 900 秒诊断档，既不能消失也不能被普通长档借用')
+        longest_collect = max(w.CORS_DURATIONS.values()) + w.EXTEND_SECONDS
+        self.assertLessEqual(
+            longest_collect, w.COLLECT_MAX_DURATION,
+            f'采集加一次延长 {longest_collect:g}s 超过采集硬上限 '
+            f'{w.COLLECT_MAX_DURATION:g}s')
+        worst = (w.WARMUP_SECONDS + longest_collect
+                 + w.CORS_COMPLETION_RESERVE_SECONDS)
+        self.assertLessEqual(worst, 1200.0,
+                             f'含 xlong 的最坏总耗时 {worst:g}s 超过 20 分钟')
 
     def test_warmup_is_fixed_but_handoff_needs_a_point(self):
         """预热本身没有判据，**但交接要确认当前还有点**（§14 P0-1）。
@@ -8003,10 +8012,17 @@ class TestFrontendMatchesBackendFlow(unittest.TestCase):
             self.assertNotIn(phrase, text)
 
     def test_confirm_estimate_counts_settle(self):
-        """停服估算必须把预热观察算进去，否则页面会比真实耗时少报一分钟。"""
+        """停服估算与采集档位必须全部由后端参数驱动。"""
         js = self._read('static', 'calibration.js')
         self.assertIn('settleSeconds()', js)
+        self.assertIn('reserveSeconds()', js)
         self.assertIn('durationSeconds(payload.duration)', js)
+        self.assertIn('fillDurationChoices(data)', js)
+        api = self._read('rtkserver', 'web', 'api_calibration.py')
+        self.assertIn("'completion_reserve_seconds': _CORS_COMPLETION_RESERVE_SECONDS", api)
+        template = self._read('templates', 'calibration.html')
+        self.assertNotIn('<option value="short"', template,
+                         '采集档位不能继续在模板里写死')
         text = self._read('static', 'i18n.js')
         self.assertEqual(text.count("'cal.confirm.stop'"), 2)
         self.assertIn('{settle}', text)

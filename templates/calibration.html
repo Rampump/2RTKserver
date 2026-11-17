@@ -544,13 +544,10 @@
             <div class="cal-grid" style="margin-top:14px;">
               <div class="field">
                 <label class="form-label" for="cal-duration" data-i18n="cal.duration">采集时长</label>
-                <select id="cal-duration" class="form-input">
-                  <option value="short" data-i18n="cal.duration.short">3 分钟（快速验证链路）</option>
-                  <option value="standard" selected data-i18n="cal.duration.standard">5 分钟（推荐）</option>
-                  <option value="long" data-i18n="cal.duration.long">10 分钟（信号差时用）</option>
-                </select>
+                <!-- 档位及名称由 /api/calibration/options 动态生成，避免与后端 CORS_DURATIONS 脱节。 -->
+                <select id="cal-duration" class="form-input"></select>
                 <div class="cal-muted" data-i18n="cal.duration_hint">
-                  提前收敛会自动停，所以选长档不会白等满时长。信号差时选长档。
+                  采满时长后按主簇取中位数；前面另有 60 秒预热，主簇不足时最多再延长一次。
                 </div>
               </div>
               <div class="field">

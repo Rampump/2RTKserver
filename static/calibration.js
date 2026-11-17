@@ -144,6 +144,39 @@
     return (isFinite(n) && n > 0) ? Math.round(n) : 0;
   }
 
+  // 停服估算里的固定收尾余量（后端 `CORS_COMPLETION_RESERVE_SECONDS`）。
+  // 120 只作为老版本 options 的兼容回退，当前值始终以后端下发为准。
+  function reserveSeconds() {
+    var d = (STATE.options || {}).defaults || {};
+    var n = Number(d.completion_reserve_seconds);
+    return (isFinite(n) && n > 0) ? Math.round(n) : 120;
+  }
+
+  // 采集档位由 `/api/calibration/options` 生成。模板里不再保留一份静态的
+  // “3/5/10 分钟”，否则后端新增 xlong 后，页面会继续显示过期档位。
+  function fillDurationChoices(options) {
+    var select = $('cal-duration');
+    var list = (options && options.durations) || [];
+    if (!select || !list.length) return;
+    var previous = select.value;
+    var defaultKey = (options.defaults && options.defaults.duration) || 'standard';
+    select.innerHTML = '';
+    list.forEach(function (item) {
+      if (!item || !item.value) return;
+      var option = document.createElement('option');
+      var key = 'cal.duration.' + item.value;
+      option.value = item.value;
+      option.setAttribute('data-i18n', key);
+      option.textContent = hasKey(key)
+        ? t(key)
+        : (Math.round((Number(item.seconds) || 0) / 60) + ' min');
+      select.appendChild(option);
+    });
+    var wanted = previous || defaultKey;
+    var exists = list.some(function (item) { return item && item.value === wanted; });
+    select.value = exists ? wanted : defaultKey;
+  }
+
   function showError(message) {
     var box = $('cal-global-error');
     if (!box) return;
@@ -316,6 +349,7 @@
       .then(function (data) {
         if (!data || !data.ok) throw new Error((data && data.error) || 'options failed');
         STATE.options = data;
+        fillDurationChoices(data);
         fillModules(data.modules);
         // 先定「可复用坐标」再渲染列表：列表渲染读的就是这条记录
         fillReuseHistory(data.reuse_history);
@@ -2477,11 +2511,10 @@
 
     var lines = [];
     var method = payload.method;
-    // 停服估算 = 采集时长 + 预热观察 + 120 秒余量（等固定解 + 收尾校验）+ 120 秒延长。
-    // 延长那 120 秒必须算进来：主簇不够时程序会自己再采一次，长档实际最长
-    // 60 + 300 + 120 + 120 = 600 秒，页面若显示 480 秒，用户会以为程序卡住了。
+    // 停服估算 = 采集时长 + 预热观察 + 后端下发的收尾余量 + 可能发生的一次延长。
+    // xlong 档当前最坏为 900 + 60 + 120 + 120 = 1200 秒。
     var settle = settleSeconds();
-    var stopSeconds = durationSeconds(payload.duration) + settle + 120
+    var stopSeconds = durationSeconds(payload.duration) + settle + reserveSeconds()
                       + (extendSeconds() || 120);
     if (method === 'external_rover') {
       lines.push(t('cal.confirm.measure_only'));
