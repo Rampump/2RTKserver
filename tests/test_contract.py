@@ -8986,5 +8986,91 @@ class TestConstellationCount(unittest.TestCase):
         self.assertIn('resetSatelliteView()', seg, '重连后必须整体重建，不能只清一半')
 
 
+class TestLocalCasterCard(unittest.TestCase):
+    """本地 Caster 的接入信息必须逐项显示，不能拼成一串。
+
+    现场：卡片只给 `192.168.1.19:2102/2RTK` 加一行「2RTK / 2RTK」，手机 App 里
+    地址 / 端口 / 挂载点 / 账号 / 密码是五个独立输入框，整串一抄就全错位。
+    """
+
+    def _read(self, *parts):
+        with open(os.path.join(REPO_ROOT, *parts), 'r', encoding='utf-8') as handle:
+            return handle.read()
+
+    def test_template_has_separate_fields(self):
+        html = self._read('templates', 'index.html')
+        for el in ('lc-ip', 'lc-port', 'lc-mount', 'lc-user', 'lc-password'):
+            self.assertIn(f'id="{el}"', html, f'缺少独立字段 {el}')
+        self.assertNotIn('挂载点 / 账号', html, '合并行是这次要拆掉的对象')
+
+    def test_snapshot_exposes_each_field(self):
+        src = self._read('rtkserver', 'outlets', 'local_caster.py')
+        body = src[src.index('def local_caster_snapshot('):]
+        for key in ("info['ip']", "info['password']", "info['mountpoint']", "info['user']"):
+            self.assertIn(key, body, f'快照必须单独给出 {key}')
+
+    def test_frontend_fills_each_field(self):
+        js = self._read('static', 'script.js')
+        body = js[js.index('function updateLocalCaster('):]
+        body = body[:body.index('\nfunction ')]
+        for el in ('lcIpEl', 'lcPortEl', 'lcMountEl', 'lcUserEl', 'lcPasswordEl'):
+            self.assertIn(el, body, f'渲染时必须写到 {el}')
+
+
+class TestLogStreaming(unittest.TestCase):
+    """「系统日志」卡片必须真的收到后端日志。
+
+    现场：卡片标题写着「实时推送 · 最多保留 500 条」，实际除了"WebSocket 连接成功"
+    就不再变化。后端一直在推（`WebSocketLogHandler` → `state.broadcast`），
+    是前端 onmessage 里根本没有 `type == 'log' / 'print' / 'history'` 的分支，
+    收到就丢。顺带发现实时日志帧没有按登录状态过滤，匿名访客也能读到全量日志。
+    """
+
+    def _read(self, *parts):
+        with open(os.path.join(REPO_ROOT, *parts), 'r', encoding='utf-8') as handle:
+            return handle.read()
+
+    def test_frontend_handles_log_frames(self):
+        js = self._read('static', 'script.js')
+        body = js[js.index('ws.onmessage = '):]
+        body = body[:body.index('ws.onerror')]
+        self.assertIn("data.type === 'log'", body, '实时日志帧必须有人接')
+        self.assertIn("data.type === 'print'", body, 'print() 的输出走另一个 type')
+        self.assertIn("data.type === 'history'", body, '连上后的历史回放也要渲染')
+        self.assertIn('addServerLog(', body)
+        self.assertIn('SERVER_LOG_RE', js, '要从后端日志行里拆出时刻与级别')
+
+    def test_server_log_line_parsing_rules(self):
+        js = self._read('static', 'script.js')
+        self.assertIn('ERROR', js[js.index('SERVER_LOG_RE'):][:800])
+        self.assertIn("'warning'", js[js.index('SERVER_LOG_RE'):][:800])
+
+    def test_anonymous_clients_get_no_log_frames(self):
+        from rtkserver.core import state
+        from rtkserver.web import ws as ws_mod
+
+        class Fake:
+            def __init__(self, authed):
+                self.authenticated = authed
+                self.frames = []
+
+            def enqueue(self, payload):
+                self.frames.append(payload)
+
+        authed, anon = Fake(True), Fake(False)
+        saved = list(state.clients)
+        state.clients[:] = [authed, anon]
+        try:
+            ws_mod.send_to_clients({'type': 'log', 'message': '2026-11-24 05:00:00,000 - INFO - secret'})
+            ws_mod.send_to_clients({'type': 'run_status', 'run_status': {'mode': 'serial'}})
+        finally:
+            state.clients[:] = saved
+
+        log_frames = [f for f in anon.frames if '"log"' in f]
+        self.assertEqual([], log_frames, '匿名连接不能收到原始日志行')
+        self.assertTrue(authed.frames, '已登录连接要照常收到')
+        self.assertTrue(any('run_status' in f for f in anon.frames), '普通状态帧对匿名仍然公开')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

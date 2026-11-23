@@ -23,6 +23,8 @@ let lastStatsGeneration = null;
 // 最后一次收到卫星（MSM）数据的时刻：断流后后端不再推 cell_data，
 // 页面会永久停在最后一帧，看着像"还在观测 31 颗星"。
 let lastSatelliteAt = 0;
+// 历史回放的最后一行：用来跳过"历史 + 首条实时"之间的重复行
+let lastServerLogLine = null;
 const loadingIndicator = document.getElementById("loading-indicator");
 const observedSystemsEl = document.getElementById("observed-systems")
 const runModeEl = document.getElementById("run-mode");
@@ -40,8 +42,13 @@ const deviceModelEl = document.getElementById('device-model');
 const firmwareVersionEl = document.getElementById('firmware-version');
 const antennaModelEl = document.getElementById('antenna-model');
 const lcStatusEl = document.getElementById('lc-status');
-const lcAddressEl = document.getElementById('lc-address');
+// 接入信息一律分开显示：现场最常见的错误就是把 192.168.1.19:2102/2RTK 整串
+// 抄进手机 App 的"地址"一栏，后三栏（端口/挂载点/账号）反而空着。
+const lcIpEl = document.getElementById('lc-ip');
+const lcPortEl = document.getElementById('lc-port');
 const lcMountEl = document.getElementById('lc-mount');
+const lcUserEl = document.getElementById('lc-user');
+const lcPasswordEl = document.getElementById('lc-password');
 const lcClientsEl = document.getElementById('lc-clients');
 const lcHintEl = document.getElementById('lc-hint');
 const upStatusEl = document.getElementById('up-status');
@@ -222,7 +229,7 @@ function cachedWgs84ToGcj02(lon, lat) {
 }
 
 // 添加日志显示函数
-function addLog(message, type = 'info') {
+function addLog(message, type = 'info', timeText = null) {
   const logContainer = document.getElementById('log-container');
   if (!logContainer) return;
 
@@ -242,9 +249,9 @@ function addLog(message, type = 'info') {
     'system': 'log-system'
   };
   
-  // 获取当前时间
+  // 获取当前时间（后端日志自带时刻，用它更贴近真实发生时间）
   const now = new Date();
-  const timeString = now.toLocaleTimeString();
+  const timeString = timeText || now.toLocaleTimeString();
   
   // 设置日志内容
   logEntry.className = typeClasses[type] || 'log-info';
@@ -261,6 +268,25 @@ function addLog(message, type = 'info') {
   if (entries.length > 500) {
     logContainer.removeChild(entries[0]);
   }
+}
+
+// 后端日志行格式：`2026-11-24 05:07:56,001 - INFO - 消息`（见 utils/logger.py）
+// 拆成 时刻 + 级别 + 正文：正文里再带一个前端时刻会让每行出现两个时间，
+// 而且级别光看文字分不出颜色。历史回放和实时推送共用这一条解析。
+const SERVER_LOG_RE = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})[,.]\d+\s*-\s*([A-Z]+)\s*-\s*([\s\S]*)$/;
+
+function addServerLog(line) {
+  if (typeof line !== 'string' || !line) return;
+  const m = line.match(SERVER_LOG_RE);
+  if (!m) {
+    // print() 的输出没有级别前缀，按普通信息显示，原样保留
+    addLog(line, 'info');
+    return;
+  }
+  const level = m[3];
+  const type = (level === 'ERROR' || level === 'CRITICAL') ? 'error'
+    : (level === 'WARNING' ? 'warning' : 'info');
+  addLog(m[4], type, m[2]);
 }
 
 // ================== 地图相关函数封装 ==================
@@ -761,6 +787,27 @@ function initWebSocket() {
         loadingIndicator.classList.add('hidden');
       }
 
+      // 后端日志：logging 走 type=log，print() 走 type=print，连上时先补一帧 history。
+      // 原先前端**完全没有这两个分支**——卡片写着「实时推送」，实际只显示前端自己的
+      // WebSocket 事件，所以除了"连接成功"那一条，面板永远不会变。
+      if (data.type === 'log' || data.type === 'print') {
+        const line = data.message;
+        // 历史回放的最后一行可能与随后的实时推送重复（后端先入队历史再推实时）
+        if (line && line === lastServerLogLine) {
+          lastServerLogLine = null;
+        } else {
+          lastServerLogLine = null;
+          addServerLog(line);
+        }
+        return;
+      }
+      if (data.type === 'history') {
+        const messages = Array.isArray(data.messages) ? data.messages : [];
+        messages.forEach(addServerLog);
+        lastServerLogLine = messages.length ? messages[messages.length - 1] : null;
+        return;
+      }
+
       // 换源/重连：后端清空统计时把代数 +1。先整体重建视图，再处理本帧数据，
       // 这样新星座能在干净的字典里重新计数，不会继承上一路的键。
       if (typeof data.stats_generation === 'number' &&
@@ -1169,10 +1216,14 @@ function updateLocalCaster(info) {
     el.className = 'kv-value' + (kind ? ' is-' + kind : '');
   };
 
-  lcAddressEl.textContent = info.example || '--';
-  lcMountEl.textContent = info.mountpoint
-    ? `${info.mountpoint} / ${info.user || '--'}`
-    : '--';
+  // 四项分开填：IP / 端口 / 挂载点 / 账号密码各自一格，避免整串复制粘贴
+  const ip = info.ip || String(info.example || '').split(':')[0] || '--';
+  const setText = (el, text) => { if (el) el.textContent = (text === undefined || text === null || text === '') ? '--' : text; };
+  setText(lcIpEl, ip);
+  setText(lcPortEl, info.port);
+  setText(lcMountEl, info.mountpoint);
+  setText(lcUserEl, info.user);
+  setText(lcPasswordEl, info.password);
 
   if (!info.enabled) {
     setValue(lcStatusEl, I18N.t('lc.disabled'), 'warning');
@@ -1182,8 +1233,9 @@ function updateLocalCaster(info) {
     setValue(lcStatusEl, I18N.t('lc.running'), 'success');
     setValue(lcClientsEl, `${info.clients} / ${info.max_clients}`, info.clients > 0 ? 'success' : '');
     if (lcHintEl) {
-      lcHintEl.textContent =
-        I18N.t('lc.running_hint', { addr: info.example, mp: info.mountpoint, user: info.user });
+      lcHintEl.textContent = I18N.t('lc.running_hint', {
+        ip, port: info.port, mp: info.mountpoint, user: info.user,
+      });
     }
   } else if (info.mode === 'none') {
     setValue(lcStatusEl, I18N.t('lc.none'), 'warning');

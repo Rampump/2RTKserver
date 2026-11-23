@@ -116,10 +116,17 @@ def send_to_clients(message):
     if not snapshot:
         return
 
+    # 日志行是原始文本（串口路径、配置值、标定坐标都可能出现），和首帧 history
+    # 一样只发给已登录连接。原先只拦了 history、放过了实时帧，等于匿名访客
+    # 打开状态页就能读到全量运行日志。
+    log_only = isinstance(message, dict) and message.get('type') in ('log', 'print')
+
     authed_json = None
     public_json = None
 
     for client in snapshot:
+        if log_only and not client.authenticated:
+            continue
         if client.authenticated or PUBLIC_STATION_COORDS:
             if authed_json is None:
                 authed_json = json.dumps(message)

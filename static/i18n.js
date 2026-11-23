@@ -125,8 +125,11 @@
 
       // 本地 Caster 字段
       'lc.status': '运行状态',
-      'lc.address': '接入地址',
-      'lc.mount': '挂载点 / 账号',
+      'lc.ip': 'IP 地址',
+      'lc.port': '端口',
+      'lc.mount': '挂载点',
+      'lc.user': '用户名',
+      'lc.password': '密码',
       'lc.clients': '在线客户端',
       'lc.reading': '读取中…',
 
@@ -196,7 +199,7 @@
       'lc.disabled': '未启用',
       'lc.disabled_hint': '需要在「运行设置」里勾选启用本地 Caster 并保存。',
       'lc.running': '运行中',
-      'lc.running_hint': '移动站填地址 {addr} ，挂载点 {mp}，账号 / 密码均为 {user}。',
+      'lc.running_hint': '移动站里 IP 填 {ip}，端口填 {port}，挂载点填 {mp}，用户名和密码都填 {user}。',
       'lc.none': '未运行：当前没有数据源',
       'lc.none_hint': '运行模式为 none，本机没有数据可发布。',
       'lc.enabled_not_run': '已启用但未运行',
@@ -857,8 +860,11 @@
 
       // Local Caster fields
       'lc.status': 'Status',
-      'lc.address': 'Address',
-      'lc.mount': 'Mount / Account',
+      'lc.ip': 'IP Address',
+      'lc.port': 'Port',
+      'lc.mount': 'Mount Point',
+      'lc.user': 'Username',
+      'lc.password': 'Password',
       'lc.clients': 'Clients Online',
       'lc.reading': 'Reading…',
 
@@ -926,7 +932,7 @@
       'lc.disabled': 'Disabled',
       'lc.disabled_hint': 'Enable the local caster in Settings and save.',
       'lc.running': 'Running',
-      'lc.running_hint': 'Rover: address {addr}, mount point {mp}, user/password both {user}.',
+      'lc.running_hint': 'On the rover: IP {ip}, port {port}, mount point {mp}, username and password both {user}.',
       'lc.none': 'Not running: no data source',
       'lc.none_hint': 'Mode is none; this device has no data to publish.',
       'lc.enabled_not_run': 'Enabled but not running',

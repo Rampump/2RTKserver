@@ -479,6 +479,10 @@ def local_caster_snapshot() -> dict:
     info['enabled'] = enabled
     info['mountpoint'] = LOCAL_CASTER_MOUNTPOINT
     info['user'] = LOCAL_CASTER_USER
+    info['password'] = LOCAL_CASTER_PASSWORD
     info['last_error'] = state.local_caster_last_error
-    info['example'] = f"{get_local_ip()}:{info['port']}/{LOCAL_CASTER_MOUNTPOINT}"
+    # 拆开给：现场最容易错的就是把 IP、端口、挂载点、账号密码混成一串
+    # （192.168.1.19:2102/2RTK 看着像"地址"，填进手机 App 却各格都要单独填）。
+    info['ip'] = get_local_ip()
+    info['example'] = f"{info['ip']}:{info['port']}/{LOCAL_CASTER_MOUNTPOINT}"
     return info
