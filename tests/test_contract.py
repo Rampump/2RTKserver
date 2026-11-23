@@ -9072,5 +9072,135 @@ class TestLogStreaming(unittest.TestCase):
         self.assertTrue(any('run_status' in f for f in anon.frames), '普通状态帧对匿名仍然公开')
 
 
+class TestCasterProtocolCompat(unittest.TestCase):
+    """本地 Caster 的握手兼容性（真起一个 127.0.0.1 实例跑，不碰 2102）。
+
+    现场反馈「大部分客户端连不上」，查下来是三处协议细节：
+      1. 客户端用 HTTP/1.1 说话、但没带 `Ntrip-Version` 头时，旧代码一律回
+         `ICY 200 OK` —— HTTP 客户端收到非 HTTP 状态行，判握手失败；
+      2. 客户端走 HTTP 代理时请求行是绝对形态（`GET http://ip:port/2RTK`），
+         旧代码把整串当挂载点名，回 404；
+      3. `SOURCE /2RTK` 被当成"要源列表"，回了 SOURCETABLE，客户端把源列表
+         当数据流解析 → "连上了但一帧都没有"。
+    另外 401 没有 `Content-Length` 时，部分客户端会当成响应不完整而不重试。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import base64
+        import threading
+
+        from rtkserver.outlets import local_caster as mod
+
+        cls.mod = mod
+        cls.auth = base64.b64encode(b'2RTK:2RTK').decode()
+        cls.caster = mod.LocalCaster('127.0.0.1', 0)
+        if not cls.caster.start(retry=1):
+            raise unittest.SkipTest('本机无法监听 127.0.0.1，跳过握手兼容性测试')
+        cls.port = cls.caster._listen.getsockname()[1]
+        cls._stop = threading.Event()
+
+        def pump():
+            payload = bytes([0xd3, 0x00, 0x13, 0x3e, 0xd0]) + bytes(17) + b'\x00\x00\x00'
+            while not cls._stop.is_set():
+                cls.caster.publish(payload)
+                time_module.sleep(0.03)
+
+        cls._pump = threading.Thread(target=pump, daemon=True)
+        cls._pump.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._stop.set()
+        cls.caster.stop()
+
+    # ---------- 工具 ----------
+    def _ask(self, request: bytes, collect=1.2) -> bytes:
+        import socket
+        sock = socket.create_connection(('127.0.0.1', self.port), timeout=4)
+        try:
+            sock.sendall(request)
+            sock.settimeout(collect)
+            buf = b''
+            deadline = time_module.time() + collect
+            while time_module.time() < deadline:
+                try:
+                    chunk = sock.recv(65536)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+        finally:
+            sock.close()
+        return buf
+
+    def _head(self, buf: bytes) -> str:
+        return buf.split(b'\r\n\r\n')[0].decode('latin-1', 'replace')
+
+    # ---------- 用例 ----------
+    def test_normalize_target_forms(self):
+        norm = self.mod._normalize_target
+        self.assertEqual('2RTK', norm('/2RTK'))
+        self.assertEqual('2RTK', norm('/2RTK?ts=1'))
+        self.assertEqual('2RTK', norm('http://192.168.1.19:2102/2RTK'))
+        self.assertEqual('', norm('/'))
+        self.assertEqual('', norm(''))
+
+    def test_http11_client_gets_http_status_line(self):
+        """HTTP/1.1 但没带 Ntrip-Version：必须回 HTTP 200，不能回 ICY。"""
+        buf = self._ask(
+            f'GET /2RTK HTTP/1.1\r\nHost: 127.0.0.1\r\n'
+            f'Authorization: Basic {self.auth}\r\n\r\n'.encode())
+        self.assertTrue(buf.startswith(b'HTTP/1.1 200 OK'), buf[:40])
+        self.assertIn('Ntrip-Version: Ntrip/2.0', self._head(buf))
+        self.assertGreater(buf.count(b'\xd3'), 0, '认证通过后必须真的下数据')
+
+    def test_ntrip1_client_still_gets_icy(self):
+        """经典 NTRIP 1.0（HTTP/1.0 且无 Ntrip-Version）仍要回 ICY。"""
+        buf = self._ask(
+            f'GET /2RTK HTTP/1.0\r\nUser-Agent: NTRIP RTKLIB/2.4.3\r\n'
+            f'Authorization: Basic {self.auth}\r\n\r\n'.encode())
+        self.assertTrue(buf.startswith(b'ICY 200 OK'), buf[:40])
+
+    def test_absolute_uri_from_proxy_accepted(self):
+        buf = self._ask(
+            f'GET http://127.0.0.1:{self.port}/2RTK HTTP/1.1\r\n'
+            f'Host: 127.0.0.1:{self.port}\r\n'
+            f'Authorization: Basic {self.auth}\r\n\r\n'.encode())
+        self.assertTrue(buf.startswith(b'HTTP/1.1 200 OK'), buf[:60])
+        self.assertGreater(buf.count(b'\xd3'), 0)
+
+    def test_source_method_rejected_with_405(self):
+        """SOURCE 是推流语义，不能把源列表当数据流糊回去。"""
+        buf = self._ask(
+            f'SOURCE /2RTK HTTP/1.0\r\nAuthorization: Basic {self.auth}\r\n\r\n'.encode(),
+            collect=0.8)
+        self.assertTrue(buf.startswith(b'HTTP/1.1 405'), buf[:60])
+        self.assertIn('GET', buf.decode('latin-1', 'replace'))
+
+    def test_401_carries_content_length(self):
+        bad = 'eA=='  # 任意错误凭证
+        buf = self._ask(
+            f'GET /2RTK HTTP/1.1\r\nHost: 127.0.0.1\r\nNtrip-Version: Ntrip/2.0\r\n'
+            f'Authorization: Basic {bad}\r\n\r\n'.encode(), collect=0.8)
+        head = self._head(buf)
+        self.assertTrue(buf.startswith(b'HTTP/1.1 401'), buf[:60])
+        self.assertIn('WWW-Authenticate: Basic', head)
+        self.assertIn('Content-Length:', head, '缺 Content-Length 时部分客户端不重试')
+
+    def test_mountpoint_is_case_insensitive(self):
+        buf = self._ask(
+            f'GET /2rtk HTTP/1.0\r\nAuthorization: Basic {self.auth}\r\n\r\n'.encode())
+        self.assertTrue(buf.startswith(b'ICY 200 OK'), buf[:40])
+
+    def test_lf_only_request_accepted(self):
+        """只发 LF 的客户端不能被挂到握手超时。"""
+        buf = self._ask(
+            f'GET /2RTK HTTP/1.0\nUser-Agent: NTRIP x\n'
+            f'Authorization: Basic {self.auth}\n\n'.encode())
+        self.assertTrue(buf.startswith(b'ICY 200 OK'), buf[:40])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

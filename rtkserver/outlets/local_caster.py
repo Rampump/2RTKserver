@@ -42,6 +42,26 @@ class _CasterClient:
         self.alive = True
 
 
+def _normalize_target(target: str) -> str:
+    """把请求目标归一化成挂载点名。
+
+    三种形态现场都出现过，必须都认：
+      /2RTK                     标准 NTRIP
+      /2RTK?x=1                 带 query（个别客户端会加时间戳）
+      http://1.2.3.4:2102/2RTK  绝对形态 —— 客户端走了 HTTP 代理时，
+                                请求行里的目标就是完整 URL。原先这种请求被
+                                整串当成挂载点名，直接回 404「不存在的挂载点」。
+    """
+    if not target:
+        return ''
+    text = target.split('?', 1)[0].split('#', 1)[0]
+    if '://' in text:
+        rest = text.split('://', 1)[1]
+        slash = rest.find('/')
+        text = rest[slash:] if slash >= 0 else '/'
+    return text.strip().strip('/')
+
+
 class LocalCaster:
     """把本机正在转发的 RTCM 数据以 NTRIP Caster 形式对内网发布。
 
@@ -49,7 +69,11 @@ class LocalCaster:
       GET /             → 返回 SOURCETABLE（不需要账号，方便客户端发现挂载点）
       GET /2RTK         → Basic 认证通过后返回 200/ICY，随后持续下发 RTCM
       认证失败          → 401 + WWW-Authenticate，客户端（RTKLIB/u-center 等）会重试带账号
-      NTRIP 1.0 客户端  → 用 "ICY 200 OK"，2.0 客户端 → "HTTP/1.1 200 OK + Ntrip-Version"
+      **版本镜像**      → 客户端用 HTTP/1.1 说话就回 "HTTP/1.1 200 OK + Ntrip-Version"，
+                         只有经典 NTRIP 1.0（GET ... HTTP/1.0 且不带 Ntrip-Version）
+                         才回 "ICY 200 OK"。原先"没声明 2.0 就一律回 ICY"会让
+                         HTTP/1.1 客户端收到非 HTTP 状态行，判握手失败。
+      SOURCE 方法       → 405（那是"推流"语义，本机不作上游 Caster）
     """
 
     def __init__(self, host, port):
@@ -218,7 +242,9 @@ class LocalCaster:
                 full = len(self._clients) >= LOCAL_CASTER_MAX_CLIENTS
             if full:
                 try:
-                    sock.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n")
+                    sock.sendall(self._response_head(
+                        '503 Service Unavailable', True, self._http_date(),
+                        body=f'too many clients (max {LOCAL_CASTER_MAX_CLIENTS})\r\n'.encode()))
                 except OSError:
                     pass
                 try:
@@ -234,32 +260,67 @@ class LocalCaster:
             threading.Thread(target=self._serve_client, args=(client,),
                              name=f'caster-{addr[0]}', daemon=True).start()
 
-    def _parse_request(self, raw: bytes):
-        """解析 NTRIP 请求，返回 (挂载点, 是否通过认证, 是否请求源列表, 是否NTRIP2)。"""
-        mountpoint = ''
+    def _parse_request(self, raw: bytes) -> dict:
+        """解析 NTRIP 请求，返回各要素。
+
+        原先返回位置元组，字段一多就容易错位；改成 dict 后每个字段自解释。
+        行分隔同时容忍 CRLF 与裸 LF（个别嵌入式客户端只发 LF）。
+        """
+        lines = raw.replace(b'\r\n', b'\n').split(b'\n')
+        method = ''
+        target = ''
+        http11 = False
         authorized = False
         ntrip2 = False
-        for line in raw.split(b'\r\n'):
+
+        parts = (lines[0] if lines else b'').split(b' ')
+        if len(parts) >= 2:
+            method = parts[0].decode('latin-1').upper().strip()
+            target = parts[1].decode('latin-1').strip()
+            if len(parts) >= 3:
+                http11 = b'1.1' in parts[2]
+
+        for line in lines[1:]:
             low = line.lower()
-            if low.startswith(b'get '):
-                parts = line.split(b' ')
-                if len(parts) >= 2:
-                    target = parts[1].decode('latin-1')
-                    mountpoint = target.split('?')[0].strip('/')
-            elif low.startswith(b'authorization: basic '):
+            if low.startswith(b'authorization: basic '):
                 given = line.split(b' ', 2)[2].strip()
                 if hmac.compare_digest(given, self._credentials):
                     authorized = True
             elif low.startswith(b'ntrip-version:'):
-                ntrip2 = b'2.0' in line
-        return mountpoint, authorized, mountpoint == '', ntrip2
+                if b'2.0' in line:
+                    ntrip2 = True
+
+        return {'method': method, 'target': target,
+                'mountpoint': _normalize_target(target),
+                'authorized': authorized, 'ntrip2': ntrip2, 'http11': http11}
+
+    @staticmethod
+    def _response_head(status: str, v2: bool, http_date: str,
+                       body: bytes = b'', extra: str = '') -> bytes:
+        """构造短响应（401/404/405/503），显式带 Content-Length 后关闭连接。
+
+        为什么要显式写 Content-Length：部分客户端（.NET 的 HttpClient、部分
+        国产 App）在既没有 Content-Length 又没等到 EOF 时，会把 401 当成
+        "响应不完整"而直接判失败，不再带账号重试 —— 表现就是"一直认证不上"。
+        """
+        head = (
+            f"HTTP/1.1 {status}\r\n"
+            + ("Ntrip-Version: Ntrip/2.0\r\n" if v2 else "")
+            + f"Server: {LOCAL_CASTER_SERVER_NAME}\r\nDate: {http_date}\r\n"
+            + extra
+            + "Content-Type: text/plain\r\n"
+            + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+        ).encode()
+        return head + body
 
     def _serve_client(self, client: _CasterClient):
         sock = client.sock
         try:
             sock.settimeout(LOCAL_CASTER_CLIENT_TIMEOUT)
             raw = b''
-            while b'\r\n\r\n' not in raw and len(raw) < 8192:
+            # 同时容忍 CRLF 与裸 LF：个别嵌入式客户端只发 LF，
+            # 只等 b'\r\n\r\n' 会让它一直挂到超时，表现就是"连接超时"。
+            while (b'\r\n\r\n' not in raw and b'\n\n' not in raw) and len(raw) < 8192:
                 chunk = sock.recv(1024)
                 if not chunk:
                     return
@@ -267,43 +328,55 @@ class LocalCaster:
             if not raw:
                 return
 
-            mountpoint, authorized, wants_table, ntrip2 = self._parse_request(raw)
+            info = self._parse_request(raw)
             http_date = self._http_date()
+            # 版本镜像：客户端用 HTTP/1.1 说话就用 HTTP/1.1 回。只有经典
+            # NTRIP 1.0 客户端（GET ... HTTP/1.0 且不带 Ntrip-Version）才用
+            # "ICY 200 OK"。原先"没声明 2.0 就一律回 ICY"会让 HTTP/1.1
+            # 客户端（.NET、部分国产 App）收到非 HTTP 状态行而判握手失败。
+            v2 = bool(info['ntrip2'] or info['http11'])
+            mountpoint = info['mountpoint']
+
+            # 0) 只接受 GET。SOURCE 是"推流"语义（客户端想当基站往这里发数据），
+            #    个别客户端会先试一次；原先它落进"挂载点为空"的分支被回了源列表，
+            #    客户端把源列表当数据流解析，表现就是"连上了但一帧都没有"。
+            if info['method'] != 'GET':
+                sock.sendall(self._response_head(
+                    '405 Method Not Allowed', v2, http_date,
+                    body=f"this caster requires GET, got {info['method'] or '?'}\r\n".encode(),
+                    extra='Allow: GET\r\n'))
+                logging.warning(
+                    f"本地 Caster: {client.addr[0]} 用了不支持的请求方式 "
+                    f"{info['method'] or '?'} {info['target']}（本机只接受 GET）")
+                return
 
             # 1) 源列表：不要求认证（只暴露一个固定挂载点名，没有敏感信息）
-            if wants_table:
-                sock.sendall(self._build_sourcetable_response(ntrip2, http_date))
+            if not mountpoint or mountpoint.lower() == 'sourcetable':
+                sock.sendall(self._build_sourcetable_response(v2, http_date))
                 logging.info(f"本地 Caster: {client.addr[0]} 读取源列表")
                 return
 
-            # 2) 挂载点不对：明确回 404，别把源列表当数据流塞给客户端
-            if mountpoint != LOCAL_CASTER_MOUNTPOINT:
-                body = f"unknown mountpoint, available: /{LOCAL_CASTER_MOUNTPOINT}\r\n".encode()
-                head = (
-                    "HTTP/1.1 404 Not Found\r\n"
-                    + ("Ntrip-Version: Ntrip/2.0\r\n" if ntrip2 else "")
-                    + f"Date: {http_date}\r\nContent-Type: text/plain\r\n"
-                    + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
-                ).encode() + body
-                sock.sendall(head)
-                logging.warning(f"本地 Caster: {client.addr[0]} 请求了不存在的挂载点 /{mountpoint}")
+            # 2) 挂载点不对：明确回 404，别把源列表当数据流塞给客户端。
+            #    比较忽略大小写：挂载点名在现场经常被手抄成全小写。
+            if mountpoint.lower() != LOCAL_CASTER_MOUNTPOINT.lower():
+                body = (f"unknown mountpoint /{mountpoint}, "
+                        f"available: /{LOCAL_CASTER_MOUNTPOINT}\r\n").encode()
+                sock.sendall(self._response_head('404 Not Found', v2, http_date, body=body))
+                logging.warning(
+                    f"本地 Caster: {client.addr[0]} 请求了不存在的挂载点 /{mountpoint}"
+                    f"（原始请求行：{info['method']} {info['target']}）")
                 return
 
             # 3) 认证
-            if not authorized:
-                head = (
-                    "HTTP/1.1 401 Unauthorized\r\n"
-                    + ("Ntrip-Version: Ntrip/2.0\r\n" if ntrip2 else "")
-                    + f"Server: {LOCAL_CASTER_SERVER_NAME}\r\nDate: {http_date}\r\n"
-                    + f'WWW-Authenticate: Basic realm="{LOCAL_CASTER_MOUNTPOINT}"\r\n'
-                    + "Connection: close\r\n\r\n"
-                ).encode()
-                sock.sendall(head)
+            if not info['authorized']:
+                sock.sendall(self._response_head(
+                    '401 Unauthorized', v2, http_date,
+                    extra=f'WWW-Authenticate: Basic realm="{LOCAL_CASTER_MOUNTPOINT}"\r\n'))
                 logging.warning(f"本地 Caster: {client.addr[0]} 认证失败（账号或密码不对）")
                 return
 
             # 4) 放行，开始推流
-            if ntrip2:
+            if v2:
                 head = (
                     "HTTP/1.1 200 OK\r\n"
                     f"Ntrip-Version: Ntrip/2.0\r\n"
@@ -317,7 +390,7 @@ class LocalCaster:
             sock.sendall(head.encode())
             sock.settimeout(None)
             logging.info(f"本地 Caster: {client.addr[0]}:{client.addr[1]} 已接入挂载点 "
-                         f"/{LOCAL_CASTER_MOUNTPOINT}（{'NTRIP2' if ntrip2 else 'NTRIP1'}）")
+                         f"/{LOCAL_CASTER_MOUNTPOINT}（{'NTRIP2' if v2 else 'NTRIP1'}）")
 
             while self._running and client.alive:
                 try:

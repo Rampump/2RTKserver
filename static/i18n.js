@@ -199,7 +199,9 @@
       'lc.disabled': '未启用',
       'lc.disabled_hint': '需要在「运行设置」里勾选启用本地 Caster 并保存。',
       'lc.running': '运行中',
-      'lc.running_hint': '移动站里 IP 填 {ip}，端口填 {port}，挂载点填 {mp}，用户名和密码都填 {user}。',
+      'lc.running_hint': '移动站里 IP 填 {ip}，端口填 {port}，挂载点填 {mp}，用户名和密码都填 {user}。'
+        + '取流请直接填 IP，不要填 2rtk.local（mDNS 只负责网页发现，数据走直连 TCP）；'
+        + '客户端若报 proxy / 代理类型错误，把局域网地址设为直连、或临时关掉系统代理即可。',
       'lc.none': '未运行：当前没有数据源',
       'lc.none_hint': '运行模式为 none，本机没有数据可发布。',
       'lc.enabled_not_run': '已启用但未运行',
@@ -932,7 +934,9 @@
       'lc.disabled': 'Disabled',
       'lc.disabled_hint': 'Enable the local caster in Settings and save.',
       'lc.running': 'Running',
-      'lc.running_hint': 'On the rover: IP {ip}, port {port}, mount point {mp}, username and password both {user}.',
+      'lc.running_hint': 'On the rover: IP {ip}, port {port}, mount point {mp}, username and password both {user}. '
+        + 'Use the plain IP, not 2rtk.local (mDNS only covers web discovery; the stream is plain TCP). '
+        + 'If the client reports a proxy error, set the LAN address to direct / disable the system proxy.',
       'lc.none': 'Not running: no data source',
       'lc.none_hint': 'Mode is none; this device has no data to publish.',
       'lc.enabled_not_run': 'Enabled but not running',
