@@ -176,6 +176,9 @@ Calibration design and field notes (mostly 中文):
   calibration flow with the exact serial commands at each stage
 - [docs/quectel-lg290p-calibration-commands.zh.md](docs/quectel-lg290p-calibration-commands.zh.md)
   — LG290P command reference (`PQTMCFG*` / `PQTMSVIN*`) plus quirks and traps
+- [docs/unicore-n4-commands-reference.zh.md](docs/unicore-n4-commands-reference.zh.md)
+  — Unicore N4 (UM960/960L/980/982/UB9A0) command reference: MODE/CONFIG, RTCM/NMEA output,
+  built-in NTRIP, network ports, and which commands the driver already covers
 - [docs/calibration-four-methods-per-module.zh.md](docs/calibration-four-methods-per-module.zh.md)
   — four methods × three modules, side by side
 - [docs/one-click-calibration-framework.zh.md](docs/one-click-calibration-framework.zh.md)

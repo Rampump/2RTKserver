@@ -154,6 +154,9 @@ sudo systemctl start 2rtkserver
   逐步走 CORS 标定流程，标出每个阶段的确切串口命令
 - [docs/quectel-lg290p-calibration-commands.zh.md](docs/quectel-lg290p-calibration-commands.zh.md)
   —— LG290P 命令参考（`PQTMCFG*` / `PQTMSVIN*`）与踩过的坑
+- [docs/unicore-n4-commands-reference.zh.md](docs/unicore-n4-commands-reference.zh.md)
+  —— 和芯星通 N4（UM960/960L/980/982/UB9A0）命令参考：MODE/CONFIG、RTCM/NMEA 输出、
+  内置 NTRIP、网络串口，以及驱动已覆盖/未覆盖的命令对照
 - [docs/calibration-four-methods-per-module.zh.md](docs/calibration-four-methods-per-module.zh.md)
   —— 四种方式 × 三个模块逐行对照
 - [docs/one-click-calibration-framework.zh.md](docs/one-click-calibration-framework.zh.md)

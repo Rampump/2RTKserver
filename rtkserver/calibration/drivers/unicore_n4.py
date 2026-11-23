@@ -2,7 +2,13 @@
 """Unicore（和芯星通）N4 系列驱动（UM960 / UM960L / UM980 / UM982）。
 
 数据来源：《Unicore Reference Commands Manual For N4 High Precision Products》
-（V2_CH_R1.1，下称"手册"）。每个方法都标了章节，改一行前先去文档核对，不要凭记忆改。
+（**V2_EN_R1.4，2024-07，349 页**，下称"手册"）。每个方法都标了章节，改一行前先去
+文档核对，不要凭记忆改。
+
+⚠ 章节号以 **R1.4 目录**为准。本文件早期注释按旧版 `V2_CH_R1.1` 编号，
+两版之间有个别小节漂移（已修正的：天线高 `CONFIG ANTENNADELTAHEN` 是 §4.25 而不是
+§4.22；R1.4 的 §4.26 是 `CONFIG AUTHCODE`，不是天线型号）。遇到对不上的章节号，
+以 `docs/unicore-n4-commands-reference.zh.md`（逐条抄自 R1.4）为准。
 
 ## 为什么一个手册要拆成四个驱动类
 
@@ -115,11 +121,27 @@ CMD = {
     'set_ant_delta':   'CONFIG ANTENNADELTAHEN {h} {east} {north}',
     'set_ant_model':   'CONFIG BASEANTENNAMODEL "{name}" {sn} {setup_id} {type}',
 
-    # ---- 五、截止高度角（§5.2 MASK）----
+    # ---- 五、截止高度角与星座屏蔽（§5）----
+    # `MASK 10` 是高度角，`MASK GPS` 是屏蔽系统，`MASK GPS PRN 10` 是屏蔽单星 ——
+    # 三种形态共用一个命令头，所以命令体按形态拆成三个键，参数校验在方法里做，
+    # 绝不能把用户输入原样塞进 `MASK {x}`（传 `-5` 会变成合法的高度角设置）。
     'get_mask':        'MASK',
     'set_elev_mask':   'MASK {degree}',
+    'mask_target':     'MASK {target}',
+    'mask_prn':        'MASK {system} PRN {prn}',
+    'unmask_target':   'UNMASK {target}',
+    'unmask_prn':      'UNMASK {system} PRN {prn}',
 
-    # ---- 六、报文输出（§1 表 1-1 + 附录 2）----
+    # ---- 六、差分与 RTK 引擎（§4.5 / §4.6 / §4.7）----
+    # 这两条是**流动站侧最关键的参数**：差分龄期超过超时值就退化解，
+    # 现场"明明连着 caster 却一直是浮点"多半是 RTK TIMEOUT 配小了。
+    'set_rtk_timeout':     'CONFIG RTK TIMEOUT {seconds}',
+    'set_dgps_timeout':    'CONFIG DGPS TIMEOUT {seconds}',
+    'set_rtk_reliability': 'CONFIG RTK RELIABILITY {engine} {adr}',
+    'reset_rtk':           'CONFIG RTK RESET',
+    'disable_rtk':         'CONFIG RTK DISABLE',
+
+    # ---- 七、报文输出（§1 表 1-1 + 附录 2）----
     # rtcm<消息号> com<口> <间隔秒>；gpgga/gprmc/gpzda/gpvth/gpths com<口> <间隔秒>
     # 间隔语义是**秒**：1006/1033 写 10 = 每 10 秒一次；MSM 写 1 = 1 Hz（§1.1 表 1-2）。
     'rtcm_msg':        'RTCM{msg} {port} {interval}',
@@ -128,11 +150,22 @@ CMD = {
     'unlog_msg':       'UNLOG {name}',
     'unlog_port':      'UNLOG {port}',
     'unlog_port_msg':  'UNLOG {port} {name}',
+    # NMEA 版本（§4.15）：V410 默认（扩展支持 BDS），V411
+    'set_nmea_version': 'CONFIG NMEA0183 {version}',
 
-    # ---- 七、工具（§8）----
+    # ---- 八、内置 NTRIP（§4.35 / §4.36，**仅 V1**）----
+    # 上传端 NCOM1/2/3 只有密码、没有用户名（NTRIP1 风格）；
+    # 下载端只有 NCOM20 一路，要用户名 + 密码。参数顺序见文档 §5.1 / §5.2。
+    'ntrip_server':    'CONFIG NCOM{n} {host} {port} {mount} {password}',
+    'ntrip_client':    'CONFIG NCOM20 {host} {port} {mount} {user} {password}',
+    'ntrip_disable':   'CONFIG NCOM{n} Disable',
+
+    # ---- 九、工具（§8 / §10）----
     'save':            'SAVECONFIG',
     'factory_reset':   'FRESET',
     'reset':           'RESET',
+    # 选择性清数据（§10）：RESET [EPHEM|ALMANAC|IONUTC|POSITION|XOPARAM|ALL]
+    'reset_data':      'RESET {kind}',
 }
 
 # 流动站（§3.6）**不属于**公共集：手册明写"适用产品：UM960、UM980、UM982"，
@@ -144,9 +177,16 @@ ROVER_CMD = {
 }
 
 # Heading2 定向（§3.7）：适用 UM960、UM980、UM982
+# 第二参数可选，决定定向解算的动态模型（§3.7 原表）：
+#   FIXLENGTH       基线长度固定（两天线刚性安装，最常用）
+#   VARIABLELENGTH  基线长度可变
+#   STATIC          静止
+#   LOWDYNAMIC      低动态
 HEADING2_CMD = {
-    'set_heading2':    'MODE HEADING2',
+    'set_heading2':      'MODE HEADING2',
+    'set_heading2_mode': 'MODE HEADING2 {mode}',
 }
+HEADING2_MODES = ('FIXLENGTH', 'VARIABLELENGTH', 'STATIC', 'LOWDYNAMIC')
 
 # 双天线 Heading 引擎（§4.8）：**仅 UM982**（手册 §4.8 表 4-12）
 HEADING_CMD = {
@@ -159,6 +199,22 @@ HEADING_CMD = {
 UM980_ONLY_CMD = {
     'set_mmp':         'CONFIG MMP {mode}',
     'set_psrveldrpos': 'CONFIG PSRVELDRPOS {mode}',
+}
+
+# 无差分时段保持厘米级定位（§4.7）：适用 UM960 / UM980 / UM982，
+# **UM960L 不在适用表里**，所以不能放公共集。
+# 流动站过隧道/进遮挡时靠它撑住解算，出遮挡立刻恢复 RTK —— 属于现场常用项。
+DIFF_HOLD_CMD = {
+    'set_standalone':   'CONFIG STANDALONE ENABLE {lat} {lon} {h}',
+    'unset_standalone': 'CONFIG STANDALONE DISABLE',
+}
+
+# RTCM 侧的两个编解码开关，仅 UM980 / UM982（§4.16 / §4.37）：
+#   RTCMB1CB2a    是否把 BDS B1C/B2a 编进 RTCM（默认 ENABLE），关掉能省带宽
+#   RTCMDECAUTO   同时收到 RTCM3.0 与 3.2 时优先解 3.2 并滤掉 3.0
+RTCM_BDS_CMD = {
+    'set_rtcm_b1cb2a':  'CONFIG RTCMB1CB2a {mode}',
+    'set_rtcm_decauto': 'CONFIG RTCMDECAUTO {mode}',
 }
 
 CAPS = {
@@ -186,7 +242,7 @@ CAPS = {
     # False = 只能按时间 + 坐标稳定性间接判断（N4 属于这档）。
     'svin_has_status': False,
     'fixed': True,            # 精确坐标（§3.2）
-    'ant_info': True,         # CONFIG BASEANTENNAMODEL（§4.26，影响 1005/1006/1007/1033）
+    'ant_info': True,         # CONFIG BASEANTENNAMODEL（手册 §8 CONFIG 表，影响 1005/1006/1007/1033）
     # 天线高（§4.22 ANTENNADELTAHEN，影响 RTCM1006）。四型号都有这条命令，
     # 但"天线偏移/天线高"整个功能在产品层面已定案不做（见 MEMORY：不参与 RTK 测量
     # 工程就不需要 APC→ARP），所以默认 None = 不下发。留着命令体是为了
@@ -195,6 +251,21 @@ CAPS = {
     'msg_rate': True,         # rtcmXXXX / gpgga 逐条配间隔
     'rtcm_out': True,         # 同上
     'heading2': False,        # 双天线 Heading2 定向，子类按手册打开
+    # 差分龄期超时（§4.5 DGPS / §4.6 RTK）。流动站侧最容易被忽略、又最影响
+    # "连着 caster 却一直浮点"的一项：超时值配小了，差分刚有 3 秒空档就退化解。
+    'rtk_timeout': True,
+    # 按系统 / 频率 / PRN 屏蔽（§5.2，`MASK GPS` / `MASK B1` / `MASK GPS PRN 10`）
+    'mask_system': True,
+    # 选择性清数据（§10 `RESET EPHEM|ALMANAC|IONUTC|POSITION|XOPARAM|ALL`）
+    'reset_data': True,
+    # NMEA 版本可切（§4.15 V410 / V411）
+    'nmea_version': True,
+    # 内置 NTRIP（§4.35 / §4.36）。**能力位保持 False 是刻意的**：
+    # 手册把 NCOM1/2/3 与 NCOM20 的小节标为适用 UB9A0，而文档 §12 明说
+    # "其余型号上机前须实测"。命令体与方法都已实现，现场实测通过后
+    # 把本键改成 True 即可启用；不改就代表"厂商没对这四个型号承诺过"，
+    # 上层不会以为板子自带 NTRIP 而把外部转发链路拆掉。
+    'ntrip': False,
     'err3': False,            # 简化 ASCII 不返回数字错误码，只有"不响应"或 `$command,response:...`
     # `FRESET`：清 NVM 全部配置。恢复出厂后串口参数也可能回到默认档，
     # PREFLIGHT 恢复出厂后必须重新枚举波特率再识别。
@@ -241,8 +312,12 @@ LEGACY_PRODUCTS = ('UB4B0', 'UM4B0', 'UM480', 'UM440', 'UM482', 'UM442', 'UB482'
 
 # 流动站工作模式（§3.6 表 3-8）。参数 2 留空 = 该大类默认配置。
 ROVER_PROFILES = ('UAV', 'SURVEY', 'AUTOMOTIVE')
+# ⚠ UAV 的第二档是 **HIGHDYN**（高动态：编队灯光秀 / FPV），不是 FORMATION。
+# 手册 R1.4 §3.6 表 3-8 原文只有 DEFAULT / HIGHDYN 两档；
+# 早先这里写成 FORMATION，会拼出 `MODE ROVER UAV FORMATION` ——
+# 简化 ASCII 协议不回错误码，模块静默不认，现场表现就是"选了无人机细分没反应"。
 ROVER_VARIANTS = {
-    'UAV': ('DEFAULT', 'FORMATION'),
+    'UAV': ('DEFAULT', 'HIGHDYN'),
     'SURVEY': ('DEFAULT', 'MOW'),
     'AUTOMOTIVE': ('DEFAULT',),
 }
@@ -281,7 +356,7 @@ class UnicoreN4Base(BaseDriver):
     """
 
     # 数据来源标注（前端"关于/型号详情"要显示，别让用户以为是我们编的）
-    DOC_TITLE = 'Unicore Reference Commands Manual For N4 High Precision Products V2_CH_R1.1'
+    DOC_TITLE = 'Unicore Reference Commands Manual For N4 High Precision Products V2_EN_R1.4'
 
     # 厂牌声明：扫描器认出的 `$command,response:` 命令族 / `#VERSIONA` 日志头
     # 都归到 'Unicore'，四个子类共用（见 `BaseDriver.VENDOR` 的注释）。
@@ -649,7 +724,18 @@ class UnicoreN4Base(BaseDriver):
             if not self.caps('heading2'):
                 return False, (f'{self.DISPLAY_NAME} 不支持 Heading2 定向'
                                f'（手册 §3.7 适用产品不含本型号）'), {'error': 'unsupported'}
-            key, params = 'set_heading2', {}
+            # §3.7 的第二参数决定定向解算的动态模型，不传就用模块当前设置。
+            # 早先这个分支把参数整个丢掉、只发裸 `MODE HEADING2`，
+            # 于是"刚性基线"这种必须显式声明的场景永远配不上（模块按默认跑）。
+            heading_mode = (kwargs.pop('heading_mode', '') or variant or '').upper()
+            if heading_mode:
+                if heading_mode not in HEADING2_MODES:
+                    return False, (f'Heading2 的动态模型只能是 '
+                                   f'{"/".join(HEADING2_MODES)}，收到 {heading_mode}'), {
+                        'error': 'bad_variant'}
+                key, params = 'set_heading2_mode', {'mode': heading_mode}
+            else:
+                key, params = 'set_heading2', {}
         else:
             return False, f'不支持的模式：{mode}（可选 base / rover / heading2）', {
                 'error': 'bad_mode'}
@@ -675,7 +761,12 @@ class UnicoreN4Base(BaseDriver):
         return True, f'已下发切换到 {mode} 模式', {'mode': mode, 'variant': variant}
 
     def set_rover(self, profile=None, variant=None, persist=True, restart=True, verify=True):
-        """§3.6 流动站细分：`MODE ROVER [UAV|SURVEY|AUTOMOTIVE] [DEFAULT|FORMATION|MOW]`。
+        """§3.6 流动站细分：`MODE ROVER [UAV|SURVEY|AUTOMOTIVE] [DEFAULT|HIGHDYN|MOW]`。
+
+        第二档按大类而不同（表 3-8）：UAV 是 DEFAULT / HIGHDYN、
+        SURVEY 是 DEFAULT / MOW、AUTOMOTIVE 只有 DEFAULT。
+        校验读 `ROVER_VARIANTS`，不在表里的档位直接拒绝 ——
+        简化 ASCII 下发不认的命令既不报错也不生效，只能靠这一层挡住。
 
         单独一个方法（而不是塞进 `set_mode(..., profile=)`）是因为
         `set_mode` 是**基类约定的接口**，签名不能按厂商需要随意加参数 ——
@@ -986,8 +1077,12 @@ class UnicoreN4Base(BaseDriver):
         "这个要求本型号无法保证"，而不是假装配了。
         """
         seconds = _to_int(count)
-        if seconds is None or not (1 <= seconds <= 86400):
-            return False, f'自主优化时长必须在 1~86400 秒之间，收到 {count}', {
+        # 上限是 **3600 秒（1 小时）**，手册 §3.3 原文 "非负，≤3600"。
+        # 早先写成 86400 是按 Quectel `MinDur` 的上限抄过来的 —— 那是另一家的口径，
+        # 超过 3600 的时长 N4 会静默不认（简化 ASCII 不回错误码），
+        # 现场表现是"填了 7200 秒，模块还是按 3600 收敛"，而流程层以为配的是 7200。
+        if seconds is None or not (1 <= seconds <= 3600):
+            return False, f'自主优化时长必须在 1~3600 秒之间（手册 §3.3 上限 1 小时），收到 {count}', {
                 'error': 'bad_count'}
 
         params = {'seconds': int(seconds)}
@@ -1377,6 +1472,46 @@ class UnicoreN4Base(BaseDriver):
                        f'请改用 set_rtcm_output / set_message_rate'), {
             'error': 'unsupported', 'hint': 'use_set_message_rate', 'msm_type': msm_type}
 
+    def set_rtcm_b1cb2a(self, enabled=True, persist=True):
+        """§4.16 `CONFIG RTCMB1CB2a ENABLE|DISABLE`：是否把 BDS B1C/B2a 编进 RTCM。
+
+        默认 ENABLE。关掉的收益是基站上行带宽明显变小（B1C/B2a 观测占一块），
+        代价是支持 B1C/B2a 的流动站拿不到这部分观测 —— 只有确认全网流动站
+        都不用这两路信号时再关。适用 UM980 / UM982（UM960 不在手册适用表里）。
+        """
+        mode = 'ENABLE' if enabled else 'DISABLE'
+        ok, message, data = self.request('set_rtcm_b1cb2a', mode=mode)
+        if ok and persist:
+            self.save()
+        return ok, message, data
+
+    def set_rtcm_decauto(self, enabled=True, persist=True):
+        """§4.37 `CONFIG RTCMDECAUTO ENABLE|DISABLE`：同时收到 RTCM3.0 与 3.2 时优先解 3.2。
+
+        上游 caster 混播两种版本时打开它，能避免用老版本电文算出过时的差分。
+        适用 UM980 / UM982。
+        """
+        mode = 'ENABLE' if enabled else 'DISABLE'
+        ok, message, data = self.request('set_rtcm_decauto', mode=mode)
+        if ok and persist:
+            self.save()
+        return ok, message, data
+
+    def set_nmea_version(self, version='V410', persist=True):
+        """§4.15 `CONFIG NMEA0183 V410|V411`：NMEA 版本，`V410` 为默认（扩展支持 BDS）。
+
+        只两个合法值。写成 `V4.10` / `410` 模块一律不认且不报错，
+        所以这里卡成枚举，而不是把字符串原样丢过去。
+        """
+        version = str(version or '').strip().upper()
+        if version not in ('V410', 'V411'):
+            return False, f'NMEA 版本只能是 V410 或 V411，收到 {version}', {
+                'error': 'bad_version'}
+        ok, message, data = self.request('set_nmea_version', version=version)
+        if ok and persist:
+            self.save()
+        return ok, message, data
+
     def read_rtcm_config(self):
         """N4 没有 RTCM 配置查询命令 —— 播发项就是当前 `LOG` 列表，读不回来。"""
         return False, (f'{self.DISPLAY_NAME} 没有查询 RTCM 播发配置的命令'), {
@@ -1426,9 +1561,13 @@ class UnicoreN4Base(BaseDriver):
 
     # ==================== 六、天线 ====================
     def set_antenna_info(self, desc, setup_id=0, sn='', persist=True):
-        """§4.26 `CONFIG BASEANTENNAMODEL "<名称>" <SN> <setup_id> <类型>`（进 RTCM3-1033）。
+        """`CONFIG BASEANTENNAMODEL "<名称>" <SN> <setup_id> <类型>`（进 RTCM3-1033）。
 
-        三个硬限制（手册 §4.26）：
+        章节号说明：手册把它列在 §8 的 CONFIG 汇总表里，**没有单列小节号**。
+        早先写的 "§4.26" 是错的 —— R1.4 的 §4.26 是 `CONFIG AUTHCODE`（授权码），
+        照那个号去翻只会找到不相干的内容。
+
+        三个硬限制（手册该条目的 NOTE）：
             - 名称最长 16 字符（**不是** Quectel 的 31，抄过来会静默截断）
             - 一律用双引号包住，名称里不能有引号
             - setup_id 0~255
@@ -1462,10 +1601,16 @@ class UnicoreN4Base(BaseDriver):
             'desc': desc, 'setup_id': setup_id, 'sn': sn}
 
     def set_elevation_mask(self, degree, persist=True):
-        """§5.2 截止高度角：`MASK <度>`，范围 0~90。"""
+        """§5.2 截止高度角：`MASK <度>`，手册给的合法区间是 **-90~90**（默认 5）。
+
+        早先这里写 0~90，把负值当非法拒掉了 —— 但手册明确允许负角度
+        （等于"不按高度角筛"，低仰角观测全收，多路径环境下才需要）。
+        合法值被拒的后果是现场只能改成 0，实际行为与要求并不一致。
+        """
         degree = _to_float(degree)
-        if degree is None or not (0.0 <= degree <= 90.0):
-            return False, f'截止高度角必须在 0~90 度之间，收到 {degree}', {'error': 'bad_mask'}
+        if degree is None or not (-90.0 <= degree <= 90.0):
+            return False, f'截止高度角必须在 -90~90 度之间（手册 §5.2），收到 {degree}', {
+                'error': 'bad_mask'}
         ok, message, data = self.request('set_elev_mask', degree=_fmt_num(degree, 1))
         if not ok:
             return False, message, data
@@ -1484,25 +1629,316 @@ class UnicoreN4Base(BaseDriver):
         return True, message, {'degree': _to_float(fields[-1]), 'raw': data.get('raw')}
 
     def set_ant_delta(self, height, east=0.0, north=0.0, persist=True):
-        """§4.22 `CONFIG ANTENNADELTAHEN <高> <东> <北>`（影响 RTCM1006）。
+        """§4.25（R1.4 章节号）`CONFIG ANTENNADELTAHEN <高> <东> <北>`（影响 RTCM1006）。
 
         **默认关着**（`CAPS['ant_delta'] = None`）：本产品不做 RTK 测量工程，
         天线相位中心到地面标识点的偏移没有意义。命令体保留，
         现场确实需要时把能力位打开即可，不必重写一遍协议。
+
+        取值范围按手册表 4-30：高 **0~6.5535 m**、东/北偏移 **0~100 m**。
+        早先这里写 -10~10 且只校验高，等于放过了超上限的高和任意大的偏移；
+        超范围的参数模块会静默忽略（简化 ASCII 无错误码），
+        而 1006 里的天线描述就成了一个"看起来配了、其实没配"的值。
         """
         if not self.caps('ant_delta'):
             return False, ('本产品不做天线偏移（APC→ARP）——那是 RTK 测量工程的工序；'
                            '如需启用请打开驱动的 ant_delta 能力位'), {'error': 'unsupported'}
         height = _to_float(height)
-        if height is None or not (-10.0 <= height <= 10.0):
-            return False, f'天线高必须在 -10~10 米之间，收到 {height}', {'error': 'bad_height'}
+        if height is None or not (0.0 <= height <= 6.5535):
+            return False, f'天线高必须在 0~6.5535 米之间（手册表 4-30），收到 {height}', {
+                'error': 'bad_height'}
+        east = _to_float(east)
+        north = _to_float(north)
+        if east is None or not (0.0 <= east <= 100.0):
+            return False, f'东向偏移必须在 0~100 米之间，收到 {east}', {'error': 'bad_offset'}
+        if north is None or not (0.0 <= north <= 100.0):
+            return False, f'北向偏移必须在 0~100 米之间，收到 {north}', {'error': 'bad_offset'}
         ok, message, data = self.request(
             'set_ant_delta', h=_fmt_num(height, 4),
-            east=_fmt_num(_to_float(east) or 0.0, 4),
-            north=_fmt_num(_to_float(north) or 0.0, 4))
+            east=_fmt_num(east, 4),
+            north=_fmt_num(north, 4))
         if ok and persist:
             self.save()
         return ok, message, data
+
+    # ==================== 六之二、星座 / 频率屏蔽（§5.2） ====================
+    # 手册 §5.2 的屏蔽对象写法：星座用下列缩写，频率写 `B1` / `B2` / `E5a` 这类，
+    # 单颗星写 `MASK <系统> PRN <号>`。同一条 `MASK` 命令头还兼管截止高度角，
+    # 所以三种形态必须在**参数层**分开 —— 见 `mask_target()` 里"拒绝纯数字"那段。
+    MASK_SYSTEMS = ('GPS', 'BDS', 'GLO', 'GAL', 'QZSS', 'IRNSS')
+
+    def mask_target(self, target, persist=True):
+        """§5.2 按星座或频率屏蔽：`MASK GPS` / `MASK B1` / `MASK E5a`。
+
+        必须拒绝纯数字：`MASK` 后面跟数字是**截止高度角**，跟名字才是屏蔽对象。
+        两者共用一个命令头，一旦把 `MASK 10` 当"屏蔽 10 号星"发下去，
+        改的是高度角设置且静默生效 —— 现场只会看到"卫星突然少了一片"，
+        几乎不可能回溯到这条命令。所以宁可报错让用户改调 `set_elevation_mask()`。
+        """
+        target = str(target or '').strip().upper()
+        if not target:
+            return False, '屏蔽对象不能为空', {'error': 'bad_target'}
+        if target.lstrip('-').replace('.', '').isdigit():
+            return False, (f'{target} 是高度角写法；截止高度角请用 set_elevation_mask()，'
+                           f'这里只接收星座或频率名'), {'error': 'looks_like_elevation'}
+        if ' ' in target:
+            return False, f'屏蔽对象不能含空格（单颗星请用 mask_prn()）：{target}', {
+                'error': 'bad_target'}
+        ok, message, data = self.request('mask_target', target=target)
+        if ok and persist:
+            self.save()
+        return ok, message, data
+
+    def mask_prn(self, system, prn, persist=True):
+        """§5.2 屏蔽单颗星：`MASK GPS PRN 10`。
+
+        手册明确警告：**按系统屏蔽与按 PRN 屏蔽不能混用**
+        （屏蔽整个系统后再解禁单颗 PRN 不生效）。这条限制在驱动层判断不了
+        （要先读回当前屏蔽表），所以只在返回值里带一句提醒，不假装能替用户兜住。
+        """
+        system = str(system or '').strip().upper()
+        if system not in self.MASK_SYSTEMS:
+            return False, f'星座只能是 {"/".join(self.MASK_SYSTEMS)}，收到 {system}', {
+                'error': 'bad_system'}
+        prn = _to_int(prn)
+        if prn is None or not (1 <= prn <= 999):
+            # 手册只给了 `MASK GPS PRN 10` 这个例子，没写上限；
+            # 这里按卫星编号的通行范围粗校验，只防 0 / 负数 / 非数字被原样发下去。
+            return False, f'PRN 必须是 1~999 的整数，收到 {prn}', {'error': 'bad_prn'}
+        ok, message, data = self.request('mask_prn', system=system, prn=int(prn))
+        if ok and persist:
+            self.save()
+        if ok and isinstance(data, dict):
+            data['warning'] = '按系统屏蔽与按 PRN 屏蔽不能混用（手册 §5.2）'
+        return ok, message, data
+
+    def unmask(self, target, persist=True):
+        """§5.2 解禁星座 / 频率：`UNMASK GPS` / `UNMASK B1`，与 `mask_target` 同构。"""
+        target = str(target or '').strip().upper()
+        if not target:
+            return False, '解禁对象不能为空', {'error': 'bad_target'}
+        if target.lstrip('-').replace('.', '').isdigit():
+            return False, f'{target} 是高度角写法，UNMASK 只接收星座或频率名', {
+                'error': 'looks_like_elevation'}
+        ok, message, data = self.request('unmask_target', target=target)
+        if ok and persist:
+            self.save()
+        return ok, message, data
+
+    def unmask_prn(self, system, prn, persist=True):
+        """§5.2 解禁单颗星：`UNMASK GPS PRN 10`。"""
+        system = str(system or '').strip().upper()
+        if system not in self.MASK_SYSTEMS:
+            return False, f'星座只能是 {"/".join(self.MASK_SYSTEMS)}，收到 {system}', {
+                'error': 'bad_system'}
+        prn = _to_int(prn)
+        if prn is None or not (1 <= prn <= 999):
+            return False, f'PRN 必须是 1~999 的整数，收到 {prn}', {'error': 'bad_prn'}
+        ok, message, data = self.request('unmask_prn', system=system, prn=int(prn))
+        if ok and persist:
+            self.save()
+        return ok, message, data
+
+    # ==================== 六之三、差分龄期与 RTK 引擎（§4.5 / §4.6 / §4.7） ====================
+    def set_rtk_timeout(self, seconds, persist=True):
+        """§4.6 `CONFIG RTK TIMEOUT <秒>`：差分数据最大龄期，**0 = 关闭 RTK**。
+
+        流动站侧最值得先配的一项。出厂默认各型号不同（UM982 = 600 s，
+        UM980 = 120 s）。配太小：caster 抖三五秒就丢固定解，现场看起来像
+        "上游差分不稳"；配太大：早就不新鲜的差分仍被当有效，解算显示固定
+        但坐标已经在偏 —— 两种都查不到根因，所以把区间卡死在手册给的 1~1800。
+        """
+        seconds = _to_int(seconds)
+        if seconds is None or not (0 <= seconds <= 1800):
+            return False, f'RTK 超时必须 0~1800 秒（0 = 关闭 RTK），收到 {seconds}', {
+                'error': 'bad_timeout'}
+        ok, message, data = self.request('set_rtk_timeout', seconds=int(seconds))
+        if ok and persist:
+            self.save()
+        return ok, message, data
+
+    def set_dgps_timeout(self, seconds, persist=True):
+        """§4.5 `CONFIG DGPS TIMEOUT <秒>`：DGPS 差分龄期，默认 300，0 = 关闭。"""
+        seconds = _to_int(seconds)
+        if seconds is None or not (0 <= seconds <= 1800):
+            return False, f'DGPS 超时必须 0~1800 秒（0 = 关闭 DGPS），收到 {seconds}', {
+                'error': 'bad_timeout'}
+        ok, message, data = self.request('set_dgps_timeout', seconds=int(seconds))
+        if ok and persist:
+            self.save()
+        return ok, message, data
+
+    def set_rtk_reliability(self, engine=1, adr=1, persist=True):
+        """`CONFIG RTK RELIABILITY <引擎阈值> <ADR 阈值>`，两个参数都是 1~4。
+
+        手册把它归在 §4.6 一带，语义是"解算可靠性的门限档"：
+        调高更保守（不容易给假固定），调低更容易出固定解但误固定风险上升。
+        默认不动，只在现场出现"频繁假固定"或"死活不出固定"时才需要它。
+        """
+        engine = _to_int(engine)
+        adr = _to_int(adr)
+        for name, value in (('引擎', engine), ('ADR', adr)):
+            if value is None or not (1 <= value <= 4):
+                return False, f'{name} 可靠性档必须 1~4，收到 {value}', {
+                    'error': 'bad_reliability'}
+        ok, message, data = self.request('set_rtk_reliability',
+                                         engine=int(engine), adr=int(adr))
+        if ok and persist:
+            self.save()
+        return ok, message, data
+
+    def reset_rtk(self, persist=False):
+        """`CONFIG RTK RESET`：复位 RTK 解（固定与浮点一起清）。
+
+        用途是排障：从模拟器切回真实信号、或换 caster 之后残留了旧解时，
+        复位一次比等它自己收敛快。默认**不存 NVM** —— 这是瞬时动作，
+        存进去只会让下次上电多一条无意义的配置。
+        """
+        ok, message, data = self.request('reset_rtk')
+        if ok and persist:
+            self.save()
+        return ok, message, data
+
+    def disable_rtk(self, persist=False):
+        """`CONFIG RTK DISABLE`：停掉 RTK（含浮点与固定），只剩单点/差分。
+
+        与 `reset_rtk()` 的区别：RESET 是"清掉当前解、继续算"，
+        DISABLE 是"这一路不要再用 RTK"。给现场做"只想看单点精度"的对照用。
+        """
+        ok, message, data = self.request('disable_rtk')
+        if ok and persist:
+            self.save()
+        return ok, message, data
+
+    def set_standalone(self, lat, lon, height, persist=True):
+        """§4.7 `CONFIG STANDALONE ENABLE <lat> <lon> <h>`：无差分时段保持厘米级定位。
+
+        流动站过隧道、进树下遮挡时，靠它把最后的已知位置撑住，
+        出遮挡恢复差分立刻接回 RTK。**适用 UM960 / UM980 / UM982**，
+        UM960L 不在手册的适用表里（所以它的 CMD 表没有这两个键）。
+        """
+        lat = _to_float(lat)
+        lon = _to_float(lon)
+        height = _to_float(height)
+        if lat is None or not (-90.0 <= lat <= 90.0):
+            return False, f'纬度超出 ±90°：{lat}', {'error': 'bad_lat'}
+        if lon is None or not (-180.0 <= lon <= 180.0):
+            return False, f'经度超出 ±180°：{lon}', {'error': 'bad_lon'}
+        if height is None or not (-1000.0 <= height <= 20000.0):
+            return False, f'椭球高超出 -1000~20000 m：{height}', {'error': 'bad_height'}
+        ok, message, data = self.request('set_standalone', lat=_fmt_deg(lat, 9),
+                                         lon=_fmt_deg(lon, 9), h=f'{height:.4f}')
+        if ok and persist:
+            self.save()
+        return ok, message, data
+
+    def unset_standalone(self, persist=True):
+        """§4.7 `CONFIG STANDALONE DISABLE`：关掉无差分保持。"""
+        ok, message, data = self.request('unset_standalone')
+        if ok and persist:
+            self.save()
+        return ok, message, data
+
+    # ==================== 六之四、内置 NTRIP（§4.35 / §4.36，**仅 V1**） ====================
+    # 能力位 `CAPS['ntrip']` 默认 False：手册把 NCOM 小节标为适用 UB9A0，
+    # N4 这四个型号厂商没有逐一承诺（见 docs/unicore-n4-commands-reference §12）。
+    # 方法照样实现，是为了"现场实测通过后打开一个开关就能用"，不是假装配好了。
+    NTRIP_SERVER_SLOTS = (1, 2, 3)
+    NTRIP_CLIENT_SLOT = 20
+
+    def _check_ntrip_common(self, host, port, mount, secret_name, secret):
+        """NTRIP 三要素的公共校验，两个 set_* 共用（错误文案才不会两处漂）。"""
+        host = str(host or '').strip()
+        mount = str(mount or '').strip()
+        secret = str(secret or '').strip()
+        if not host or ' ' in host:
+            return None, f'caster 地址不能为空或含空格：{host!r}'
+        port = _to_int(port)
+        # 手册 §4.2 的端口范围 1~65534（40000 保留给内部系统编程）。
+        if port is None or not (1 <= port <= 65534):
+            return None, f'端口必须是 1~65534 的整数，收到 {port}'
+        if port == 40000:
+            return None, '端口 40000 保留给内部系统编程（手册 §4.2），请换一个'
+        if not mount or ' ' in mount:
+            return None, f'挂载点不能为空或含空格：{mount!r}'
+        if not secret or ' ' in secret:
+            return None, f'{secret_name}不能为空或含空格'
+        return {'host': host, 'port': int(port), 'mount': mount, secret_name: secret}, ''
+
+    def set_ntrip_server(self, host, port, mount, password, slot=1, persist=True):
+        """§4.35 内置 Ntrip Server（模块自己往 caster 上传）：`CONFIG NCOM<n> ...`。
+
+        **凭据只有上传密码、没有用户名** —— 这是 NTRIP1 的模型，
+        与我们程序里那套 NTRIP2（账号 + 密码）不是一回事。
+        所以本方法只适合"caster 允许匿名/纯密码上传"的场景；
+        需要用户名时仍然得走外部程序转发，别指望模块内置。
+        """
+        slot = _to_int(slot)
+        if slot not in self.NTRIP_SERVER_SLOTS:
+            return False, (f'上传通道只有 NCOM1/2/3 三路，收到 {slot}'
+                           f'（下载走 set_ntrip_client 的 NCOM20）'), {'error': 'bad_slot'}
+        params, problem = self._check_ntrip_common(host, port, mount, 'password', password)
+        if params is None:
+            return False, problem, {'error': 'bad_param'}
+        ok, message, data = self.request(
+            'ntrip_server', n=int(slot), host=params['host'], port=params['port'],
+            mount=params['mount'], password=params['password'])
+        if ok and persist:
+            self.save()
+        if ok and isinstance(data, dict):
+            data.update({'slot': int(slot), 'protocol': 'NTRIP1',
+                         'verified_on_this_model': bool(self.caps('ntrip'))})
+        return ok, message, data
+
+    def set_ntrip_client(self, host, port, mount, user, password, persist=True):
+        """§4.36 内置 Ntrip Client（模块自己从 caster 取差分）：`CONFIG NCOM20 ...`。
+
+        **只有 NCOM20 一路**，且要用户名 + 密码（与上传端的纯密码模型不同）。
+        这是流动站最省事的一条路：模块直连 caster，不必再挂一个转发程序。
+        代价是只有 NTRIP1、拿不到 VRS 的 GGA 交互型挂载点信息 ——
+        需要 VRS（发 GGA 换差分）时仍要用外部程序。
+        """
+        params, problem = self._check_ntrip_common(host, port, mount, 'password', password)
+        if params is None:
+            return False, problem, {'error': 'bad_param'}
+        user = str(user or '').strip()
+        if not user or ' ' in user:
+            return False, f'用户名不能为空或含空格：{user!r}', {'error': 'bad_param'}
+        ok, message, data = self.request(
+            'ntrip_client', host=params['host'], port=params['port'],
+            mount=params['mount'], user=user, password=params['password'])
+        if ok and persist:
+            self.save()
+        if ok and isinstance(data, dict):
+            data.update({'slot': self.NTRIP_CLIENT_SLOT, 'protocol': 'NTRIP1',
+                         'verified_on_this_model': bool(self.caps('ntrip'))})
+        return ok, message, data
+
+    def disable_ntrip(self, slot=None, persist=True):
+        """关闭内置 NTRIP 的某一路：`CONFIG NCOM<n> Disable`。
+
+        `slot` 不传就**同时关掉三路上传 + 一路下载** —— 现场"先别用模块内置 NTRIP"
+        时希望一句话关干净，而不是记得关四次。
+        """
+        slots = [slot] if slot is not None else list(self.NTRIP_SERVER_SLOTS) + [self.NTRIP_CLIENT_SLOT]
+        closed, failed = [], {}
+        for item in slots:
+            number = _to_int(item)
+            if number not in tuple(self.NTRIP_SERVER_SLOTS) + (self.NTRIP_CLIENT_SLOT,):
+                failed[str(item)] = '通道只能是 NCOM1/2/3 或 NCOM20'
+                continue
+            ok, message, _data = self.request('ntrip_disable', n=int(number))
+            if ok:
+                closed.append(int(number))
+            else:
+                failed[str(number)] = message
+        if failed:
+            return False, f'部分通道关闭失败：{failed}', {
+                'error': 'partial', 'closed': closed, 'failed': failed}
+        if persist and closed:
+            self.save()
+        return True, f'已关闭 NTRIP 通道 {"、".join(f"NCOM{n}" for n in closed)}', {
+            'closed': closed}
 
     # ==================== 七、持久化与工具 ====================
     def save(self):
@@ -1533,6 +1969,24 @@ class UnicoreN4Base(BaseDriver):
         if ok:
             return True, '已下发恢复出厂，重启后生效', data
         return False, message, data
+
+    def reset_data(self, kind='ALL'):
+        """§10 `RESET [EPHEM|ALMANAC|IONUTC|POSITION|XOPARAM|ALL]`：重启并按需清数据。
+
+        手册专门提醒：**信号从模拟器切回真实场景时**要清星历、历书、电离层/UTC、
+        位置，否则可能长时间不定位 —— 这条就是给那个场景用的。
+        注意 `ALL` 清的是上述除 `XOPARAM` 之外全部，等于把学到的星历与位置全丢掉，
+        下次冷启动会明显变慢，别当成普通重启用。
+
+        走 `_reboot_sequence()`：`RESET` 没有 OK 应答（与 `reboot()` 同一条路径），
+        用 `request()` 只会白等一个超时。
+        """
+        kind = str(kind or '').strip().upper()
+        if kind not in ('EPHEM', 'ALMANAC', 'IONUTC', 'POSITION', 'XOPARAM', 'ALL'):
+            return False, (f'RESET 的数据类型只能是 '
+                           f'EPHEM/ALMANAC/IONUTC/POSITION/XOPARAM/ALL，收到 {kind}'), {
+                'error': 'bad_kind'}
+        return self._reboot_sequence(self.body('reset_data', kind=kind))
 
     def fetch_raw(self, key):
         """按键名取命令体后用 `_raw()` 发（用于无应答 / 非标准应答的命令）。"""
@@ -1619,9 +2073,9 @@ class UnicoreUM960Driver(UnicoreN4Base):
     DISPLAY_NAME = 'Unicore UM960'
     PRODUCT_MODEL = 'UM960'
     DOC_TITLE = 'Unicore N4 手册 § UM960'
-    # §3.6 流动站 + §3.7 Heading2 都在适用产品里；§4.8 双天线引擎不在
-    CMD = {**CMD, **ROVER_CMD, **HEADING2_CMD}
-    CAPS = {**CAPS, 'heading2': True}
+    # §3.6 流动站 + §3.7 Heading2 都在适用产品里；§4.7 无差分保持也在（§4.8 双天线引擎不在）
+    CMD = {**CMD, **ROVER_CMD, **HEADING2_CMD, **DIFF_HOLD_CMD}
+    CAPS = {**CAPS, 'heading2': True, 'standalone': True}
 
 
 @register
@@ -1665,8 +2119,10 @@ class UnicoreUM980Driver(UnicoreN4Base):
     DISPLAY_NAME = 'Unicore UM980'
     PRODUCT_MODEL = 'UM980'
     DOC_TITLE = 'Unicore N4 手册 § UM980'
-    CMD = {**CMD, **ROVER_CMD, **HEADING2_CMD, **UM980_ONLY_CMD}
-    CAPS = {**CAPS, 'heading2': True, 'mmp': True, 'psrveldrpos': True}
+    CMD = {**CMD, **ROVER_CMD, **HEADING2_CMD, **UM980_ONLY_CMD,
+           **DIFF_HOLD_CMD, **RTCM_BDS_CMD}
+    CAPS = {**CAPS, 'heading2': True, 'mmp': True, 'psrveldrpos': True,
+            'standalone': True, 'rtcm_bds': True}
 
 
 @register
@@ -1693,8 +2149,10 @@ class UnicoreUM982Driver(UnicoreN4Base):
     DISPLAY_NAME = 'Unicore UM982'
     PRODUCT_MODEL = 'UM982'
     DOC_TITLE = 'Unicore N4 手册 § UM982'
-    CMD = {**CMD, **ROVER_CMD, **HEADING2_CMD, **HEADING_CMD}
-    CAPS = {**CAPS, 'heading2': True, 'heading_engine': True}
+    CMD = {**CMD, **ROVER_CMD, **HEADING2_CMD, **HEADING_CMD,
+           **DIFF_HOLD_CMD, **RTCM_BDS_CMD}
+    CAPS = {**CAPS, 'heading2': True, 'heading_engine': True,
+            'standalone': True, 'rtcm_bds': True}
     HIDDEN = True               # 双天线定向板，不适合做 RTK 基准站 → 前端不推
 
 
