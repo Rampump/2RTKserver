@@ -18,7 +18,7 @@ from typing import Optional
 from ..core import state
 from ..core.constants import (CASTER_QUEUE_SIZE, CASTER_RECONNECT_INTERVAL,
                               CASTER_WRITE_TIMEOUT, NTRIP_HANDSHAKE_TIMEOUT,
-                              UPLOAD_STATE_TEXT)
+                              SOURCE_STALL_TIMEOUT, UPLOAD_STATE_TEXT)
 from ..sources.ntrip import connect_to_host
 from ..utils.common import format_duration
 
@@ -94,7 +94,7 @@ def mark_upload_state(state_name: str, cfg=None, error: str = '', reconnect: boo
         upload_status['reconnects'] = int(upload_status.get('reconnects', 0)) + 1
     if state_name == 'authed':
         _upload_session_start = time.time()
-    elif state_name in ('idle', 'connecting', 'retrying', 'error'):
+    elif state_name in ('idle', 'waiting_source', 'connecting', 'retrying', 'error'):
         _upload_session_start = 0.0
     try:
         state.run_status['upload'] = upload_snapshot(cfg)
@@ -231,7 +231,7 @@ class CasterUploader:
                 self._last_error = error
             if state_name == 'authed':
                 self._session_start = time.time()
-            elif state_name in ('idle', 'connecting', 'retrying', 'error'):
+            elif state_name in ('idle', 'waiting_source', 'connecting', 'retrying', 'error'):
                 self._session_start = 0.0
 
     def _close(self):
@@ -308,18 +308,55 @@ class CasterUploader:
 
     def _retry_connect(self):
         while self._running and self._sock is None:
+            # 门闸同样管着重连：数据源没数据时不再一轮轮去认证（那正是云端
+            # 反复踢源的来源），等有了数据再连。
+            if self._pause_if_no_source():
+                return
             if self._connect():
                 return
             self._sleep(CASTER_RECONNECT_INTERVAL)
 
+    def _source_idle_seconds(self) -> float:
+        """距最近一帧 RTCM 的秒数；从没收到过数据时返回 inf。"""
+        ts = state.last_data_ts
+        return (time.time() - ts) if ts else float('inf')
+
+    def _pause_if_no_source(self) -> bool:
+        """数据源断流时主动退场：断开上传并停在 waiting_source，等数据恢复。
+
+        为什么必须主动断：NTRIP 的 SOURCE 连接没有心跳，光靠 sendall 抛错永远
+        发现不了"云端已经在踢我"。数据停了就自己走，比被踢掉再重连对云端友好，
+        也不会在 caster 侧留下半死会话。返回 True 表示"本轮已经处理过，调用方
+        应重新判断"。
+        """
+        idle = self._source_idle_seconds()
+        if idle <= SOURCE_STALL_TIMEOUT:
+            return False
+        age = int(idle) if idle != float('inf') else -1
+        if self._sock is not None:
+            reason = f"数据源 {age} 秒无数据，已主动断开上传" if age >= 0 else "数据源无数据，已主动断开上传"
+            logging.warning(f"上传出口：{reason}（避免被云端判定空闲后踢线）")
+            self._close()
+            self._set_state('waiting_source', error=reason)
+        elif self._state != 'waiting_source':
+            self._set_state('waiting_source', error='数据源无数据，等待 RTCM 后再认证')
+        self._sleep(0.5)
+        return True
+
     def _loop(self):
-        # 首次建连：失败就退避重试，直到成功或收到停止信号
+        # 首次建连：必须等数据源真的有数据；失败就退避重试
         while self._running and self._sock is None:
+            if self._pause_if_no_source():
+                continue
             if self._connect():
                 break
             self._sleep(CASTER_RECONNECT_INTERVAL)
 
         while self._running:
+            # 运行期断流熔断：模块被拔 / 中继上游停流时不再空挂一条已认证的会话
+            if self._pause_if_no_source():
+                continue
+
             try:
                 data = self._outbox.get(timeout=0.5)
             except queue.Empty:

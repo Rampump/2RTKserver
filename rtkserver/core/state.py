@@ -24,6 +24,18 @@ restart_event = threading.Event()       # 「保存并重启」信号，只重�
 
 worker_thread = None                    # 当前数据源线程，用于防止重复推流
 
+# ==================== 数据源门闸（三个出口共用） ====================
+# 为什么需要：出口原先无条件先于数据源启动。模块没插时上传端照样去云端认证，
+# 云端看到"SOURCE 连上了却一个字节不发"，几秒后把源踢掉；而数据源探测失败又会让
+# 本轮走 finally 把出口拆掉重来——真机日志实测就是每 7.06 秒一轮的上下线。
+# 现在的约定：
+#   last_data_ts      —— distributor 每收到一帧真实 RTCM 就刷新（唯一写点）
+#   first_data_event  —— 本轮首帧到达，lifecycle 用它做"起出口前"的门闸
+#   source_state      —— 给前端看的门闸状态：unknown / waiting / ok / stalled
+last_data_ts = 0.0
+first_data_event = threading.Event()
+source_state = 'unknown'
+
 # ==================== RTCM 缓冲与解析结果 ====================
 rtcm_buffer = bytearray()
 buffer_lock = threading.Lock()

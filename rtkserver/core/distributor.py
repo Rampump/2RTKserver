@@ -11,6 +11,7 @@
 数据源（串口 / 中继）只调这一个函数，不再关心有哪几个出口、谁先谁后。
 """
 import logging
+import time
 
 from . import state
 
@@ -23,10 +24,29 @@ def _ensure_registered():
     register_all()
 
 
+def _mark_source_data(data: bytes):
+    """门闸打点：只认真正带 RTCM 帧头（0xD3）的数据。
+
+    为什么不认"任意字节"：串口噪声、中继的 NTRIP 心跳、模块上电时吐的 ASCII
+    日志都会先于 RTCM 到达，把它们当成"有数据"会让出口在真的没有差分数据时
+    就抢先起连，问题原样复现。0xD3 是 RTCM3 的固定前导，与 detect_serial()
+    的判据一致。
+    """
+    if b'\xd3' not in data:
+        return
+    state.last_data_ts = time.time()
+    if state.source_state != 'ok':
+        state.source_state = 'ok'
+    if not state.first_data_event.is_set():
+        state.first_data_event.set()
+
+
 def distribute(data: bytes):
     """把一路 RTCM 数据扇出给所有「已启用」的出口 + 解析线程。"""
     if not data:
         return
+
+    _mark_source_data(data)
 
     _ensure_registered()
 

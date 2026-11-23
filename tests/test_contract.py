@@ -8141,5 +8141,124 @@ class TestPatchAuditFixes(unittest.TestCase):
         self.assertIn('主簇中位数', zh)
 
 
+# ==================== 数据源门闸（三个出口共用） ====================
+class TestSourceGate(unittest.TestCase):
+    """锁死「没数据就不许开出口」这条契约。
+
+    真机现场：模块没插 → 出口照旧先起（本地 Caster 监听 2102 + 云端 SOURCE
+    认证成功）→ 数据源探测失败 → finally 拆掉出口 → 主循环重来，日志实测
+    7.06 秒一轮。云端看到的是"每 7 秒上线又下线、一个字节不发"，只能反复踢。
+    这些断言防的就是启动顺序被改回去。
+    """
+
+    def _read(self, *parts):
+        path = os.path.join(REPO_ROOT, *parts)
+        with open(path, 'r', encoding='utf-8') as handle:
+            return handle.read()
+
+    def test_gate_runs_before_any_outlet(self):
+        """门闸必须早于三个出口的启动调用。"""
+        source = self._read('rtkserver', 'core', 'lifecycle.py')
+        body = source[source.index('def _run_once_body('):]
+        gate_at = body.index('_wait_first_source_data(')
+        for starter in ('start_local_caster(', 'start_serial_bridge(', 'start_caster_uploader('):
+            self.assertGreater(body.index(starter), gate_at,
+                               f'{starter} 必须在门闸之后，否则又会出现"无数据也认证"')
+
+    def test_gate_failure_returns_before_outlets(self):
+        """等不到首帧时本轮必须直接 return，一个出口都不许起。"""
+        source = self._read('rtkserver', 'core', 'lifecycle.py')
+        body = source[source.index('def _run_once_body('):]
+        start = body.index('if not _wait_first_source_data(')
+        seg = body[start:body.index('start_local_caster(', start)]
+        self.assertIn('return', seg, '门闸失败分支必须 return，不能继续往下开出口')
+        self.assertIn('_mark_source_waiting(', seg, '门闸失败要落前端提示')
+
+    def test_first_frame_is_marked_only_by_rtcm(self):
+        """门闸打点只认 RTCM 前导 0xD3，不能把串口噪声/心跳当成"有数据"。"""
+        source = self._read('rtkserver', 'core', 'distributor.py')
+        self.assertIn("b'\\xd3'", source)
+        self.assertIn('state.last_data_ts = time.time()', source)
+        self.assertIn('state.first_data_event.set()', source)
+
+    def test_gate_wait_yields_to_restart_signal(self):
+        """等首帧期间收到重启/退出信号必须立刻让位，不能干等满 10 秒。"""
+        source = self._read('rtkserver', 'core', 'lifecycle.py')
+        fn = source[source.index('def _wait_first_source_data('):]
+        fn = fn[:fn.index('\ndef ')]
+        self.assertIn('raise ThreadExitRequested()', fn)
+        self.assertIn('state.restart_event.is_set()', fn)
+        self.assertIn('state.shutdown_event.is_set()', fn)
+
+
+class TestSourceGateRuntime(unittest.TestCase):
+    """运行期熔断：数据停了要自己退出，而不是等云端踢完再重连。"""
+
+    def setUp(self):
+        from rtkserver.core import state
+        self.state = state
+        self._old_ts = state.last_data_ts
+        self._old_state = state.source_state
+
+    def tearDown(self):
+        self.state.last_data_ts = self._old_ts
+        self.state.source_state = self._old_state
+
+    def _uploader(self):
+        from rtkserver.outlets.caster_uploader import CasterUploader
+        return CasterUploader({'caster_host': 'h', 'caster_port': '2101',
+                               'caster_mountpoint': 'm', 'caster_password': 'p'})
+
+    def test_waits_when_never_had_data(self):
+        """从没收到过数据：不许去认证，状态必须是 waiting_source。"""
+        up = self._uploader()
+        self.state.last_data_ts = 0.0
+        self.assertTrue(up._pause_if_no_source())
+        self.assertEqual(up.status()['state'], 'waiting_source')
+
+    def test_goes_ahead_when_data_is_fresh(self):
+        up = self._uploader()
+        self.state.last_data_ts = time_module.time()
+        self.assertFalse(up._pause_if_no_source())
+
+    def test_backs_off_when_data_stalled(self):
+        """数据停了超过阈值：主动断开并落到 waiting_source。"""
+        from rtkserver.core.constants import SOURCE_STALL_TIMEOUT
+
+        up = self._uploader()
+        self.state.last_data_ts = time_module.time() - (SOURCE_STALL_TIMEOUT + 5)
+        self.assertTrue(up._pause_if_no_source())
+        self.assertEqual(up.status()['state'], 'waiting_source')
+
+    def test_frontend_gets_the_reason(self):
+        """状态页要能说清"为什么没数据"，三个入口都要有对应文案。"""
+        index = TestSourceGate._read(self, 'templates', 'index.html')
+        self.assertIn('id="source-hint"', index)
+
+        js = TestSourceGate._read(self, 'static', 'script.js')
+        self.assertIn('rs.source_waiting', js)
+        self.assertIn('rs.source_stalled', js)
+
+        i18n = TestSourceGate._read(self, 'static', 'i18n.js')
+        self.assertIn("'rs.source_waiting'", i18n)
+        self.assertIn("'rs.source_stalled'", i18n)
+        self.assertIn("'mode.waiting_source'", i18n)
+
+    def test_gate_state_follows_data_age(self):
+        """refresh_source_gate 由 last_data_ts 派生，不另存一份状态。"""
+        from rtkserver.core.constants import SOURCE_STALL_TIMEOUT
+        from rtkserver.core.status import refresh_source_gate
+
+        self.state.last_data_ts = time_module.time()
+        self.assertEqual(refresh_source_gate(), 'ok')
+
+        self.state.last_data_ts = time_module.time() - (SOURCE_STALL_TIMEOUT + 1)
+        self.assertEqual(refresh_source_gate(), 'stalled')
+
+        self.state.source_state = 'waiting'
+        self.state.last_data_ts = 0.0
+        self.assertEqual(refresh_source_gate(), 'waiting')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -108,12 +108,51 @@ def _web_port() -> int:
     return WEB_PORT
 
 
+def refresh_source_gate():
+    """把「数据源有没有数据」算成前端能直接用的两个字段。
+
+    source_state 只有四种：
+      unknown  —— 还没开始（未配置 / 刚启动）
+      waiting  —— 本轮一帧 RTCM 都没收到（门闸拦住，三个出口都没开）
+      ok       —— 最近 SOURCE_STALL_TIMEOUT 秒内有数据
+      stalled  —— 有数据过，但现在断了（模块被拔 / 中继上游停流）
+    判定只依赖 state.last_data_ts（distributor 唯一写点），不另存一份状态，
+    避免"上传端以为有数据、状态页以为没有"这种两套事实。
+    """
+    import time as _time
+
+    from ..core.constants import SOURCE_STALL_TIMEOUT
+
+    ts = state.last_data_ts
+    if not ts:
+        st = 'waiting' if state.source_state == 'waiting' else 'unknown'
+        idle = 0
+    else:
+        idle = int(max(0.0, _time.time() - ts))
+        st = 'stalled' if idle > SOURCE_STALL_TIMEOUT else 'ok'
+    state.run_status['source_state'] = st
+    state.run_status['source_idle_seconds'] = idle
+    # 提示文案由后端给出中文兜底；英文界面按 source_state 查 i18n
+    if st == 'stalled':
+        state.run_status['source_hint'] = (
+            f"数据源已 {idle} 秒没有 RTCM 数据（模块掉线或上游无流），"
+            "云端上传已临时断开，数据恢复后自动重连")
+    elif st == 'ok':
+        state.run_status['source_hint'] = ''
+    # waiting 的文案由 lifecycle 的 _mark_source_waiting() 写入，这里不覆盖
+    return st
+
+
 def push_run_status():
     """推送运行状态，并顺带带上各出口的实时快照。
 
     客户端数会随时变化，所以不能只在启动时算一次；放在这里每 2 秒更新，
     首页那几张卡片就能跟着动。
     """
+    try:
+        refresh_source_gate()
+    except Exception:
+        pass
     try:
         state.run_status["local_caster"] = local_caster.local_caster_snapshot()
     except Exception:
@@ -135,6 +174,10 @@ def push_run_status():
 def initial_run_status() -> dict:
     """WS 首帧专用：给一份完整快照（含 mode=none 时的 IP 展示）。"""
     refresh_network_info()
+    try:
+        refresh_source_gate()
+    except Exception:
+        pass
     try:
         state.run_status["local_caster"] = local_caster.local_caster_snapshot()
     except Exception:

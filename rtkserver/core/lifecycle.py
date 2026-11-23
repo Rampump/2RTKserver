@@ -4,6 +4,9 @@
 边界约定（改配置只重启数据面，Web 与全局资源不动）：
   - 出口是否启动，只看各自的 _enabled 独立开关（与本函数里的 mode 无关）；
   - 数据源是否启动，只看 mode；
+  - **三个出口都受「数据源门闸」约束**：拿不到首帧 RTCM 就一个都不开
+    （否则会出现"云端已认证、本地已 listen，但一个字节都发不出去"，
+    云端反复踢源站——真机日志实测 7 秒一轮）；
   - 任何模块启动失败都只记日志，不阻断其他模块，也不中断整体运行。
 
 退出语义（本次拆分新增，原代码缺失）：
@@ -34,8 +37,8 @@ from ..sources.serial_source import detect_serial, upload_via_serial
 from ..validation import validate_config
 from . import state
 from .config import get_config, init_db, migrate_admin_password
-from .constants import ART_LOGO, WEB_HOST, WEB_PORT
-from .status import describe_targets
+from .constants import (ART_LOGO, SOURCE_FIRST_DATA_TIMEOUT, WEB_HOST, WEB_PORT)
+from .status import describe_targets, push_run_status
 
 
 def install_signal_handlers():
@@ -125,7 +128,7 @@ def _sync_mdns_ntrip_port():
 
 
 def run_once():
-    """一轮完整运行：先启动数据出口，再启动数据源；停机严格逆序。"""
+    """一轮完整运行：先起数据源并确认有数据，再开出口；停机严格逆序。"""
     # 上一轮的工作线程若仍未退出（例如卡在阻塞的 recv 里），
     # 绝不能再起一个新线程：否则两个线程会同时向同一个挂载点推流、抢同一个串口。
     if state.worker_thread is not None and state.worker_thread.is_alive():
@@ -141,6 +144,40 @@ def run_once():
         _run_once_body()
     finally:
         state.run_once_active = False
+
+
+def _wait_first_source_data(timeout: float) -> bool:
+    """等本轮第一帧 RTCM。
+
+    返回 False 只表示「等超时」；被重启/退出信号打断时抛 ThreadExitRequested，
+    交给调用方的统一出口去停机——两种情况的处理完全不同（超时要落一条
+    "数据源无数据"的前端提示，打断则是正常让位）。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if state.first_data_event.wait(0.2):
+            return True
+        # 标定方要独占串口时会置 restart_event：这轮必须马上让位，不能等满 10 秒
+        if state.shutdown_event.is_set() or state.restart_event.is_set():
+            raise ThreadExitRequested()
+    return state.first_data_event.is_set()
+
+
+def _mark_source_waiting(timeout: float):
+    """门闸没过：把「为什么没数据」写进 run_status，前端据此显示提示条。"""
+    state.source_state = 'waiting'
+    state.last_data_ts = 0.0
+    state.run_status['source_state'] = 'waiting'
+    state.run_status['source_idle_seconds'] = 0
+    state.run_status['source_hint'] = (
+        f"数据源 {timeout:.0f} 秒内没有 RTCM 数据（未检测到模块或上游无流），"
+        "已暂停本地 Caster / 数传 / 云端上传")
+    state.run_status['mode'] = '等待数据源'
+    state.run_status['mode_key'] = 'waiting_source'
+    try:
+        push_run_status()
+    except Exception as e:
+        logging.debug(f"推送等待数据源状态失败（忽略）：{e}")
 
 
 def _run_once_body():
@@ -172,7 +209,82 @@ def _run_once_body():
 
         mode = cfg['mode']
 
-        # ==================== 阶段 2：启动数据出口（先起，等着接数据）====================
+        # 门闸状态按轮重置：上一轮的数据不能当成这一轮的"有数据"
+        state.first_data_event.clear()
+        state.last_data_ts = 0.0
+        state.source_state = 'unknown'
+
+        # ==================== 阶段 2：启动数据源（先起，出口等它）====================
+        # 顺序为什么反过来：出口是「对外可见」的——本地 Caster 一开始 listen，局域网
+        # 流动站就会连进来；上传出口一启动就去云端认证，云端会把它当成一个在线源站。
+        # 数据源没有数据时这两件事都是错的，而且数据源失败会让本轮 return、finally
+        # 再把出口拆掉重来——真机日志实测就是每 7.06 秒一轮 SOURCE 上线/下线，云端
+        # 只能反复踢。所以：先确认真的有 RTCM，再开任何一个出口。
+        if mode == 'serial':
+            logging.info("进入串口模式")
+            port, baud = detect_serial(cfg)
+            if not (port and baud):
+                logging.warning("未检测到有效串口，5秒后重试")
+                interruptible_sleep(5, state.shutdown_event)
+                return
+            cfg['serial_port'], cfg['baud_rate'] = port, baud
+            try:
+                ser = serial.Serial(port=port, baudrate=baud, timeout=1)
+            except Exception as e:
+                logging.error(f"打开串口失败: {e}")
+                interruptible_sleep(5, state.shutdown_event)
+                return
+
+            source_thread = threading.Thread(
+                target=upload_via_serial,
+                args=(ser, cfg, state.thread_exit_event),
+                name='source-serial',
+                daemon=True
+            )
+            source_thread.start()
+            state.worker_thread = source_thread
+
+        elif mode == 'relay':
+            logging.info("进入中继模式")
+            try:
+                relay = open_relay(cfg)
+            except Exception as e:
+                logging.error(f"打开中继连接失败: {e}")
+                interruptible_sleep(5, state.shutdown_event)
+                return
+
+            source_thread = threading.Thread(
+                target=forward_relay,
+                args=(relay, cfg, state.thread_exit_event),
+                name='source-relay',
+                daemon=True
+            )
+            source_thread.start()
+            state.worker_thread = source_thread
+
+        else:
+            logging.error(f"未知模式: {mode}")
+            time.sleep(5)
+            return
+
+        # ==================== 阶段 3：门闸 —— 必须拿到第一帧 RTCM ====================
+        # 串口/中继的线程已经跑起来了，但出口一个都还没开。等不到数据就整轮放弃，
+        # 云端连一次认证都不会收到（这是本次修复的核心）。
+        if not _wait_first_source_data(SOURCE_FIRST_DATA_TIMEOUT):
+            _mark_source_waiting(SOURCE_FIRST_DATA_TIMEOUT)
+            logging.warning(
+                f"数据源 {SOURCE_FIRST_DATA_TIMEOUT:.0f} 秒内没有 RTCM 数据，本轮不启用任何出口"
+                f"（本地 Caster / 数传 / 云端上传），5 秒后重试")
+            interruptible_sleep(5, state.shutdown_event)
+            return
+
+        # ==================== 阶段 4：启动数据出口（有数据之后才开）====================
+        # 门闸已过：立刻清掉上一次等待留下的提示，别让前端挂着旧文案
+        state.source_state = 'ok'
+        state.run_status['source_state'] = 'ok'
+        state.run_status['source_idle_seconds'] = 0
+        state.run_status['source_hint'] = ''
+
         # 顺序：本地 Caster（开始 listen）→ 数传（开串口待命）→ 上传（建连 + 握手）
         # 三者各自独立线程；任何一个启动失败只记日志，绝不影响另外两个，也不影响数据源。
 
@@ -198,55 +310,7 @@ def _run_once_body():
 
         logging.info(f"数据出口就绪：{describe_targets(cfg)}")
 
-        # ==================== 阶段 3：启动数据源（后起，一起来就有数据）====================
-        if mode == 'serial':
-            logging.info("进入串口模式")
-            port, baud = detect_serial(cfg)
-            if not (port and baud):
-                logging.warning("未检测到有效串口，5秒后重试")
-                time.sleep(5)
-                return
-            cfg['serial_port'], cfg['baud_rate'] = port, baud
-            try:
-                ser = serial.Serial(port=port, baudrate=baud, timeout=1)
-            except Exception as e:
-                logging.error(f"打开串口失败: {e}")
-                time.sleep(5)
-                return
-
-            source_thread = threading.Thread(
-                target=upload_via_serial,
-                args=(ser, cfg, state.thread_exit_event),
-                name='source-serial',
-                daemon=True
-            )
-            source_thread.start()
-            state.worker_thread = source_thread
-
-        elif mode == 'relay':
-            logging.info("进入中继模式")
-            try:
-                relay = open_relay(cfg)
-            except Exception as e:
-                logging.error(f"打开中继连接失败: {e}")
-                time.sleep(5)
-                return
-
-            source_thread = threading.Thread(
-                target=forward_relay,
-                args=(relay, cfg, state.thread_exit_event),
-                name='source-relay',
-                daemon=True
-            )
-            source_thread.start()
-            state.worker_thread = source_thread
-
-        else:
-            logging.error(f"未知模式: {mode}")
-            time.sleep(5)
-            return
-
-        # ==================== 阶段 4：等待重启 / 退出信号 ====================
+        # ==================== 阶段 5：等待重启 / 退出信号 ====================
         while not state.restart_event.is_set() and not state.shutdown_event.is_set():
             time.sleep(1)
 

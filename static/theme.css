@@ -855,6 +855,7 @@ select.form-input {
 
 .field-hint.is-info { color: var(--accent); }
 .field-hint.is-ok { color: var(--success); }
+.field-hint.is-warning { color: var(--warning); }
 .field-hint.is-error { color: var(--danger); }
 
 /* ---------- 就地候选（扫描串口 / 读取挂载点） ----------

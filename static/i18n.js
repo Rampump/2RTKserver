@@ -85,6 +85,8 @@
       'rs.mdns.hint': '固定地址打不开、用 IP 却正常？多半是本机代理 / VPN 软件拦了 .local（表现为 502），把 *.local 加入直连即可。',
       'rs.android_hint': '安卓手机 / 平板不支持 .local 名字解析，请用上面的「本机 IP」访问。',
       'rs.waiting': '等待数据…',
+      'rs.source_waiting': '数据源暂无 RTCM 数据（未检测到模块或上游无流），本地 Caster / 数传 / 云端上传均已暂停。',
+      'rs.source_stalled': '数据源已 {s} 秒没有 RTCM 数据（模块掉线或上游无流），云端上传已临时断开，数据恢复后自动重连。',
       'rs.target.none': '仅本地监控（未启用任何出口）',
       'rs.target.caster': '上传 {host}:{port}/{mount}',
       'rs.target.local': '本地 Caster {host}:{port}',
@@ -167,6 +169,7 @@
       'mode.none': '未配置',
       'mode.auto': '自动检测',
       'mode.unconfigured': '等待配置',
+      'mode.waiting_source': '等待数据源',
 
       'up.unconfigured': '未启用上传出口',
       'up.unconfigured_hint': '未勾选「上传到云端 Caster」，本机不会向任何上游服务器发送数据。需要上传请在配置页勾选该出口。',
@@ -808,6 +811,8 @@
       'rs.mdns.hint': 'Fixed address fails but the IP works? A local proxy / VPN is intercepting .local (usually a 502) — add *.local to the proxy bypass list.',
       'rs.android_hint': 'Android phones/tablets cannot resolve .local names — use the Local IP above.',
       'rs.waiting': 'Waiting for data…',
+      'rs.source_waiting': 'No RTCM data from the source (module not detected or upstream idle). Local caster, radio and cloud upload are all paused.',
+      'rs.source_stalled': 'No RTCM data for {s}s (module unplugged or upstream idle). Cloud upload was dropped temporarily and will reconnect once data returns.',
       'rs.target.none': 'Local monitoring only (no output enabled)',
       'rs.target.caster': 'Upload {host}:{port}/{mount}',
       'rs.target.local': 'Local caster {host}:{port}',
@@ -890,6 +895,7 @@
       'mode.none': 'Not Configured',
       'mode.auto': 'Auto-detect',
       'mode.unconfigured': 'Waiting for configuration',
+      'mode.waiting_source': 'Waiting for source data',
 
       'up.unconfigured': 'Upload output disabled',
       'up.unconfigured_hint': 'The "Upload to upstream Caster" output is not ticked, so nothing is sent upstream. Enable it on the settings page if you need uploading.',

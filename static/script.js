@@ -18,6 +18,7 @@ const runModeEl = document.getElementById("run-mode");
 const dataSourceEl = document.getElementById("data-source");
 const targetCasterEl = document.getElementById("target-caster");
 const dataSentEl = document.getElementById("data-sent");
+const sourceHintEl = document.getElementById("source-hint");
 const runTimeEl = document.getElementById("run-time");
 // 首次使用（还没配数据源）时首页唯一能指导用户的就是这两项：
 // 电脑/苹果用固定地址，安卓只能用本机 IP。
@@ -994,6 +995,22 @@ function updateRunStatus(status) {
   }
   if (status.data_sent) dataSentEl.textContent = status.data_sent;
   if (status.run_time) runTimeEl.textContent = status.run_time;
+
+  // 数据源门闸提示：没数据时三个出口都是停的，这里必须说清"为什么没数据"，
+  // 否则用户会以为是程序卡死或配置没生效。
+  if (sourceHintEl) {
+    const st = status.source_state;
+    let hint = '';
+    if (st === 'waiting') {
+      hint = I18N.t('rs.source_waiting');
+    } else if (st === 'stalled') {
+      hint = I18N.t('rs.source_stalled', { s: status.source_idle_seconds || 0 });
+    } else if (status.source_hint) {
+      hint = status.source_hint;
+    }
+    sourceHintEl.textContent = hint;
+    sourceHintEl.hidden = !hint;
+  }
   if (status.local_caster) updateLocalCaster(status.local_caster);
   if (status.upload) updateUploadStatus(status.upload);
   if (status.radio) updateRadioStatus(status.radio);

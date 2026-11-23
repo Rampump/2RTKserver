@@ -40,6 +40,15 @@ CASTER_WRITE_TIMEOUT = 15           # 上传端写超时，用来尽早发现死
 RELAY_READ_TIMEOUT = 20             # 中继端读超时，超时视为"本轮无数据"
 RELAY_IDLE_RECONNECT = 120          # 中继连续无数据多久后重连
 
+# ==================== 数据源门闸（三个出口共用） ====================
+# 首帧门闸：拿不到一帧 RTCM 就绝不去连云端 / 不开本地监听 / 不占数传口。
+# 10 秒的依据：RTCM 常见 1 Hz，慢流也 ≥0.2 Hz；比 detect_serial() 的单档 2 秒
+# 宽松，但比云端常见的 30~60 秒空闲踢线短得多。
+SOURCE_FIRST_DATA_TIMEOUT = 10.0
+# 运行期断流：模块被拔 / 中继上游停流后，超过这个时间就主动断开上传，
+# 避免"被云端踢 + 立刻重连"的抖动。取值必须明显小于云端空闲阈值。
+SOURCE_STALL_TIMEOUT = 15.0
+
 # 设为 1 时，未登录的访问者也能看到基准站精确坐标（旧行为）
 PUBLIC_STATION_COORDS = os.environ.get('PUBLIC_STATION_COORDS', '0') == '1'
 
@@ -79,6 +88,7 @@ CASTER_RECONNECT_INTERVAL = 5.0    # 断线重连基础间隔（秒）
 
 UPLOAD_STATE_TEXT = {
     "idle": "未配置",
+    "waiting_source": "等待数据源",
     "connecting": "连接中…",
     "authed": "已认证 · 正在推送",
     "retrying": "连接中断 · 重试中",
