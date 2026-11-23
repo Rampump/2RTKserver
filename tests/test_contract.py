@@ -8868,5 +8868,73 @@ class TestReconnectBackoff(unittest.TestCase):
             self.assertIn(key, i18n, f'{key} 缺中文或英文条目')
 
 
+class TestRtcmStats(unittest.TestCase):
+    """RTCM 统计不能跨源残留：换源后页面要立刻反映新源。
+
+    现场：从一路源（例如 MSM7 的 1077/1087）切到另一路（MSM4 的 1074/1084）后，
+    页面还挂着 1077(1)/1087(1)。两个原因叠加：
+      1. `get_all_frequencies` 对窗口为空的类型用 `max(1, 0)` 兜成 1 Hz；
+      2. 频率表的键只增不删，换了源也留着。
+    再加上换源那一刻没有任何地方重置统计，旧源就会一直"在线"。
+    """
+
+    def setUp(self):
+        from rtkserver.core import state
+        from rtkserver.sources import rtcm_parser
+        self.state = state
+        self.parser = rtcm_parser
+        self._seen = set(state.msg_types_seen)
+        self._recent = dict(state.msg_types_recent)
+        self._station = dict(state.station_info)
+
+    def tearDown(self):
+        self.state.msg_types_seen.clear()
+        self.state.msg_types_seen.update(self._seen)
+        self.state.msg_types_recent.clear()
+        self.state.msg_types_recent.update(self._recent)
+        self.state.station_info.clear()
+        self.state.station_info.update(self._station)
+
+    def _read(self, *parts):
+        with open(os.path.join(REPO_ROOT, *parts), 'r', encoding='utf-8') as handle:
+            return handle.read()
+
+    def test_expired_types_drop_out(self):
+        tracker = self.parser.FrequencyTracker(window_size=30)
+        tracker.msg_timestamps[1077].append(time_module.time() - 120)
+        tracker.msg_timestamps[1074].append(time_module.time())
+        freq = tracker.get_all_frequencies()
+        self.assertNotIn(1077, freq, '窗口内没有消息的类型不能以 (1) 留在列表里')
+        self.assertIn(1074, freq)
+        self.assertNotIn(1077, tracker.msg_timestamps, '键也要删掉，否则永远残留')
+
+    def test_reset_stats_clears_types_freq_and_station(self):
+        self.parser.frequency_tracker.add_message(1005)
+        self.state.msg_types_seen.add(1005)
+        self.state.msg_types_recent[1005] = time_module.time()
+        self.state.station_info['station_id'] = 'OLD'
+        self.parser.reset_stats()
+        self.assertEqual({}, self.parser.frequency_tracker.get_all_frequencies())
+        self.assertEqual(set(), set(self.state.msg_types_seen))
+        self.assertEqual({}, dict(self.state.station_info))
+
+    def test_every_source_switch_resets_stats(self):
+        serial = self._read('rtkserver', 'sources', 'serial_source.py')
+        seg = serial[serial.index('串口重连成功'):]
+        self.assertIn('reset_stats()', seg[:600], '串口换模块/换口重连后必须清统计')
+        relay = self._read('rtkserver', 'sources', 'relay_source.py')
+        body = relay[relay.index('def open_relay'):relay.index('def forward_relay')]
+        self.assertIn('reset_stats()', body,
+                      '中继每次建连都要清统计（EOF/空闲/异常三处共用 open_relay）')
+        lifecycle = self._read('rtkserver', 'core', 'lifecycle.py')
+        self.assertIn('reset_stats()', lifecycle, '换源重启数据面时也要清')
+
+    def test_frontend_clears_stale_rtcm_types(self):
+        js = self._read('static', 'script.js')
+        self.assertIn("rtcmTypeListEl.textContent = frequencyList || '--'", js)
+        self.assertIn('lastRtcmTypeAt', js)
+        self.assertIn('15000', js, '断流兜底阈值要与后端 SOURCE_STALL_TIMEOUT 对齐')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

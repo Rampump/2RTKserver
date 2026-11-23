@@ -17,6 +17,7 @@ from ..core.status import describe_target_parts, describe_targets, push_run_stat
 from ..utils.common import (Backoff, ThreadExitRequested, clear_screen, format_bytes,
                             format_duration, interruptible_sleep)
 from .ntrip import connect_to_host, handshake_ntrip_client
+from .rtcm_parser import reset_stats
 
 
 def _note_source_retry(kind: str, backoff: Backoff, detail: str = '', delay: float = 0.0):
@@ -46,6 +47,10 @@ def open_relay(cfg):
         raise RuntimeError('中继认证失败')
     # 读超时交给 forward_relay 解释为"本轮没有数据"，而不是致命错误
     sock.settimeout(RELAY_READ_TIMEOUT)
+    # 每次建连都是一条新会话：上一路的消息类型、频率、基站坐标必须作废。
+    # 不清的话换了上游（EOF 重连、同名源被顶替）页面还挂着旧源的 RTCM 统计，
+    # 用户看到的就是"换了源还是以前的数据"。三处重连都走这里，无需逐个加。
+    reset_stats()
     return sock
 
 

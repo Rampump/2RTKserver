@@ -32,7 +32,7 @@ from ..outlets.caster_uploader import (mark_upload_state, start_caster_uploader,
 from ..outlets.local_caster import start_local_caster, stop_local_caster
 from ..outlets.radio_bridge import start_serial_bridge, stop_serial_bridge
 from ..sources.relay_source import forward_relay, open_relay
-from ..sources.rtcm_parser import process_rtcm_buffer
+from ..sources.rtcm_parser import process_rtcm_buffer, reset_stats
 from ..sources.serial_source import detect_serial, upload_via_serial
 from ..validation import last_error, validate_config
 from . import state
@@ -219,9 +219,9 @@ def _run_once_body():
         return
 
     # 退出信号已在 run_once() 入口（确认上一轮线程已死后）清过，这里不再清。
-    # 换数据源后，上一轮的消息类型不能带进来，否则源列表会描述已不存在的数据
-    state.msg_types_seen.clear()
-    state.msg_types_recent.clear()
+    # 换数据源后，上一轮的消息类型不能带进来，否则源列表会描述已不存在的数据。
+    # 一并清频率表与基站信息：频率表原先从不重置，old 类型会以 (1) 一直挂着。
+    reset_stats()
 
     ser = None
     relay = None

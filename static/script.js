@@ -12,6 +12,9 @@ const lonEl = document.getElementById("lon");
 const latEl = document.getElementById("lat");
 const heightEl = document.getElementById("height");
 const rtcmTypeListEl = document.getElementById("rtcm-type-list");
+// 最后一次收到 RTCM 消息统计的时刻。后端断流/换源后就不再推这个字段，
+// 页面会一直停在最后一帧，必须靠时间戳自己判断"现在其实没有数据"。
+let lastRtcmTypeAt = 0;
 const loadingIndicator = document.getElementById("loading-indicator");
 const observedSystemsEl = document.getElementById("observed-systems")
 const runModeEl = document.getElementById("run-mode");
@@ -801,11 +804,19 @@ function initWebSocket() {
           .join(', ');
         // 用 textContent：MSM 每秒多条，重建 innerHTML 会反复触发重排；
         // 同时也省掉一个不必要的 HTML 解析入口
-        rtcmTypeListEl.textContent = frequencyList;
+        // 空表 = 后端已把过期类型清掉（换源 / 断流），显示 -- 而不是留一片空白
+        rtcmTypeListEl.textContent = frequencyList || '--';
+        lastRtcmTypeAt = Date.now();
       }
 
       // 更新运行状态
       if (data.run_status) {
+        // 断流 / 拔模块后后端不再推 RTCM 统计，这里按时间戳兜底清空。
+        // 阈值与后端 SOURCE_STALL_TIMEOUT（15 秒）对齐：慢流 0.2 Hz 也有 3 帧余量，
+        // 不会因为一次丢帧就把正常数据判成"没有"。
+        if (rtcmTypeListEl && Date.now() - lastRtcmTypeAt > 15000) {
+          rtcmTypeListEl.textContent = '--';
+        }
         updateRunStatus(data.run_status);
       }
 

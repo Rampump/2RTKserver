@@ -77,13 +77,28 @@ class FrequencyTracker:
         self._prune_old_timestamps(msg_type, current_time)
 
     def get_all_frequencies(self):
+        """只返回**当前还在推**的消息类型及其频率（Hz）。
+
+        原来的实现有两个坑，合在一起就是"换源后页面还挂着上一路的类型"：
+          1. `max(1, freq)`：窗口内一条都没有时算出 0，被兜成 1，于是旧类型
+             永远显示成 `1077(1)`，看起来像还在推；
+          2. 字典键只增不删：`_prune_old_timestamps` 只清队列，不清键，
+             即使消息早停了，条目依旧存在。
+        现在窗口内没有时间戳就直接把键删掉，列表只反映最近 window_size 秒。
+        """
         current_time = time.time()
         frequencies = {}
-        for msg_type, timestamps in self.msg_timestamps.items():
+        for msg_type in list(self.msg_timestamps):
             self._prune_old_timestamps(msg_type, current_time)
-            freq = len(timestamps) // self.window_size
-            frequencies[msg_type] = max(1, freq)
+            timestamps = self.msg_timestamps[msg_type]
+            if not timestamps:
+                del self.msg_timestamps[msg_type]
+                continue
+            frequencies[msg_type] = max(1, len(timestamps) // self.window_size)
         return frequencies
+
+    def reset(self):
+        self.msg_timestamps.clear()
 
     def _prune_old_timestamps(self, msg_type, current_time):
         cutoff = current_time - self.window_size
@@ -93,6 +108,25 @@ class FrequencyTracker:
 
 
 frequency_tracker = FrequencyTracker(window_size=30)
+
+
+def reset_stats():
+    """清空「这个源正在推什么」的全部统计：消息类型、频率、基站信息。
+
+    什么时候必须清：换源的那一刻（串口拔插换模块、中继换上游、重启数据面）。
+    这些字段是"当前来源"的描述，不清就会把上一路的类型号、基站 ID、坐标
+    继续显示给用户——前端看到的就是"换了源还是老的 RTCM 数据"。
+    只在建连/换源时调用，数据流动期间一次都不碰。
+    """
+    had = bool(frequency_tracker.msg_timestamps or state.msg_types_seen or state.station_info)
+    frequency_tracker.reset()
+    state.msg_types_seen.clear()
+    state.msg_types_recent.clear()
+    state.station_info.clear()
+    if had:
+        # 只在"确实清掉了东西"时留痕：换源时现场能看到这一行，
+        # 启动时（本来就没有数据）不刷日志。
+        logging.info("RTCM 统计已重置（换源/重连）：消息类型、频率、基站信息")
 
 _msm_last_sent = {}                 # gnss -> 上次广播时间，仅 process_rtcm_buffer 线程写
 

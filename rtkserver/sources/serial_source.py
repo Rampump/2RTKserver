@@ -19,7 +19,7 @@ from ..core.distributor import distribute
 from ..core.status import describe_target_parts, describe_targets, push_run_status
 from ..utils.common import (ThreadExitRequested, clear_screen, format_bytes,
                             format_duration, interruptible_sleep)
-from .rtcm_parser import extract_rtcm_frames
+from .rtcm_parser import extract_rtcm_frames, reset_stats
 
 
 def _looks_like_nmea(data: bytes) -> bool:
@@ -213,6 +213,9 @@ def upload_via_serial(ser, cfg, thread_exit_event):
                         cfg['serial_port'], cfg['baud_rate'] = port, baud
                         last_data_ts = time.time()
                         logging.info(f"串口重连成功: {port} @ {baud}")
+                        # 新连接 = 新来源：上一路的类型号、频率、基站坐标全部作废。
+                        # 不清的话，换了模块（或换了口）页面还挂着旧源的 RTCM 统计。
+                        reset_stats()
                     except Exception as e:
                         logging.error(f"串口重建失败: {e}")
                         if interruptible_sleep(5, thread_exit_event):
