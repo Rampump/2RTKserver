@@ -34,7 +34,7 @@ from ..outlets.radio_bridge import start_serial_bridge, stop_serial_bridge
 from ..sources.relay_source import forward_relay, open_relay
 from ..sources.rtcm_parser import process_rtcm_buffer
 from ..sources.serial_source import detect_serial, upload_via_serial
-from ..validation import validate_config
+from ..validation import last_error, validate_config
 from . import state
 from .config import get_config, init_db, migrate_admin_password
 from .constants import (ART_LOGO, SOURCE_FIRST_DATA_TIMEOUT, WEB_HOST, WEB_PORT)
@@ -137,6 +137,13 @@ def run_once():
         time.sleep(1)
         return
 
+    # 退出信号只在「确认上一轮线程已经死了」之后才清。
+    # 原先放在 _run_once_body 开头清，而 _run_once_body 可能在旧线程还活着时
+    # 就跑起来（守卫只拦 1 秒），于是老线程刚看到 set() 又被清掉，"自行退出"
+    # 变成永远退不出；更糟的是它还会往新一轮的 first_data_event 里写数据，
+    # 让门闸用旧线程的数据"假通过"。所以清信号这件事必须跟着守卫一起做。
+    state.thread_exit_event.clear()
+
     # 从这一行开始，本轮就算"数据面占用中"：`detect_serial()` 会在起线程之前
     # 打开串口探测，标定方必须能看到这个标志才不会在同一时刻抢同一个口。
     state.run_once_active = True
@@ -147,7 +154,12 @@ def run_once():
 
 
 def _wait_first_source_data(timeout: float) -> bool:
-    """等本轮第一帧 RTCM。
+    """等本轮第一帧**任意数据**（不再要求是 RTCM）。
+
+    为什么放宽：只出 NMEA 的模块（没配成输出 RTCM、或刚上电还在吐 ASCII 提示）
+    串口是活的，若门闸只认 RTCM 就会一直判"没数据"，本地 Caster / 数传也跟着
+    永远不开——现场看到的就是"插了模块但三路全停、像锁死"。
+    "能不能上传"由上传端自己按 last_rtcm_ts 判断，不需要在这里一并卡住。
 
     返回 False 只表示「等超时」；被重启/退出信号打断时抛 ThreadExitRequested，
     交给调用方的统一出口去停机——两种情况的处理完全不同（超时要落一条
@@ -163,15 +175,31 @@ def _wait_first_source_data(timeout: float) -> bool:
     return state.first_data_event.is_set()
 
 
-def _mark_source_waiting(timeout: float):
-    """门闸没过：把「为什么没数据」写进 run_status，前端据此显示提示条。"""
+def _mark_source_waiting(timeout: float, reason: str = 'no_data'):
+    """门闸没过：把「为什么没数据」写进 run_status，前端据此显示提示条。
+
+    reason 区分两种现场：
+      no_device —— 连串口都没找到（模块没插 / 驱动没起来），原先这条分支
+                   只写日志、不落状态，于是"没插模块"反而比"有口无数据"
+                   更沉默，用户什么都看不到。
+      no_data   —— 找到串口了，但 10 秒内一个字节都没读到。
+    """
     state.source_state = 'waiting'
     state.last_data_ts = 0.0
+    state.last_rtcm_ts = 0.0
     state.run_status['source_state'] = 'waiting'
     state.run_status['source_idle_seconds'] = 0
-    state.run_status['source_hint'] = (
-        f"数据源 {timeout:.0f} 秒内没有 RTCM 数据（未检测到模块或上游无流），"
-        "已暂停本地 Caster / 数传 / 云端上传")
+    if reason == 'no_device':
+        state.run_status['source_hint'] = (
+            "未检测到 RTK 模块（没有任何可用串口），本地 Caster / 数传 / 云端上传均已暂停")
+    elif reason == 'open_failed':
+        state.run_status['source_hint'] = (
+            "找到串口但打开失败（可能被其他程序占用或权限不足），"
+            "本地 Caster / 数传 / 云端上传均已暂停")
+    else:
+        state.run_status['source_hint'] = (
+            f"数据源 {timeout:.0f} 秒内没有收到任何数据（模块未输出或上游无流），"
+            "已暂停本地 Caster / 数传 / 云端上传")
     state.run_status['mode'] = '等待数据源'
     state.run_status['mode_key'] = 'waiting_source'
     try:
@@ -190,8 +218,7 @@ def _run_once_body():
         logging.info("标定租约已持有串口，本轮不启动数据面")
         return
 
-    # 退出信号只在新一轮开始时清除（原先是放在 finally 里，会把还没退出的老线程"复活"）
-    state.thread_exit_event.clear()
+    # 退出信号已在 run_once() 入口（确认上一轮线程已死后）清过，这里不再清。
     # 换数据源后，上一轮的消息类型不能带进来，否则源列表会描述已不存在的数据
     state.msg_types_seen.clear()
     state.msg_types_recent.clear()
@@ -212,6 +239,7 @@ def _run_once_body():
         # 门闸状态按轮重置：上一轮的数据不能当成这一轮的"有数据"
         state.first_data_event.clear()
         state.last_data_ts = 0.0
+        state.last_rtcm_ts = 0.0
         state.source_state = 'unknown'
 
         # ==================== 阶段 2：启动数据源（先起，出口等它）====================
@@ -225,6 +253,7 @@ def _run_once_body():
             port, baud = detect_serial(cfg)
             if not (port and baud):
                 logging.warning("未检测到有效串口，5秒后重试")
+                _mark_source_waiting(0, 'no_device')
                 interruptible_sleep(5, state.shutdown_event)
                 return
             cfg['serial_port'], cfg['baud_rate'] = port, baud
@@ -232,6 +261,7 @@ def _run_once_body():
                 ser = serial.Serial(port=port, baudrate=baud, timeout=1)
             except Exception as e:
                 logging.error(f"打开串口失败: {e}")
+                _mark_source_waiting(0, 'open_failed')
                 interruptible_sleep(5, state.shutdown_event)
                 return
 
@@ -250,6 +280,7 @@ def _run_once_body():
                 relay = open_relay(cfg)
             except Exception as e:
                 logging.error(f"打开中继连接失败: {e}")
+                _mark_source_waiting(0, 'open_failed')
                 interruptible_sleep(5, state.shutdown_event)
                 return
 
@@ -267,21 +298,31 @@ def _run_once_body():
             time.sleep(5)
             return
 
-        # ==================== 阶段 3：门闸 —— 必须拿到第一帧 RTCM ====================
+        # ==================== 阶段 3：门闸 —— 必须拿到第一帧**任意数据** ====================
         # 串口/中继的线程已经跑起来了，但出口一个都还没开。等不到数据就整轮放弃，
         # 云端连一次认证都不会收到（这是本次修复的核心）。
+        # 判据放宽到"任意字节"：只有 NMEA 的模块也算源活着，本地 Caster / 数传
+        # 可以开；能不能上传由上传端按 last_rtcm_ts 自己决定，不在这里一起卡死。
         if not _wait_first_source_data(SOURCE_FIRST_DATA_TIMEOUT):
+            # 先停源线程、再落"等待数据源"状态。否则它在这 5 秒退避里还在读
+            # 串口、继续打点，状态会被刷成"有数据"，而三个出口都是关的——
+            # 前端于是同时显示"数据源正常"和"三路全停"，比没有提示更误导。
+            state.thread_exit_event.set()
+            if source_thread is not None and source_thread.is_alive():
+                source_thread.join(3)
             _mark_source_waiting(SOURCE_FIRST_DATA_TIMEOUT)
             logging.warning(
-                f"数据源 {SOURCE_FIRST_DATA_TIMEOUT:.0f} 秒内没有 RTCM 数据，本轮不启用任何出口"
+                f"数据源 {SOURCE_FIRST_DATA_TIMEOUT:.0f} 秒内没有收到任何数据，本轮不启用任何出口"
                 f"（本地 Caster / 数传 / 云端上传），5 秒后重试")
             interruptible_sleep(5, state.shutdown_event)
             return
 
         # ==================== 阶段 4：启动数据出口（有数据之后才开）====================
-        # 门闸已过：立刻清掉上一次等待留下的提示，别让前端挂着旧文案
-        state.source_state = 'ok'
-        state.run_status['source_state'] = 'ok'
+        # 门闸已过：立刻清掉上一次等待留下的提示，别让前端挂着旧文案。
+        # 只有 NMEA、还没见到 RTCM 时状态是 alive_no_rtcm —— 本地两路照开，
+        # 云端由上传端自己等到 last_rtcm_ts 再认证。
+        state.source_state = 'ok' if state.last_rtcm_ts else 'alive_no_rtcm'
+        state.run_status['source_state'] = state.source_state
         state.run_status['source_idle_seconds'] = 0
         state.run_status['source_hint'] = ''
 
@@ -462,7 +503,15 @@ def main():
         if not validate_config(cfg):
             # 配置还没配好就安静等待：网页、登录、改密这些功能都照常可用，
             # 只是不往下启动任何数据模块。validate_config 内部已按 60 秒节流
-            # 打出具体缺哪一项，这里不重复记日志。
+            # 打出具体缺哪一项，这里不重复记日志——但必须把它推到前端：
+            # 否则用户看到的是"配置保存成功、三路出口全停"，只能猜是不是程序锁死。
+            problem = last_error()
+            if problem and state.run_status.get('config_error') != problem:
+                state.run_status['config_error'] = problem
+                try:
+                    push_run_status()
+                except Exception as e:
+                    logging.debug(f"推送配置错误失败（忽略）：{e}")
             if (cfg.get('mode') or 'none') == 'none':
                 # 让状态页能明确显示"等待配置"，而不是一片空白
                 state.run_status['mode'] = '等待配置'
@@ -480,6 +529,12 @@ def main():
             continue  # 跳过后续逻辑，直接进入下一次循环
 
         # 2. 配置有效，执行主流程（run_once不变）
+        if state.run_status.get('config_error'):
+            state.run_status['config_error'] = ''
+            try:
+                push_run_status()
+            except Exception:
+                pass
         logging.info("配置信息有效，启动主程序...")
         run_once()
 

@@ -7,6 +7,7 @@
 import math
 import os
 import platform
+import random
 import sys
 import time
 from functools import wraps
@@ -16,6 +17,68 @@ from ..core import state
 
 class ThreadExitRequested(Exception):
     """收到退出/重启信号时，用于中断阻塞中的重试循环"""
+
+
+class Backoff:
+    """按固定档位递增的重连退避（带抖动），由调用方决定何时复位。
+
+    为什么不用 `@retry` 装饰器：装饰器的重试次数是编译期写死的，而现场真正
+    需要的是"这一轮失败之后，下一次该等多久"。多个 `@retry` 叠在一起时
+    （历史上 `open_relay` = connect 3 次 × 握手 3 次 + 外层 15 秒），实际间隔
+    既不可预测也调不动。改成显式对象后，一个故障点只有一个节奏来源。
+
+    用法：
+        b = Backoff(NETWORK_BACKOFF, jitter=BACKOFF_JITTER, name='中继')
+        delay = b.next_delay()      # 首次 2 秒（含抖动），逐档升到 30 秒封顶
+        b.reset()                   # 一旦真的收到数据，退回最快档
+        b.describe()                # "第 3 次失败 · 下次 10 秒后"
+
+    抖动只在 `next_delay()` 里加，不影响 `schedule` 本身，便于测试用 jitter=0。
+    """
+
+    __slots__ = ('_schedule', '_jitter', '_name', '_step')
+
+    def __init__(self, schedule=(2.0, 5.0, 10.0, 20.0, 30.0), jitter=0.0, name=''):
+        values = tuple(float(x) for x in (schedule or ()) if float(x) >= 0)
+        self._schedule = values or (5.0,)
+        self._jitter = max(0.0, min(1.0, float(jitter)))
+        self._name = name
+        self._step = 0
+
+    @property
+    def step(self) -> int:
+        """已经连续失败了几个档位（0 表示还没失败过）。"""
+        return self._step
+
+    @property
+    def schedule(self):
+        return self._schedule
+
+    def next_delay(self) -> float:
+        """返回本次应等待的秒数，并把档位往前推一格。"""
+        base = self._schedule[min(self._step, len(self._schedule) - 1)]
+        self._step += 1
+        if self._jitter:
+            base *= 1.0 + random.uniform(-self._jitter, self._jitter)
+        return round(max(0.1, base), 1)
+
+    def peek_delay(self) -> float:
+        """看一眼"下一次会等多久"，不推进档位（给状态提示用）。"""
+        return round(self._schedule[min(self._step, len(self._schedule) - 1)], 1)
+
+    def reset(self):
+        self._step = 0
+
+    def describe(self) -> str:
+        """给日志用的一句话："中继连接失败 · 连续第 3 次"。
+
+        刻意不带"下次多久"——调用方通常在 `next_delay()` 之后打日志，那时
+        档位已经推进，再说"下次"会和同一行的实际等待秒数冲突。
+        """
+        if self._step <= 0:
+            return self._name or ''
+        text = f"连续第 {self._step} 次失败"
+        return f"{self._name} · {text}" if self._name else text
 
 
 def _dataplane_exit_requested() -> bool:

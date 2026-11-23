@@ -859,7 +859,8 @@ class _FakeCasterServer:
         return self
 
     def _serve(self):
-        # 循环 accept：connect_to_host 带 @retry(3)，一次会话里可能连多次
+        # 循环 accept：上层（RECONNECT_BACKOFF）会重连多次，一次会话里可能连多次。
+        # 注意 connect_to_host 自 2026-11-24 起不再自带 @retry，重试全由上层控制。
         while not self._stop:
             try:
                 self._sock, _addr = self._listener.accept()

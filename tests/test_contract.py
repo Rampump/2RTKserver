@@ -8149,6 +8149,10 @@ class TestSourceGate(unittest.TestCase):
     认证成功）→ 数据源探测失败 → finally 拆掉出口 → 主循环重来，日志实测
     7.06 秒一轮。云端看到的是"每 7 秒上线又下线、一个字节不发"，只能反复踢。
     这些断言防的就是启动顺序被改回去。
+
+    2026-11-24 修正：判据从"首帧 RTCM"放宽到"首帧任意数据"，因为只出 NMEA
+    的模块被旧判据判成"没模块"，三路一次都开不起来。能不能上传改由上传端
+    按 last_rtcm_ts 单独判断（见 TestSourceGateRuntime）。
     """
 
     def _read(self, *parts):
@@ -8174,12 +8178,59 @@ class TestSourceGate(unittest.TestCase):
         self.assertIn('return', seg, '门闸失败分支必须 return，不能继续往下开出口')
         self.assertIn('_mark_source_waiting(', seg, '门闸失败要落前端提示')
 
-    def test_first_frame_is_marked_only_by_rtcm(self):
-        """门闸打点只认 RTCM 前导 0xD3，不能把串口噪声/心跳当成"有数据"。"""
-        source = self._read('rtkserver', 'core', 'distributor.py')
-        self.assertIn("b'\\xd3'", source)
-        self.assertIn('state.last_data_ts = time.time()', source)
-        self.assertIn('state.first_data_event.set()', source)
+    def test_marks_have_two_levels(self):
+        """两级判据：分发路径只记"任意数据"，RTCM 由解析线程记。"""
+        dist = self._read('rtkserver', 'core', 'distributor.py')
+        mark = dist[dist.index('def _mark_source_data('):dist.index('def distribute(')]
+        self.assertIn('state.last_data_ts = time.time()', mark)
+        self.assertIn('state.first_data_event.set()', mark)
+        self.assertNotIn('state.last_rtcm_ts =', mark,
+                         '分发热路径只做赋值，不判 RTCM（也别再扫 0xD3）')
+        self.assertNotIn("b'\\xd3'", mark, '热路径不该扫 RTCM 前导')
+
+        parser = self._read('rtkserver', 'sources', 'rtcm_parser.py')
+        self.assertIn('state.last_rtcm_ts = time.time()', parser)
+        body = parser[parser.index('def process_rtcm_buffer('):]
+        self.assertLess(body.index('if frames:'),
+                        body.index('state.last_rtcm_ts = time.time()'),
+                        '只有真的解出帧才打点，缓冲区里有字节不算')
+
+    def test_nmea_marks_alive_but_not_upload_ready(self):
+        """真实行为：NMEA 让门闸开，但不算"能上传"。"""
+        from rtkserver.core import state
+        from rtkserver.core.distributor import _mark_source_data
+
+        old_any, old_rtcm = state.last_data_ts, state.last_rtcm_ts
+        try:
+            state.last_data_ts = 0.0
+            state.last_rtcm_ts = 0.0
+            state.first_data_event.clear()
+            _mark_source_data(b'$GNGGA,000000.00,2520.35,N,11027.75,E,2,45,0.9,132.7,M,,,,*5C\r\n')
+            self.assertGreater(state.last_data_ts, 0)
+            self.assertEqual(state.last_rtcm_ts, 0.0)
+            self.assertTrue(state.first_data_event.is_set())
+        finally:
+            state.last_data_ts, state.last_rtcm_ts = old_any, old_rtcm
+            state.first_data_event.clear()
+
+    def test_gate_does_not_wait_for_rtcm(self):
+        """门闸等的是 first_data_event（任意数据），不能偷偷改回等 RTCM。"""
+        source = self._read('rtkserver', 'core', 'lifecycle.py')
+        fn = source[source.index('def _wait_first_source_data('):]
+        fn = fn[:fn.index('\ndef ')]
+        self.assertIn('state.first_data_event.wait(', fn)
+        self.assertNotIn('state.last_rtcm_ts', fn, '门闸放宽后不该再按 RTCM 判定')
+
+    def test_detect_serial_accepts_nmea_only(self):
+        """端口探测要认"有数据"，否则只出 NMEA 的模块永远找不到。
+
+        注意 NMEA 只是兜底判据（RTCM 优先），所以这里断言的是探针的返回三态，
+        而不是"只要有 NMEA 就直接当数据源"。
+        """
+        source = self._read('rtkserver', 'sources', 'serial_source.py')
+        self.assertIn('def _looks_like_nmea(', source)
+        self.assertIn("b'$G'", source)
+        self.assertIn("return 'nmea' if saw_nmea else None", source)
 
     def test_gate_wait_yields_to_restart_signal(self):
         """等首帧期间收到重启/退出信号必须立刻让位，不能干等满 10 秒。"""
@@ -8190,6 +8241,14 @@ class TestSourceGate(unittest.TestCase):
         self.assertIn('state.restart_event.is_set()', fn)
         self.assertIn('state.shutdown_event.is_set()', fn)
 
+    def test_no_device_failure_leaves_hint(self):
+        """找不到串口也要落前端提示（原先这条分支只写日志，比"有口无数据"更沉默）。"""
+        source = self._read('rtkserver', 'core', 'lifecycle.py')
+        body = source[source.index('def _run_once_body('):]
+        start = body.index('port, baud = detect_serial(cfg)')
+        seg = body[start:body.index('source_thread = threading.Thread(', start)]
+        self.assertIn("_mark_source_waiting(0, 'no_device')", seg)
+
 
 class TestSourceGateRuntime(unittest.TestCase):
     """运行期熔断：数据停了要自己退出，而不是等云端踢完再重连。"""
@@ -8198,10 +8257,12 @@ class TestSourceGateRuntime(unittest.TestCase):
         from rtkserver.core import state
         self.state = state
         self._old_ts = state.last_data_ts
+        self._old_rtcm = state.last_rtcm_ts
         self._old_state = state.source_state
 
     def tearDown(self):
         self.state.last_data_ts = self._old_ts
+        self.state.last_rtcm_ts = self._old_rtcm
         self.state.source_state = self._old_state
 
     def _uploader(self):
@@ -8213,51 +8274,598 @@ class TestSourceGateRuntime(unittest.TestCase):
         """从没收到过数据：不许去认证，状态必须是 waiting_source。"""
         up = self._uploader()
         self.state.last_data_ts = 0.0
+        self.state.last_rtcm_ts = 0.0
         self.assertTrue(up._pause_if_no_source())
         self.assertEqual(up.status()['state'], 'waiting_source')
 
-    def test_goes_ahead_when_data_is_fresh(self):
+    def test_goes_ahead_when_rtcm_is_fresh(self):
         up = self._uploader()
         self.state.last_data_ts = time_module.time()
+        self.state.last_rtcm_ts = time_module.time()
         self.assertFalse(up._pause_if_no_source())
 
-    def test_backs_off_when_data_stalled(self):
-        """数据停了超过阈值：主动断开并落到 waiting_source。"""
+    def test_parks_when_only_nmea_is_flowing(self):
+        """字节在流但没有 RTCM：本地两路照开，云端必须停着别上去挨踢。"""
+        up = self._uploader()
+        self.state.last_data_ts = time_module.time()
+        self.state.last_rtcm_ts = 0.0
+        self.assertTrue(up._pause_if_no_source(),
+                        '只有 NMEA 时不能认证——发不出 RTCM 会被云端当空闲源踢掉')
+        self.assertEqual(up.status()['state'], 'waiting_source')
+
+    def test_backs_off_when_rtcm_stalled(self):
+        """RTCM 停了超过阈值：主动断开并落到 waiting_source。"""
         from rtkserver.core.constants import SOURCE_STALL_TIMEOUT
 
         up = self._uploader()
-        self.state.last_data_ts = time_module.time() - (SOURCE_STALL_TIMEOUT + 5)
+        self.state.last_data_ts = time_module.time()
+        self.state.last_rtcm_ts = time_module.time() - (SOURCE_STALL_TIMEOUT + 5)
         self.assertTrue(up._pause_if_no_source())
         self.assertEqual(up.status()['state'], 'waiting_source')
 
+    def test_does_not_poll_when_data_is_flowing(self):
+        """运行期不做常驻检测：核对只出现在"队列空了"和"要建连"两处。"""
+        source = TestSourceGate._read(self, 'rtkserver', 'outlets', 'caster_uploader.py')
+        loop = source[source.index('    def _loop(self):'):source.index('    def _tick_rate(')]
+        self.assertIn('except queue.Empty:', loop)
+        after_empty = loop[loop.index('except queue.Empty:'):]
+        self.assertIn('_pause_if_no_source()', after_empty,
+                      '断流判据要在"没东西可发"时做')
+        # 主循环顶部不能再有无条件判断（那是每 0.5 秒都读一次）。
+        # 首次建连那个 while 里的判断是允许的：那时还没连上，本来就要等数据。
+        main_loop = loop[loop.rindex('while self._running:'):]
+        self.assertNotIn('_pause_if_no_source()',
+                         main_loop[:main_loop.index('self._outbox.get(')],
+                         '有数据在流动时不应每轮都检测数据源')
+
     def test_frontend_gets_the_reason(self):
-        """状态页要能说清"为什么没数据"，三个入口都要有对应文案。"""
+        """状态页要能说清"为什么没数据 / 为什么没启动"，三个入口都要有对应文案。"""
         index = TestSourceGate._read(self, 'templates', 'index.html')
         self.assertIn('id="source-hint"', index)
+        self.assertIn('id="config-hint"', index)
 
         js = TestSourceGate._read(self, 'static', 'script.js')
         self.assertIn('rs.source_waiting', js)
         self.assertIn('rs.source_stalled', js)
+        self.assertIn('rs.source_alive_no_rtcm', js)
+        self.assertIn('status.config_error', js)
 
         i18n = TestSourceGate._read(self, 'static', 'i18n.js')
         self.assertIn("'rs.source_waiting'", i18n)
         self.assertIn("'rs.source_stalled'", i18n)
+        self.assertIn("'rs.source_alive_no_rtcm'", i18n)
         self.assertIn("'mode.waiting_source'", i18n)
 
     def test_gate_state_follows_data_age(self):
-        """refresh_source_gate 由 last_data_ts 派生，不另存一份状态。"""
+        """refresh_source_gate 由两个时间戳派生，不另存一份状态。"""
         from rtkserver.core.constants import SOURCE_STALL_TIMEOUT
         from rtkserver.core.status import refresh_source_gate
 
-        self.state.last_data_ts = time_module.time()
+        now = time_module.time()
+        self.state.last_data_ts = now
+        self.state.last_rtcm_ts = now
         self.assertEqual(refresh_source_gate(), 'ok')
 
-        self.state.last_data_ts = time_module.time() - (SOURCE_STALL_TIMEOUT + 1)
+        # 有字节但没有 RTCM：本地两路可以跑，云端暂缓
+        self.state.last_data_ts = now
+        self.state.last_rtcm_ts = 0.0
+        self.assertEqual(refresh_source_gate(), 'alive_no_rtcm')
+
+        self.state.last_data_ts = now - (SOURCE_STALL_TIMEOUT + 1)
+        self.state.last_rtcm_ts = now - (SOURCE_STALL_TIMEOUT + 1)
         self.assertEqual(refresh_source_gate(), 'stalled')
 
         self.state.source_state = 'waiting'
         self.state.last_data_ts = 0.0
+        self.state.last_rtcm_ts = 0.0
         self.assertEqual(refresh_source_gate(), 'waiting')
+
+    def test_config_error_is_exposed_to_frontend(self):
+        """勾了数传却没填端口 → 校验失败，且原因能被前端读到。"""
+        from rtkserver import validation
+
+        cfg = {'mode': 'serial', 'serial_port': '/dev/ttyUSB0', 'baud_rate': 460800,
+               'caster_enabled': '0', 'local_caster_enabled': '0',
+               'radio_enabled': '1', 'radio_port': '', 'radio_baud': '115200'}
+        self.assertFalse(validation.validate_config(cfg))
+        self.assertIn('数传串口', validation.last_error())
+        self.assertEqual(self.state.run_status.get('config_error', ''), '',
+                         '初始不该带错误')
+# ==================== Unicore N4：R1.4 手册口径回归 ====================
+class TestUnicoreN4ManualConformance(unittest.TestCase):
+    """对照 R1.4 手册（`docs/unicore-n4-commands-reference.zh.md`）的契约。
+
+    这组用例全部来自"驱动与文档不一致"的真实缺陷：每条都能指到手册的
+    具体条款，也能说清"错了以后现场是什么症状"。不是把实现再抄一遍。
+    """
+
+    @staticmethod
+    def _channel(replies):
+        class _Stub:
+            def __init__(self):
+                self.replies = list(replies)
+                self.sent = []
+                self.cache = {}
+                self.counters = {'lines': 0, 'frames': 0, 'noise': 0}
+                self.parser = None
+                self.heads = ('$', '#')
+                self.frame_out = False
+                self.reply_aliases = {}
+
+            def send(self, body, timeout=None, retries=None, interval=None):
+                self.sent.append(body)
+                if not self.replies:
+                    return 'timeout', ''
+                return self.replies.pop(0)
+
+        return _Stub()
+
+    def _driver(self, replies, model='um960'):
+        from rtkserver.calibration.drivers import unicore_n4 as n4
+        classes = {'um960': n4.UnicoreUM960Driver, 'um960l': n4.UnicoreUM960LDriver,
+                   'um980': n4.UnicoreUM980Driver, 'um982': n4.UnicoreUM982Driver}
+        channel = self._channel(replies)
+        return classes[model](channel), channel
+
+    # ---------- §3.6 流动站细分：UAV 的第二档是 HIGHDYN ----------
+    def test_uav_second_variant_is_highdyn_not_formation(self):
+        """手册 §3.6 表 3-8：UAV = DEFAULT / HIGHDYN。
+
+        写成 FORMATION 会拼出 `MODE ROVER UAV FORMATION`；简化 ASCII 不回错误码，
+        模块静默不认，现场表现就是"选了无人机细分，模式没变"。
+        """
+        from rtkserver.calibration.drivers import unicore_n4 as n4
+        self.assertEqual(n4.ROVER_VARIANTS['UAV'], ('DEFAULT', 'HIGHDYN'))
+        driver, channel = self._driver([])
+        ok, message, data = driver.set_rover('UAV', 'FORMATION',
+                                             persist=False, restart=False)
+        self.assertFalse(ok, 'FORMATION 不是手册里的档位，必须被拒')
+        self.assertEqual(data['error'], 'bad_variant')
+        self.assertIn('HIGHDYN', message, '拒绝时要告诉用户正确档位叫什么')
+        self.assertEqual(channel.sent, [], '非法档位一条命令都不该发出去')
+
+    def test_uav_highdyn_dispatches_exact_body(self):
+        # 两条应答：第一条给 `MODE ROVER UAV HIGHDYN`，第二条给回读的 `MODE`
+        driver, channel = self._driver([('ok', '#MODE,95,ROVER*1B'),
+                                        ('ok', '#MODE,95,ROVER*1B')])
+        ok, message, _data = driver.set_rover('UAV', 'HIGHDYN',
+                                              persist=False, restart=False)
+        self.assertTrue(ok, message)
+        self.assertEqual(channel.sent[0], 'MODE ROVER UAV HIGHDYN')
+
+    # ---------- §3.3 自收敛：T 的上限是 3600 秒 ----------
+    def test_survey_in_rejects_more_than_one_hour(self):
+        """手册 §3.3：`T` 非负且 ≤3600。超过上限模块静默按上限走。"""
+        driver, channel = self._driver([])
+        ok, message, data = driver.config_survey_in(7200, persist=False, restart=False)
+        self.assertFalse(ok)
+        self.assertEqual(data['error'], 'bad_count')
+        self.assertEqual(channel.sent, [], '超范围不该发命令')
+
+    def test_survey_in_accepts_exactly_one_hour(self):
+        driver, channel = self._driver([('ok', '#MODE,95,BASE*1B')])
+        ok, message, _data = driver.config_survey_in(3600, persist=False,
+                                                     restart=False, verify=False)
+        self.assertTrue(ok, message)
+        self.assertEqual(channel.sent, ['MODE BASE TIME 3600'])
+
+    # ---------- §5.2 截止高度角：合法区间 -90~90 ----------
+    def test_elevation_mask_accepts_negative_value(self):
+        """手册 §5.2 写的是 -90~90。早先按 0~90 校验，把合法负值当非法拒掉。"""
+        driver, channel = self._driver([('ok', '#MASK,OK*1B'),
+                                        ('ok', '$SAVECONFIG,OK*00')])
+        ok, message, _data = driver.set_elevation_mask(-5, persist=True)
+        self.assertTrue(ok, message)
+        self.assertEqual(channel.sent[0], 'MASK -5.0')
+
+    def test_elevation_mask_still_rejects_out_of_range(self):
+        driver, channel = self._driver([])
+        ok, message, data = driver.set_elevation_mask(-91)
+        self.assertFalse(ok)
+        self.assertEqual(data['error'], 'bad_mask')
+        self.assertEqual(channel.sent, [])
+
+    # ---------- §4.25 天线偏移：高 0~6.5535，东/北 0~100 ----------
+    def test_ant_delta_range_follows_manual_table(self):
+        driver, channel = self._driver([])
+        driver.runtime_caps['ant_delta'] = True     # 该能力默认关着，先打开
+        ok, message, data = driver.set_ant_delta(8.0)
+        self.assertFalse(ok, '天线高上限是 6.5535 m')
+        self.assertEqual(data['error'], 'bad_height')
+        ok, message, data = driver.set_ant_delta(1.5, east=150)
+        self.assertFalse(ok, '东向偏移上限是 100 m')
+        self.assertEqual(data['error'], 'bad_offset')
+        self.assertEqual(channel.sent, [])
+
+    # ---------- §5.2 星座屏蔽：`MASK 10` 不是"屏蔽 10 号星" ----------
+    def test_mask_target_refuses_numeric_lookalike(self):
+        """同一个 `MASK` 头，跟数字是高度角、跟名字才是屏蔽对象。
+
+        把数字当"屏蔽某颗星"发下去会静默改掉高度角设置 ——
+        现场只会看到"卫星少了一片"，几乎查不回这条命令。
+        """
+        driver, channel = self._driver([])
+        ok, message, data = driver.mask_target('10')
+        self.assertFalse(ok)
+        self.assertEqual(data['error'], 'looks_like_elevation')
+        self.assertEqual(channel.sent, [])
+
+    def test_mask_system_dispatches_upper_case(self):
+        driver, channel = self._driver([('ok', '#MASK,OK*1B'),
+                                        ('ok', '$SAVECONFIG,OK*00')])
+        ok, message, _data = driver.mask_target('gps', persist=True)
+        self.assertTrue(ok, message)
+        self.assertEqual(channel.sent[0], 'MASK GPS')
+
+    def test_mask_prn_carries_manual_warning(self):
+        driver, channel = self._driver([('ok', '#MASK,OK*1B'),
+                                        ('ok', '$SAVECONFIG,OK*00')])
+        ok, message, data = driver.mask_prn('GPS', 10, persist=True)
+        self.assertTrue(ok, message)
+        self.assertEqual(channel.sent[0], 'MASK GPS PRN 10')
+        self.assertIn('不能混用', data.get('warning', ''),
+                      '手册 §5.2 的"系统屏蔽与 PRN 屏蔽不能混用"必须传给调用方')
+
+    # ---------- §4.5 / §4.6 差分龄期 ----------
+    def test_rtk_timeout_body_and_range(self):
+        driver, channel = self._driver([('ok', '$CONFIG,RTK,TIMEOUT,120*00'),
+                                        ('ok', '$SAVECONFIG,OK*00')])
+        ok, message, _data = driver.set_rtk_timeout(120, persist=True)
+        self.assertTrue(ok, message)
+        self.assertEqual(channel.sent[0], 'CONFIG RTK TIMEOUT 120')
+        other, _ch = self._driver([])
+        ok, message, data = other.set_rtk_timeout(2000)
+        self.assertFalse(ok, '手册上限 1800 秒')
+        self.assertEqual(data['error'], 'bad_timeout')
+
+    def test_dgps_timeout_zero_means_disable(self):
+        """0 是合法值（= 关闭 DGPS），不能被范围校验误杀。"""
+        driver, channel = self._driver([('ok', '$CONFIG,DGPS,TIMEOUT,0*00')])
+        ok, message, _data = driver.set_dgps_timeout(0, persist=False)
+        self.assertTrue(ok, message)
+        self.assertEqual(channel.sent[0], 'CONFIG DGPS TIMEOUT 0')
+
+    # ---------- §3.7 Heading2 的第二参数 ----------
+    def test_heading2_accepts_dynamic_model(self):
+        """§3.7：`MODE HEADING2 [FIXLENGTH|VARIABLELENGTH|STATIC|LOWDYNAMIC]`。
+
+        早先这个分支把参数整个丢掉、只发裸 `MODE HEADING2`，
+        于是"刚性基线"这种必须显式声明的场景永远配不上。
+        """
+        driver, channel = self._driver([('ok', '#MODE,95,HEADING2*1B'),
+                                        ('ok', '#MODE,95,HEADING2*1B')])
+        ok, message, _data = driver.set_mode('heading2', heading_mode='fixlength',
+                                             persist=False, restart=False, verify=True)
+        self.assertTrue(ok, message)
+        self.assertEqual(channel.sent[0], 'MODE HEADING2 FIXLENGTH')
+
+    def test_heading2_rejects_unknown_dynamic_model(self):
+        driver, channel = self._driver([])
+        ok, message, data = driver.set_mode('heading2', heading_mode='WHATEVER',
+                                            persist=False, restart=False)
+        self.assertFalse(ok)
+        self.assertEqual(data['error'], 'bad_variant')
+        self.assertEqual(channel.sent, [])
+
+    # ---------- §4.35 / §4.36 内置 NTRIP ----------
+    def test_ntrip_client_body_matches_manual_order(self):
+        """§5.2 的顺序是 host port mount **user** password（下载端要用户名）。"""
+        driver, channel = self._driver([('ok', '$CONFIG,NCOM20,1*00'),
+                                        ('ok', '$SAVECONFIG,OK*00')])
+        ok, message, data = driver.set_ntrip_client('2rtk.net', 2101, '2RTK',
+                                                    'joverking', 'pw')
+        self.assertTrue(ok, message)
+        self.assertEqual(channel.sent[0],
+                         'CONFIG NCOM20 2rtk.net 2101 2RTK joverking pw')
+        self.assertEqual(data['protocol'], 'NTRIP1')
+        self.assertFalse(data['verified_on_this_model'],
+                         '手册只把 NCOM 标给 UB9A0，不能声称已在 N4 上验证')
+
+    def test_ntrip_server_rejects_client_slot(self):
+        driver, channel = self._driver([])
+        ok, message, data = driver.set_ntrip_server('h', 2101, 'M', 'p', slot=20)
+        self.assertFalse(ok)
+        self.assertEqual(data['error'], 'bad_slot')
+        self.assertEqual(channel.sent, [])
+
+    def test_ntrip_rejects_reserved_port(self):
+        """§4.2：端口 40000 保留给内部系统编程。"""
+        driver, channel = self._driver([])
+        ok, message, data = driver.set_ntrip_server('h', 40000, 'M', 'p')
+        self.assertFalse(ok)
+        self.assertEqual(data['error'], 'bad_param')
+        self.assertEqual(channel.sent, [])
+
+    def test_disable_ntrip_closes_all_four_paths(self):
+        driver, channel = self._driver([
+            ('ok', '$CONFIG,NCOM1,1*00'), ('ok', '$CONFIG,NCOM2,1*00'),
+            ('ok', '$CONFIG,NCOM3,1*00'), ('ok', '$CONFIG,NCOM20,1*00'),
+            ('ok', '$SAVECONFIG,OK*00')])
+        ok, message, data = driver.disable_ntrip()
+        self.assertTrue(ok, message)
+        self.assertEqual(data['closed'], [1, 2, 3, 20])
+        self.assertEqual(channel.sent[:4],
+                         ['CONFIG NCOM1 Disable', 'CONFIG NCOM2 Disable',
+                          'CONFIG NCOM3 Disable', 'CONFIG NCOM20 Disable'])
+
+    # ---------- §10 RESET 的数据类型 ----------
+    def test_reset_data_rejects_unknown_kind(self):
+        driver, channel = self._driver([])
+        ok, message, data = driver.reset_data('EVERYTHING')
+        self.assertFalse(ok)
+        self.assertEqual(data['error'], 'bad_kind')
+        self.assertEqual(channel.sent, [])
+
+    # ---------- 型号裁剪：手册"适用产品"就是裁剪依据 ----------
+    def test_new_commands_are_trimmed_by_model(self):
+        from rtkserver.calibration.drivers import unicore_n4 as n4
+        # §4.7 无差分保持：UM960/UM980/UM982，**不含 UM960L**
+        self.assertNotIn('set_standalone', n4.UnicoreUM960LDriver.CMD)
+        self.assertIn('set_standalone', n4.UnicoreUM960Driver.CMD)
+        # §4.16 BDS B1C/B2a 编入 RTCM：仅 UM980/UM982
+        self.assertNotIn('set_rtcm_b1cb2a', n4.UnicoreUM960Driver.CMD)
+        self.assertIn('set_rtcm_b1cb2a', n4.UnicoreUM980Driver.CMD)
+        self.assertIn('set_rtcm_b1cb2a', n4.UnicoreUM982Driver.CMD)
+        # 内置 NTRIP 命令体在公共集里（能力位 false 表示厂商没对这四款承诺）
+        self.assertIn('ntrip_client', n4.UnicoreUM960LDriver.CMD)
+
+
+class TestReconnectBackoff(unittest.TestCase):
+    """重连节奏契约（2026-11-24）。
+
+    背景：`connect_to_host` 上挂着 `@retry(3)`，调用方外面还有一层 sleep，
+    一次失败被放大成 3 次敲门、耗时 40 秒；中继再叠一层握手重试，最坏 100 秒
+    才回到起点。同时中继的 EOF 分支是**零延迟重连**，遇到"接受后立刻关闭"的
+    上游就是毫秒级风暴，会把 caster 的每用户连接数直接打满。
+
+    这组断言锁三件事：底层只敲一次门、退避表分级且可复位、EOF 不许零延迟。
+    """
+
+    def _read(self, *parts):
+        path = os.path.join(REPO_ROOT, *parts)
+        with open(path, 'r', encoding='utf-8') as handle:
+            return handle.read()
+
+    # ---------- Backoff 本体 ----------
+    def test_backoff_follows_schedule_and_saturates(self):
+        from rtkserver.utils.common import Backoff
+        b = Backoff((2, 5, 10, 20, 30), jitter=0)
+        self.assertEqual([b.next_delay() for _ in range(7)],
+                         [2.0, 5.0, 10.0, 20.0, 30.0, 30.0, 30.0],
+                         '退避必须逐档爬升并在最后一档封顶，不能无限增长')
+
+    def test_backoff_resets_after_success(self):
+        from rtkserver.utils.common import Backoff
+        b = Backoff((2, 5, 10), jitter=0)
+        b.next_delay()
+        b.next_delay()
+        self.assertEqual(b.step, 2)
+        b.reset()
+        self.assertEqual(b.step, 0)
+        self.assertEqual(b.next_delay(), 2.0, '恢复后必须退回最快档')
+
+    def test_backoff_jitter_stays_within_bounds(self):
+        from rtkserver.utils.common import Backoff
+        b = Backoff((10,), jitter=0.2)
+        for _ in range(50):
+            self.assertTrue(8.0 <= b.next_delay() <= 12.0)
+
+    def test_auth_backoff_is_minute_scale(self):
+        """认证类必须比网络类慢一个量级，否则密码错会每几秒敲一次门。"""
+        from rtkserver.core.constants import AUTH_BACKOFF, NETWORK_BACKOFF
+        self.assertGreaterEqual(min(AUTH_BACKOFF), 30.0)
+        self.assertLessEqual(max(AUTH_BACKOFF), 600.0)
+        self.assertLessEqual(max(NETWORK_BACKOFF), 60.0,
+                             '网络类必须能在一分钟内恢复，否则云端重启后迟迟不回线')
+
+    # ---------- 底层不再自带重试 ----------
+    def test_connect_to_host_has_no_retry_decorator(self):
+        source = self._read('rtkserver', 'sources', 'ntrip.py')
+        start = source.index('def connect_to_host(')
+        fn = source[start:source.index('\ndef ', start)]
+        self.assertIn('retries=1', fn, '默认必须只尝试一次，节奏交给调用方')
+        head = source[max(0, start - 80):start]
+        self.assertNotIn('@retry', head, '建连函数上不许再挂 @retry，否则任何退避表都被乘 3')
+
+    def test_handshake_is_single_attempt(self):
+        """握手不许重试：同一 socket 上重发 GET 本身就是错的。"""
+        source = self._read('rtkserver', 'sources', 'ntrip.py')
+        start = source.index('def handshake_ntrip_client(')
+        seg = source[start:]
+        seg = seg[:seg.index('\ndef ')]
+        self.assertIn('srv_sock.sendall(hdr.encode())', seg)
+        head = source[max(0, start - 80):start]
+        self.assertNotIn('@retry', head, '握手上不许再挂 @retry')
+
+    # ---------- 中继不许零延迟重连 ----------
+    def test_relay_eof_waits_before_reconnect(self):
+        source = self._read('rtkserver', 'sources', 'relay_source.py')
+        body = source[source.index('elif eof:'):]
+        body = body[:body.index('elif timed_out:')]
+        self.assertIn('next_delay()', body, 'EOF 分支必须从退避表取间隔')
+        self.assertIn('interruptible_sleep(delay', body,
+                      'EOF 分支必须先睡再重连，绝不允许零延迟')
+        self.assertLess(body.index('interruptible_sleep('), body.index('open_relay(cfg)'),
+                        '顺序错了就等于没退避')
+
+    def test_relay_backoff_resets_only_on_data(self):
+        """复位只能发生在真的收到数据时——建连成功就复位会退化成风暴。"""
+        source = self._read('rtkserver', 'sources', 'relay_source.py')
+        data_branch = source[source.index('if data:'):source.index('elif eof:')]
+        self.assertIn('eof_backoff.reset()', data_branch)
+        self.assertIn('net_backoff.reset()', data_branch)
+        eof_branch = source[source.index('elif eof:'):source.index('elif timed_out:')]
+        self.assertNotIn('reset()', eof_branch, 'EOF 分支里复位 = 退避永远停在第一档')
+
+    def test_source_retry_is_visible_to_frontend(self):
+        from rtkserver.core import state
+        from rtkserver.sources.relay_source import _clear_source_retry, _note_source_retry
+        from rtkserver.utils.common import Backoff
+
+        old = state.run_status.get('source_retry')
+        try:
+            state.run_status['source_retry'] = {}
+            b = Backoff((2, 5, 10), jitter=0)
+            b.next_delay()
+            _note_source_retry('relay_eof', b, '上游关闭', 5.0)
+            info = state.run_status['source_retry']
+            self.assertEqual(info['kind'], 'relay_eof')
+            self.assertEqual(info['count'], 1)
+            self.assertEqual(info['next_delay'], 5.0)
+            _clear_source_retry()
+            self.assertEqual(state.run_status['source_retry'], {})
+        finally:
+            state.run_status['source_retry'] = old if old is not None else {}
+
+    # ---------- 串口：拔插恢复的两个缺口 ----------
+    def test_detect_serial_never_hard_skips_radio_port(self):
+        """不许因为"这个口是数传口"就跳过探测。
+
+        现场真有人把模块和数传的线互换：硬过滤会让模块永远找不到，
+        表现是"插着模块却提示未检测到 RTK 模块"。正确做法是 RTCM 优先——
+        哪个口能解出 RTCM 就无条件用它，哪怕它正是配置里的数传口。
+        """
+        source = self._read('rtkserver', 'sources', 'serial_source.py')
+        body = source[source.index('def detect_serial('):source.index('def test_serial(')]
+        self.assertNotIn('available_ports = kept', body, '硬过滤数传口会让互换接线后找不到模块')
+        self.assertIn("if verdict == 'rtcm'", body)
+        self.assertIn('preferred = [c for c in nmea_candidates if not c[2]]', body,
+                      'NMEA 兜底时才优先非数传口')
+
+    def test_detect_serial_crossed_cables_picks_rtcm_port(self):
+        """模块插在 radio_port 上时，RTCM 命中必须压过"数传口"身份。"""
+        from unittest.mock import patch
+
+        from rtkserver.sources import serial_source as ss
+
+        verdicts = {('COM1', 460800): 'nmea', ('COM2', 115200): 'rtcm'}
+        cfg = {'serial_port': 'COM1', 'baud_rate': 460800,
+               'radio_enabled': '1', 'radio_port': 'COM2'}
+
+        class _Port:
+            def __init__(self, device):
+                self.device = device
+
+        with patch.object(ss, '_probe_serial',
+                          side_effect=lambda p, b, window=2.0: verdicts.get((p, b))), \
+                patch.object(ss.serial.tools.list_ports, 'comports',
+                             return_value=[_Port('COM1'), _Port('COM2')]), \
+                patch.object(ss, 'save_serial_config'):
+            self.assertEqual(ss.detect_serial(cfg), ('COM2', 115200))
+
+    def test_detect_serial_nmea_fallback_avoids_radio_port(self):
+        """一路 RTCM 都没有时，才按 NMEA 兜底，并优先非数传口。"""
+        from unittest.mock import patch
+
+        from rtkserver.sources import serial_source as ss
+
+        verdicts = {('COM1', 460800): None, ('COM2', 115200): 'nmea',
+                    ('COM3', 9600): 'nmea'}
+        cfg = {'serial_port': 'COM1', 'baud_rate': 460800,
+               'radio_enabled': '1', 'radio_port': 'COM2'}
+
+        class _Port:
+            def __init__(self, device):
+                self.device = device
+
+        with patch.object(ss, '_probe_serial',
+                          side_effect=lambda p, b, window=2.0: verdicts.get((p, b))), \
+                patch.object(ss.serial.tools.list_ports, 'comports',
+                             return_value=[_Port('COM1'), _Port('COM2'), _Port('COM3')]), \
+                patch.object(ss, 'save_serial_config'):
+            self.assertEqual(ss.detect_serial(cfg), ('COM3', 9600))
+
+    def test_detect_serial_uses_radio_port_when_it_is_the_only_source(self):
+        """只有数传口有数据（模块确实插在那儿）时也要能用，不能返回空。"""
+        from unittest.mock import patch
+
+        from rtkserver.sources import serial_source as ss
+
+        verdicts = {('COM2', 115200): 'nmea'}
+        cfg = {'serial_port': 'COM1', 'baud_rate': 460800,
+               'radio_enabled': '1', 'radio_port': 'COM2'}
+
+        class _Port:
+            def __init__(self, device):
+                self.device = device
+
+        with patch.object(ss, '_probe_serial',
+                          side_effect=lambda p, b, window=2.0: verdicts.get((p, b))), \
+                patch.object(ss.serial.tools.list_ports, 'comports',
+                             return_value=[_Port('COM2')]), \
+                patch.object(ss, 'save_serial_config'):
+            self.assertEqual(ss.detect_serial(cfg), ('COM2', 115200))
+
+    def test_serial_empty_watchdog_rebuilds(self):
+        """read() 只返回空字节的驱动也要能自愈，否则插回去也发现不了。"""
+        source = self._read('rtkserver', 'sources', 'serial_source.py')
+        body = source[source.index('def upload_via_serial('):]
+        self.assertIn('SERIAL_EMPTY_WATCHDOG', body)
+        self.assertLess(body.index('SERIAL_EMPTY_WATCHDOG'), body.index('raise serial.SerialException'),
+                        '超时后才抛异常重建，不能无条件抛')
+        self.assertIn('last_data_ts = time.time()', body, '每读到数据都要刷新看门狗')
+
+    def test_serial_retry_sleep_is_interruptible(self):
+        """重连等待必须能被重启指令打断（原来写死 time.sleep(5)，停服要等满）。"""
+        source = self._read('rtkserver', 'sources', 'serial_source.py')
+        body = source[source.index('def upload_via_serial('):]
+        self.assertIn('interruptible_sleep(5, thread_exit_event)', body)
+        self.assertNotIn('time.sleep(5)\n', body)
+        self.assertIn('except ThreadExitRequested:', body)
+
+    # ---------- 上传出口 ----------
+    def test_uploader_uses_split_backoff(self):
+        source = self._read('rtkserver', 'outlets', 'caster_uploader.py')
+        self.assertIn('AUTH_BACKOFF', source)
+        self.assertIn('NETWORK_BACKOFF', source)
+        self.assertIn("self._last_fail_kind = 'auth'", source,
+                      '认证被拒必须与网络失败分开，否则会按秒级反复敲门')
+        self.assertIn('def _next_retry_delay(', source)
+
+    def test_uploader_recycles_long_session(self):
+        """半开连接没有 FIN，只能靠定期轮换来发现。"""
+        source = self._read('rtkserver', 'outlets', 'caster_uploader.py')
+        self.assertIn('CASTER_SESSION_MAX_AGE', source)
+        body = source[source.index('def _loop('):]
+        self.assertIn('_session_age()', body)
+        self.assertIn('轮换连接', body)
+
+    def test_reject_text_names_the_real_cause(self):
+        from rtkserver.outlets.caster_uploader import CasterUploader
+        limit = CasterUploader._describe_reject(
+            'HTTP/1.0 401 Unauthorized\r\nUser connection limit exceeded\r\n')
+        self.assertIn('连接数已满', limit)
+        auth = CasterUploader._describe_reject('HTTP/1.0 401 Unauthorized\r\n')
+        self.assertIn('账号或密码', auth)
+        missing = CasterUploader._describe_reject('HTTP/1.0 404 Not Found\r\n')
+        self.assertIn('挂载点', missing)
+
+    def test_uploader_waits_for_source_before_retry(self):
+        """重连循环里门闸仍在最前面：没数据就不去认证（防被云端反复踢）。"""
+        source = self._read('rtkserver', 'outlets', 'caster_uploader.py')
+        body = source[source.index('def _retry_connect('):source.index('def _next_retry_delay(')]
+        self.assertIn('_pause_if_no_source()', body)
+        self.assertLess(body.index('_pause_if_no_source()'), body.index('self._connect()'),
+                        '必须先判数据源再建连')
+
+    def test_uploader_status_exposes_retry_wait(self):
+        """退避到分钟级后，页面必须能显示"约 N 秒后重试"，否则看起来像卡死。"""
+        from rtkserver.outlets.caster_uploader import CasterUploader
+        up = CasterUploader({
+            'caster_enabled': '1', 'caster_host': '127.0.0.1', 'caster_port': '2101',
+            'caster_mountpoint': 'T', 'caster_password': 'x',
+        })
+        info = up.status()
+        self.assertIn('retry_in', info)
+        self.assertEqual(info['retry_in'], 0)
+
+    def test_frontend_renders_retry_state(self):
+        script = self._read('static', 'script.js')
+        i18n = self._read('static', 'i18n.js')
+        self.assertIn('info.retry_in', script)
+        self.assertIn('status.source_retry', script)
+        for key in ("'up.retry_in'", "'rs.source_retry'"):
+            self.assertIn(key, i18n, f'{key} 缺中文或英文条目')
 
 
 if __name__ == '__main__':

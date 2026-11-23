@@ -9,12 +9,34 @@ import socket
 import time
 
 from ..core import state
-from ..core.constants import ART_LOGO, RELAY_IDLE_RECONNECT, RELAY_READ_TIMEOUT
+from ..core.constants import (ART_LOGO, BACKOFF_JITTER, NETWORK_BACKOFF,
+                              RELAY_EOF_BACKOFF, RELAY_IDLE_RECONNECT,
+                              RELAY_READ_TIMEOUT)
 from ..core.distributor import distribute
 from ..core.status import describe_target_parts, describe_targets, push_run_status
-from ..utils.common import (ThreadExitRequested, clear_screen, format_bytes,
+from ..utils.common import (Backoff, ThreadExitRequested, clear_screen, format_bytes,
                             format_duration, interruptible_sleep)
 from .ntrip import connect_to_host, handshake_ntrip_client
+
+
+def _note_source_retry(kind: str, backoff: Backoff, detail: str = '', delay: float = 0.0):
+    """把"正在重连、第几次、多久后重试"写进 run_status，前端据此显示提示条。
+
+    原先中继重连对前端完全不可见：页面只是"数据源没数据"，用户分不清是
+    上游断流、账号被占还是密码错。这里不新增轮询，只在重连的那一刻写一次字段。
+    """
+    state.run_status['source_retry'] = {
+        'kind': kind,
+        'count': int(backoff.step),
+        'next_delay': float(delay if delay else backoff.peek_delay()),
+        'detail': detail[:200],
+    }
+
+
+def _clear_source_retry():
+    """一旦真的收到数据，把重连提示清掉（否则页面会一直挂着旧文案）。"""
+    if state.run_status.get('source_retry'):
+        state.run_status['source_retry'] = {}
 
 
 def open_relay(cfg):
@@ -43,6 +65,9 @@ def forward_relay(relay, cfg, thread_exit_event):
     state.run_status["target_parts"] = describe_target_parts(cfg)
     push_run_status()
 
+    eof_backoff = Backoff(RELAY_EOF_BACKOFF, jitter=BACKOFF_JITTER, name='中继对端关闭')
+    net_backoff = Backoff(NETWORK_BACKOFF, jitter=BACKOFF_JITTER, name='中继连接失败')
+
     while not thread_exit_event.is_set():
         try:
             timed_out = False
@@ -61,25 +86,46 @@ def forward_relay(relay, cfg, thread_exit_event):
             if data:
                 last_recv = time.time()
                 total_bytes += len(data)
+                # 真的收到数据才算恢复：退避退回最快档，前端提示也清掉。
+                # 注意不能在"建连成功"时 reset —— 对端"接受后立刻关闭"的场景里，
+                # 那样会变成零延迟无限重连，正是要防的风暴。
+                eof_backoff.reset()
+                net_backoff.reset()
+                _clear_source_retry()
                 # 与串口模式完全相同的统一分发路径
                 distribute(data)
             elif eof:
-                # 对端主动断开：立刻重连，不必等满 120 秒
-                logging.warning("中继连接已被对端关闭，立即重新连接")
+                # 对端主动断开：等一个递增的间隔再重连，绝不留零延迟路径。
+                # 原先这里立刻 open_relay，遇到"接受连接后马上关闭"的上游
+                # （同名源已在线 / caster 内部报错）就是毫秒级重连风暴，
+                # 会把自己 caster 的"每用户 3 条连接"直接打满。
+                delay = eof_backoff.next_delay()
+                logging.warning(
+                    f"中继连接已被对端关闭，{delay:.0f} 秒后重连"
+                    f"（{eof_backoff.describe()}）")
+                _note_source_retry('relay_eof', eof_backoff,
+                                   '上游 caster 主动关闭连接，疑似同名源已在线上',
+                                   delay)
                 try:
                     relay.close()
                 except Exception:
                     pass
+                if interruptible_sleep(delay, thread_exit_event):
+                    break
                 relay = open_relay(cfg)
                 last_recv = time.time()
             elif timed_out:
                 # 读超时后走到这里，120 秒空闲重连规则现在才真正生效
                 if time.time() - last_recv > RELAY_IDLE_RECONNECT:
                     logging.warning(f"中继连接连续 {RELAY_IDLE_RECONNECT} 秒无数据，尝试重新连接")
+                    _note_source_retry('relay_idle', eof_backoff,
+                                       f'上游连续 {RELAY_IDLE_RECONNECT} 秒无数据', 2.0)
                     try:
                         relay.close()
                     except Exception:
                         pass
+                    if interruptible_sleep(2.0, thread_exit_event):
+                        break
                     relay = open_relay(cfg)
                     last_recv = time.time()
                 else:
@@ -119,8 +165,13 @@ def forward_relay(relay, cfg, thread_exit_event):
                 except ThreadExitRequested:
                     break
                 except Exception as e2:
-                    logging.error(f"中继数据源重新连接失败: {e2}")
-                    if interruptible_sleep(15):
+                    # 网络类失败按 NETWORK_BACKOFF 走：2→5→10→20→30 秒封顶。
+                    # 原先是固定 15 秒，连不上和认证被拒一个节奏，且没有上限保护。
+                    delay = net_backoff.next_delay()
+                    logging.error(f"中继数据源重新连接失败: {e2}"
+                                  f"（{net_backoff.describe()}）")
+                    _note_source_retry('relay_error', net_backoff, str(e2), delay)
+                    if interruptible_sleep(delay, thread_exit_event):
                         break
 
     # 退出时只关自己持有的中继连接

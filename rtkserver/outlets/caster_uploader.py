@@ -16,11 +16,12 @@ import time
 from typing import Optional
 
 from ..core import state
-from ..core.constants import (CASTER_QUEUE_SIZE, CASTER_RECONNECT_INTERVAL,
-                              CASTER_WRITE_TIMEOUT, NTRIP_HANDSHAKE_TIMEOUT,
+from ..core.constants import (AUTH_BACKOFF, BACKOFF_JITTER, CASTER_QUEUE_SIZE,
+                              CASTER_SESSION_MAX_AGE, CASTER_WRITE_TIMEOUT,
+                              NETWORK_BACKOFF, NTRIP_HANDSHAKE_TIMEOUT,
                               SOURCE_STALL_TIMEOUT, UPLOAD_STATE_TEXT)
 from ..sources.ntrip import connect_to_host
-from ..utils.common import format_duration
+from ..utils.common import Backoff, format_duration
 
 # ==================== 上传端（远端 Caster）链路状态 ====================
 # 只描述"往哪推 / 认证是否通过 / 推了多少"，绝不含口令。
@@ -36,6 +37,7 @@ upload_status = {
     "sent_frames": 0,
     "rate_bps": 0,              # 实测字节/秒
     "reconnects": 0,
+    "retry_in": 0,              # 当前这次退避还剩多少秒（0=没在等待）
     "last_error": "",
     "session_time": "0h 0m 0s",
 }
@@ -159,6 +161,13 @@ class CasterUploader:
         self._rate_last_bytes = 0
         self._rate_bps = 0
         self._lock = threading.Lock()
+        # 分级退避：网络类按秒级爬升，认证类直接降到分钟级。
+        # 为什么必须分开：密码填错 / 账号连接数已满时，每 5 秒去敲一次门既没用
+        # 又危险——公共 caster 会把这当成暴力尝试直接封 IP。
+        self._net_backoff = Backoff(NETWORK_BACKOFF, jitter=BACKOFF_JITTER, name='连接中断')
+        self._auth_backoff = Backoff(AUTH_BACKOFF, jitter=BACKOFF_JITTER, name='认证被拒')
+        self._last_fail_kind = 'network'
+        self._retry_wait = 0.0      # 当前这次重连实际要等多久（给状态页显示）
 
     # ---------- 生命周期 ----------
     def start(self) -> bool:
@@ -218,6 +227,7 @@ class CasterUploader:
                 'rate_bps': self._rate_bps,
                 'reconnects': self._reconnects,
                 'last_error': self._last_error,
+                'retry_in': round(self._retry_wait, 0),
                 'session_time': format_duration(session),
                 'queue_size': self._outbox.qsize(),
             }
@@ -252,11 +262,18 @@ class CasterUploader:
             time.sleep(min(0.2, max(0.0, end - time.time())))
 
     def _connect(self) -> bool:
-        """TCP 建连 + NTRIP SOURCE 握手。成功返回 True，失败不抛异常。"""
+        """TCP 建连 + NTRIP SOURCE 握手。成功返回 True，失败不抛异常。
+
+        失败时会把原因记到 `self._last_fail_kind`，调用方据此选退避表：
+          network —— 连不上 / 握手超时 / 被 RST：秒级退避，很快就能恢复
+          auth    —— 云端明确拒绝（401 / 连接数已满 / 挂载点不存在）：
+                     重试再快也没用，降到分钟级，避免被封 IP
+        """
         self._set_state('connecting')
         try:
             sock = connect_to_host(self._host, int(self._port))
         except Exception as e:
+            self._last_fail_kind = 'network'
             self._set_state('retrying', error=str(e))
             logging.error(f"上传出口连接失败：{e}")
             return False
@@ -271,6 +288,7 @@ class CasterUploader:
             sock.sendall(hdr.encode())
             resp = sock.recv(1024).decode(errors='ignore')
         except Exception as e:
+            self._last_fail_kind = 'network'
             self._set_state('retrying', error=str(e))
             logging.error(f"上传出口握手失败：{e}")
             try:
@@ -280,9 +298,10 @@ class CasterUploader:
             return False
 
         if 'ICY 200 OK' not in resp and '200 OK' not in resp:
-            head = (resp.splitlines() or ['无响应'])[0]
-            self._set_state('error', error=f"认证失败：{head}")
-            logging.error(f"上传 Caster 认证失败，响应：{resp.splitlines()[:3]}")
+            self._last_fail_kind = 'auth'
+            err = self._describe_reject(resp)
+            self._set_state('error', error=err)
+            logging.error(f"上传 Caster 拒绝，响应：{resp.splitlines()[:3]}")
             try:
                 sock.close()
             except Exception:
@@ -306,19 +325,67 @@ class CasterUploader:
         logging.info(f"上传出口认证通过，开始推送：{self.target()}")
         return True
 
+    @staticmethod
+    def _describe_reject(resp: str) -> str:
+        """把云端拒绝的响应翻译成一句现场能直接照着查的话。
+
+        原来只有"认证失败：<首行>"，而最常见的两种拒绝（连接数超限、账号密码错）
+        首行往往都是 `HTTP/1.0 401 Unauthorized`，看不出该改什么。
+        """
+        head = (resp.splitlines() or ['无响应'])[0].strip() or '无响应'
+        low = resp.lower()
+        if 'connection limit' in low or 'too many' in low or 'maximum' in low:
+            return f"云端拒绝：该账号连接数已满（{head}）"
+        if 'mountpoint' in low or 'not found' in low or '404' in low:
+            return f"云端拒绝：挂载点不存在或无权限（{head}）"
+        if '401' in head or 'unauthorized' in low:
+            return f"云端拒绝：账号或密码不正确（{head}）"
+        return f"云端拒绝：{head}"
+
     def _retry_connect(self):
+        """建连直到成功、被 stop() 打断，或数据源没数据。
+
+        退避按失败类型分表：网络类 2→5→10→20→30 秒，认证类 30→60→120→300 秒。
+        原先固定 5 秒、不分类型，密码错的时候等于每 5 秒去敲一次门。
+        """
         while self._running and self._sock is None:
             # 门闸同样管着重连：数据源没数据时不再一轮轮去认证（那正是云端
             # 反复踢源的来源），等有了数据再连。
             if self._pause_if_no_source():
                 return
             if self._connect():
+                self._net_backoff.reset()
+                self._auth_backoff.reset()
+                self._retry_wait = 0.0
                 return
-            self._sleep(CASTER_RECONNECT_INTERVAL)
+            delay = self._next_retry_delay()
+            self._retry_wait = delay
+            logging.warning(f"上传出口 {delay:.0f} 秒后重连（{self._fail_desc()}）")
+            self._sleep(delay)
+
+    def _next_retry_delay(self) -> float:
+        if self._last_fail_kind == 'auth':
+            return self._auth_backoff.next_delay()
+        return self._net_backoff.next_delay()
+
+    def _fail_desc(self) -> str:
+        if self._last_fail_kind == 'auth':
+            return self._auth_backoff.describe()
+        return self._net_backoff.describe()
+
+    def _session_age(self) -> float:
+        """当前认证会话已持续多久（秒）。0 表示还没建立会话。"""
+        with self._lock:
+            return (time.time() - self._session_start) if self._session_start else 0.0
 
     def _source_idle_seconds(self) -> float:
-        """距最近一帧 RTCM 的秒数；从没收到过数据时返回 inf。"""
-        ts = state.last_data_ts
+        """距最近一帧 **RTCM** 的秒数；从没收到过时返回 inf。
+
+        这里刻意不用 last_data_ts（任意数据）：模块只出 NMEA 时字节一直在流，
+        用它判断会让上传端以为"有数据"而抢先认证，然后一个 RTCM 都发不出去，
+        又被云端当空闲源踢掉——正是要防的那件事。
+        """
+        ts = state.last_rtcm_ts
         return (time.time() - ts) if ts else float('inf')
 
     def _pause_if_no_source(self) -> bool:
@@ -326,40 +393,56 @@ class CasterUploader:
 
         为什么必须主动断：NTRIP 的 SOURCE 连接没有心跳，光靠 sendall 抛错永远
         发现不了"云端已经在踢我"。数据停了就自己走，比被踢掉再重连对云端友好，
-        也不会在 caster 侧留下半死会话。返回 True 表示"本轮已经处理过，调用方
-        应重新判断"。
+        也不会在 caster 侧留下半死会话。
+
+        成本：只读一个时间戳（state.last_rtcm_ts），不读串口、不开线程、不轮询
+        模块。调用点也只有两处——「准备建连」和「队列空了没东西可发」，
+        数据流动期间一次都不调。
+
+        返回 True 表示"本轮已经处理过，调用方应重新判断"。
         """
         idle = self._source_idle_seconds()
         if idle <= SOURCE_STALL_TIMEOUT:
             return False
         age = int(idle) if idle != float('inf') else -1
         if self._sock is not None:
-            reason = f"数据源 {age} 秒无数据，已主动断开上传" if age >= 0 else "数据源无数据，已主动断开上传"
+            reason = (f"数据源已 {age} 秒没有 RTCM 帧，已主动断开上传"
+                      if age >= 0 else "数据源没有 RTCM 帧，已主动断开上传")
             logging.warning(f"上传出口：{reason}（避免被云端判定空闲后踢线）")
             self._close()
             self._set_state('waiting_source', error=reason)
         elif self._state != 'waiting_source':
-            self._set_state('waiting_source', error='数据源无数据，等待 RTCM 后再认证')
+            self._set_state('waiting_source', error='数据源没有 RTCM 帧，等待后再认证')
+        # 等数据源期间没有"多久后重连"这回事，别让状态页挂着上一次的倒计时
+        self._retry_wait = 0.0
         self._sleep(0.5)
         return True
 
     def _loop(self):
-        # 首次建连：必须等数据源真的有数据；失败就退避重试
-        while self._running and self._sock is None:
-            if self._pause_if_no_source():
-                continue
-            if self._connect():
-                break
-            self._sleep(CASTER_RECONNECT_INTERVAL)
+        # 首次建连：必须等数据源真的有数据；失败就按退避表重试
+        self._retry_connect()
 
         while self._running:
-            # 运行期断流熔断：模块被拔 / 中继上游停流时不再空挂一条已认证的会话
-            if self._pause_if_no_source():
-                continue
-
             try:
                 data = self._outbox.get(timeout=0.5)
             except queue.Empty:
+                # 运行期断流熔断只在这里做：队列空了 = 确实没东西可发，
+                # 这时读一次时间戳判断即可。有数据在流动时完全跳过，
+                # 不给数据面增加任何额外负担（原先放在循环顶部是每 0.5 秒
+                # 无条件判一次，属于"一直在检测数据源"）。
+                if self._pause_if_no_source():
+                    continue
+                # 会话轮换：跑满 CASTER_SESSION_MAX_AGE 就主动断一次重连。
+                # 目的不是修 bug，而是规避半开连接——云端断电 / NAT 老化时
+                # TCP 不发 FIN，而 RTCM 只有 1~2 KB/s，sendall 迟迟不报错，
+                # 状态页会一直显示"正在推送"但云端什么都收不到。
+                age = self._session_age()
+                if self._sock is not None and age > CASTER_SESSION_MAX_AGE:
+                    logging.info(f"上传会话已持续 {age / 60:.0f} 分钟，主动轮换连接")
+                    self._set_state('retrying', error='会话轮换：主动重连以规避半开连接')
+                    self._close()
+                    self._retry_connect()
+                    continue
                 if self._sock is None and self._running:
                     self._retry_connect()
                 continue
@@ -368,7 +451,16 @@ class CasterUploader:
             with self._lock:
                 sock = self._sock
             if sock is None:
-                # 连接不可用：直接丢弃这一帧，后台继续重连
+                # 连接不可用：丢掉这一帧，并（重新）尝试建连。
+                #
+                # 这里不能只 continue。数据源稳定推流时 _outbox 几乎永远非空，
+                # 而重连原先只挂在 queue.Empty 分支上，于是"连接断开 + 数据仍在
+                # 流动"这个最常见场景（云端重启、认证被拒后又恢复）永远等不到
+                # 重连，上传就永久停在断开状态——本地模拟一跑就复现：
+                # 队列每 0.2 秒进一帧，_pause_if_no_source 自始至终只被调用一次。
+                # 门闸与退避仍在 _retry_connect 内部生效，不会因此空转。
+                if self._running:
+                    self._retry_connect()
                 continue
 
             try:
@@ -381,6 +473,7 @@ class CasterUploader:
                 logging.error(f"上传出口发送失败：{e}")
                 with self._lock:
                     self._reconnects += 1
+                self._last_fail_kind = 'network'
                 self._set_state('retrying', error=str(e))
                 self._close()
                 self._retry_connect()

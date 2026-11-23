@@ -16,9 +16,15 @@ from .utils.network import check_self_loop, port_conflict_message, probe_tcp_por
 
 _validate_log_state = {'last': 0.0, 'msg': None}
 
+# 最近一条"拦住启动"的错误。为什么要单独存一份：校验失败原先只写日志，
+# 网页上什么都不显示，用户看到的是"配置保存成功了，但三路出口一个都不动"，
+# 只能猜。主循环把它塞进 run_status 推给前端，现场就能自己看出差哪一项。
+LAST_ERROR = ''
+
 
 def _log_validate_problem(level: str, message: str):
     """配置校验失败的提示，按"同一问题 60 秒一次"节流。"""
+    global LAST_ERROR
     now = time.time()
     if message == _validate_log_state['msg'] and now - _validate_log_state['last'] < 60:
         return
@@ -27,7 +33,19 @@ def _log_validate_problem(level: str, message: str):
     if level == 'warning':
         logging.warning(message)
     else:
+        # 只记 error：warning 是"能跑但不理想"，不该在前端当成启动失败
+        LAST_ERROR = message
         logging.error(message)
+
+
+def last_error() -> str:
+    """最近一条拦住启动的原因（空串表示没有错误）。"""
+    return LAST_ERROR
+
+
+def clear_last_error():
+    global LAST_ERROR
+    LAST_ERROR = ''
 
 
 def validate_config(cfg):

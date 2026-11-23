@@ -11,11 +11,39 @@ import socket
 from ..core import state
 from ..core.constants import (CASTER_WRITE_TIMEOUT, NTRIP_HANDSHAKE_TIMEOUT,
                               SOURCETABLE_MAX_BYTES, SOURCETABLE_TIMEOUT)
-from ..utils.common import (ThreadExitRequested, interruptible_sleep, retry)
+from ..utils.common import ThreadExitRequested, interruptible_sleep
 
 
-@retry(max_retries=3, delay=5)
-def connect_to_host(host, port, timeout=10):
+def connect_to_host(host, port, timeout=10, retries=1):
+    """TCP 建连。**默认只尝试一次**，重试节奏一律交给调用方的 Backoff。
+
+    为什么改成单次（2026-11-24）：原先这里挂着 `@retry(max_retries=3, delay=5)`，
+    而调用方（中继 / 上传端）外面还有一层自己的 sleep，于是"一次失败"被放大成
+    3 次敲门、耗时 3×10+2×5=40 秒；再叠加握手层同样的 @retry(3)，中继一次
+    重连最坏要 100 秒才回到起点，而且任何"把间隔改成 5 秒或 30 秒"的调整都
+    调不准。现在只有一个节奏来源：调用方的 Backoff。
+
+    `retries` 仅保留给确实需要"同一处连几次"的调用方显式使用。
+    """
+    attempts = max(1, int(retries))
+    last_error = None
+    for attempt in range(attempts):
+        if attempt:
+            if interruptible_sleep(5):
+                raise ThreadExitRequested()
+        try:
+            return _connect_once(host, port, timeout)
+        except ThreadExitRequested:
+            raise
+        except Exception as e:  # noqa: BLE001 - 建连异常种类杂，统一交给调用方分类
+            last_error = e
+            if attempt + 1 < attempts:
+                logging.warning(f"连接到{host}:{port} 第 {attempt + 1} 次失败: {e}，稍后重试")
+    raise last_error
+
+
+def _connect_once(host, port, timeout=10):
+    """单次 TCP 建连（成功返回 socket，失败抛原异常）。"""
     logging.info(f"正在向{host}:{port}发送连接")
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
@@ -59,8 +87,13 @@ def build_client_request(cfg):
     return req
 
 
-@retry(max_retries=3, delay=5)
 def handshake_ntrip_client(srv_sock, cfg):
+    """中继客户端握手（GET <mountpoint>）。
+
+    不再套 `@retry`：重试时请求头会被重复写进同一个 socket，服务端看到的是
+    两条 GET（第一条已经切到推流态），语义本身就是错的；真正的重连必须重开
+    连接，那是 `open_relay` 的职责。
+    """
     hdr = build_client_request(cfg)
     logging.info("发送realy 连接请求")
     # 握手阶段必须有超时，否则服务端不说话就会永久阻塞
@@ -78,7 +111,6 @@ def handshake_ntrip_client(srv_sock, cfg):
     return False
 
 
-@retry(max_retries=2, delay=3)
 class _NullCaster:
     """没有配置上传 Caster 时的占位对象。
 

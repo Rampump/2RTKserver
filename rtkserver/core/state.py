@@ -28,11 +28,19 @@ worker_thread = None                    # 当前数据源线程，用于防止�
 # 为什么需要：出口原先无条件先于数据源启动。模块没插时上传端照样去云端认证，
 # 云端看到"SOURCE 连上了却一个字节不发"，几秒后把源踢掉；而数据源探测失败又会让
 # 本轮走 finally 把出口拆掉重来——真机日志实测就是每 7.06 秒一轮的上下线。
-# 现在的约定：
-#   last_data_ts      —— distributor 每收到一帧真实 RTCM 就刷新（唯一写点）
-#   first_data_event  —— 本轮首帧到达，lifecycle 用它做"起出口前"的门闸
-#   source_state      —— 给前端看的门闸状态：unknown / waiting / ok / stalled
-last_data_ts = 0.0
+#
+# 判据分两级（2026-11-24 修正）：**"源活着"和"能上传"不是一回事**。
+# 早先只认 RTCM 帧，导致只出 NMEA 的模块连串口都找不到、门闸永远不开——现场
+# 看到的就是"有数据但三路全停"。现在的约定：
+#   last_data_ts      —— 任意非空字节就刷新（distributor 写；源活着，本地两路看它）
+#   last_rtcm_ts      —— 解析线程解出并校验过 CRC 的 RTCM 帧才刷新（云端防踢看它）
+#   first_data_event  —— 本轮首帧任意数据到达，lifecycle 用它做"起出口前"的门闸
+#   source_state      —— 给前端看的状态：unknown / waiting / ok / stalled / alive_no_rtcm
+#
+# 成本：两个时间戳由 distributor 顺手写，扫一次 0xD3 是 C 层 find，
+# 900 B/s 的流下可以忽略；运行期不额外开线程、不额外读串口、不轮询模块。
+last_data_ts = 0.0          # 任意数据的最近时刻
+last_rtcm_ts = 0.0          # RTCM 帧的最近时刻（云端上传唯一判据）
 first_data_event = threading.Event()
 source_state = 'unknown'
 
@@ -101,7 +109,13 @@ run_status = {
     "data_source": "",
     "target_caster": "",
     "data_sent": "0B",
-    "run_time": "0h 0m 0s"
+    "run_time": "0h 0m 0s",
+    # 配置校验拦住启动的原因（空串=没问题）。校验失败原先只写日志，
+    # 网页上三路出口全不动却没有任何提示，现场只能猜。
+    "config_error": "",
+    # 数据源正在重连时的进度（kind/count/next_delay/detail，空 dict=没在重连）。
+    # 由 relay_source 在重连那一刻写一次，收到数据后清空；前端拼成一句提示。
+    "source_retry": {},
 }
 run_status_lock = threading.Lock()
 

@@ -18,6 +18,7 @@ const runModeEl = document.getElementById("run-mode");
 const dataSourceEl = document.getElementById("data-source");
 const targetCasterEl = document.getElementById("target-caster");
 const dataSentEl = document.getElementById("data-sent");
+const configHintEl = document.getElementById("config-hint");
 const sourceHintEl = document.getElementById("source-hint");
 const runTimeEl = document.getElementById("run-time");
 // 首次使用（还没配数据源）时首页唯一能指导用户的就是这两项：
@@ -998,6 +999,14 @@ function updateRunStatus(status) {
 
   // 数据源门闸提示：没数据时三个出口都是停的，这里必须说清"为什么没数据"，
   // 否则用户会以为是程序卡死或配置没生效。
+  // 配置被校验拦住时，三个出口根本不会启动。这条提示必须比"数据源"更靠前，
+  // 否则用户看到的是"配置保存成功、三路全停"，只会怀疑程序锁死。
+  if (configHintEl) {
+    const problem = status.config_error || '';
+    configHintEl.textContent = problem;
+    configHintEl.hidden = !problem;
+  }
+
   if (sourceHintEl) {
     const st = status.source_state;
     let hint = '';
@@ -1005,8 +1014,27 @@ function updateRunStatus(status) {
       hint = I18N.t('rs.source_waiting');
     } else if (st === 'stalled') {
       hint = I18N.t('rs.source_stalled', { s: status.source_idle_seconds || 0 });
+    } else if (st === 'alive_no_rtcm') {
+      const s = status.source_rtcm_idle_seconds;
+      hint = (s === null || s === undefined)
+        ? I18N.t('rs.source_alive_no_rtcm_never')
+        : I18N.t('rs.source_alive_no_rtcm', { s });
     } else if (status.source_hint) {
       hint = status.source_hint;
+    }
+    // 中继重连对用户必须可见：单纯"没数据"分不清是上游断流、账号被占还是密码错。
+    // 后端只在重连那一刻写一次 source_retry，这里拼成一句附加说明。
+    const retry = status.source_retry || {};
+    if (retry && retry.count > 0) {
+      const tries = I18N.t('rs.source_retry', {
+        n: retry.count,
+        s: Math.max(1, Math.round(retry.next_delay || 0)),
+      });
+      const why = retry.kind === 'relay_eof'
+        ? I18N.t('rs.source_retry.eof')
+        : (retry.kind === 'relay_idle' ? I18N.t('rs.source_retry.idle') : '');
+      const detail = why ? tries + '：' + why : tries;
+      hint = hint ? hint + ' ' + detail : detail;
     }
     sourceHintEl.textContent = hint;
     sourceHintEl.hidden = !hint;
@@ -1076,12 +1104,24 @@ function updateUploadStatus(info) {
     if (upHintEl) upHintEl.textContent = I18N.t('up.connecting_hint');
   } else if (state === 'retrying') {
     setValue(upStatusEl, stateText, 'warning');
-    if (upHintEl) upHintEl.textContent = info.last_error
+    const base = info.last_error
       ? I18N.t('up.retrying_hint', { error: info.last_error })
       : I18N.t('up.retrying_hint_noerr');
+    // 退避生效后间隔会到分钟级，必须告诉用户"下次什么时候"，否则看起来像卡住
+    if (upHintEl) {
+      upHintEl.textContent = Number(info.retry_in) > 0
+        ? base + ' ' + I18N.t('up.retry_in', { s: Math.round(info.retry_in) })
+        : base;
+    }
   } else if (state === 'error') {
     setValue(upStatusEl, stateText, 'error');
-    if (upHintEl) upHintEl.textContent = info.last_error || I18N.t('up.error_hint');
+    const base = info.last_error || I18N.t('up.error_hint');
+    // 认证被拒仍在后台降频重试，页面要说清"没有放弃"
+    if (upHintEl) {
+      upHintEl.textContent = Number(info.retry_in) > 0
+        ? base + ' ' + I18N.t('up.retry_in', { s: Math.round(info.retry_in) })
+        : base;
+    }
   } else {
     setValue(upStatusEl, stateText, '');
     if (upHintEl) upHintEl.textContent = '';

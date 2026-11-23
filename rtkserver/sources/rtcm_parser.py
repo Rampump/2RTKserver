@@ -156,6 +156,12 @@ def process_rtcm_buffer():
 
             frames, remaining = extract_rtcm_frames(current_buffer)
 
+            # 云端上传的判据由这里给：只有真的解出并校验过 CRC 的 RTCM 帧才算
+            # "能上传"。放在解析线程而不是分发热路径，是为了不去扫描每个数据块
+            # （distributor 只记"任意数据"，一次赋值）。
+            if frames:
+                state.last_rtcm_ts = time.time()
+
             if remaining:
                 with state.buffer_lock:
                     state.rtcm_buffer.extend(remaining)

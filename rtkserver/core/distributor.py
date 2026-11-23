@@ -25,18 +25,20 @@ def _ensure_registered():
 
 
 def _mark_source_data(data: bytes):
-    """门闸打点：只认真正带 RTCM 帧头（0xD3）的数据。
+    """门闸打点：只记"源活着"。
 
-    为什么不认"任意字节"：串口噪声、中继的 NTRIP 心跳、模块上电时吐的 ASCII
-    日志都会先于 RTCM 到达，把它们当成"有数据"会让出口在真的没有差分数据时
-    就抢先起连，问题原样复现。0xD3 是 RTCM3 的固定前导，与 detect_serial()
-    的判据一致。
+    为什么不再在这里判 RTCM：模块只出 NMEA（还没配成输出 RTCM）、或刚从
+    rover 切回 base 的那几十秒，串口明明在流字节，旧判据却认为"没数据"，
+    于是本地 Caster / 数传 / 云端三路一起不开，现场表现就是"插了模块但锁死"。
+
+    所以这里只做一件事：任意非空字节 → last_data_ts + 放行启动门闸。
+    成本是一次赋值，不扫字节、不加锁。
+
+    "能不能上传"（last_rtcm_ts）交给已经在跑的解析线程：它解出并校验过 CRC
+    的 RTCM 帧才打点。这比在热路径上扫 0xD3 更准（不会把载荷里的 0xD3 当帧头），
+    也让分发路径彻底不碰 RTCM 语义。
     """
-    if b'\xd3' not in data:
-        return
     state.last_data_ts = time.time()
-    if state.source_state != 'ok':
-        state.source_state = 'ok'
     if not state.first_data_event.is_set():
         state.first_data_event.set()
 
