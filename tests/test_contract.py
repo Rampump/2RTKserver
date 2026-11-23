@@ -8936,5 +8936,55 @@ class TestRtcmStats(unittest.TestCase):
         self.assertIn('15000', js, '断流兜底阈值要与后端 SOURCE_STALL_TIMEOUT 对齐')
 
 
+class TestConstellationCount(unittest.TestCase):
+    """「观测星座数量」必须与「观测到的星座」同源。
+
+    现场：列表显示 BDS+GPS+GLO+GAL+QZS+NAV（6 个），数量却一直是 0。
+    根因不在后端算错，而在前端两套状态各自记账：
+      - 列表来自 observedSystems（重连时被 clear，重新攒）；
+      - 数量来自 `systemCount++`，条件是"allSatellites 里还没有这个星座"，
+        而 allSatellites 从来不清 → 重连后键都在，一次都不会再加。
+    现在数量直接取集合大小，并且换源/重连时整体重建视图。
+    """
+
+    def _read(self, *parts):
+        with open(os.path.join(REPO_ROOT, *parts), 'r', encoding='utf-8') as handle:
+            return handle.read()
+
+    def test_reset_stats_bumps_generation(self):
+        from rtkserver.core import state
+        from rtkserver.sources import rtcm_parser
+        before = state.stats_generation
+        rtcm_parser.reset_stats()
+        self.assertEqual(before + 1, state.stats_generation,
+                         '换源/重连清统计必须换代数，前端才知道手里的卡片过期了')
+
+    def test_broadcasts_carry_generation(self):
+        parser = self._read('rtkserver', 'sources', 'rtcm_parser.py')
+        self.assertGreaterEqual(parser.count('"stats_generation": state.stats_generation'), 4,
+                                'MSM / 1005 / 1033 每条广播都要带代数，否则前端收不到换源信号')
+
+    def test_frontend_count_derives_from_the_same_set(self):
+        js = self._read('static', 'script.js')
+        self.assertIn('systemCountEl.textContent = observedSystems.size', js)
+        self.assertNotIn('systemCount++', js,
+                         '按字典新增累加会在字典没清时永远停在 0，数量必须取集合大小')
+
+    def test_frontend_rebuilds_view_when_generation_changes(self):
+        js = self._read('static', 'script.js')
+        body = js[js.index('function resetSatelliteView('):]
+        body = body[:body.index('\nfunction ')]
+        self.assertIn('observedSystems.clear()', body)
+        self.assertIn('delete allSatellites[k]', body, '卫星字典必须一起清，否则卡片和计数会混着上一路')
+        self.assertIn('[id^="block_"]', body, '动态星座卡片也要拆掉')
+        self.assertIn('data.stats_generation', js, 'onmessage 要按代数变化触发重建')
+
+    def test_reconnect_clears_satellite_state(self):
+        js = self._read('static', 'script.js')
+        seg = js[js.index('ws.onopen = '):]
+        seg = seg[:seg.index('ws.onmessage')]
+        self.assertIn('resetSatelliteView()', seg, '重连后必须整体重建，不能只清一半')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

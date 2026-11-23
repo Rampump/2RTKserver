@@ -15,6 +15,14 @@ const rtcmTypeListEl = document.getElementById("rtcm-type-list");
 // 最后一次收到 RTCM 消息统计的时刻。后端断流/换源后就不再推这个字段，
 // 页面会一直停在最后一帧，必须靠时间戳自己判断"现在其实没有数据"。
 let lastRtcmTypeAt = 0;
+// 后端「统计代数」。每次换源/重连清空统计都会 +1，随广播下发。
+// 前端手里的星座卡片、卫星计数都是"这一路专属"的，代数一变就整体重建；
+// 原先只在 ws.onopen 里清一半（清 observedSystems 但不清 allSatellites），
+// 重连后 allSatellites 的键还在，"星座数量"就再也不加了——一直是 0。
+let lastStatsGeneration = null;
+// 最后一次收到卫星（MSM）数据的时刻：断流后后端不再推 cell_data，
+// 页面会永久停在最后一帧，看着像"还在观测 31 颗星"。
+let lastSatelliteAt = 0;
 const loadingIndicator = document.getElementById("loading-indicator");
 const observedSystemsEl = document.getElementById("observed-systems")
 const runModeEl = document.getElementById("run-mode");
@@ -151,7 +159,6 @@ const RECONNECT_DELAY = 3000;
 let wsLoggedFirstFrame = false;   // 日志区只在首帧记一条，避免刷屏
 
 // 状态变量
-let systemCount = 0;
 let satelliteCount = 0;
 let strongSignalCount = 0;
 const allSatellites = {}; // 按系统存储所有卫星数据
@@ -706,13 +713,9 @@ function initWebSocket() {
       </div>
     `;
     
-    // 重置观测系统集合
-    observedSystems.clear();
-    updateObservedSystemsDisplay();
-    
-    // 重置系统计数
-    systemCount = 0;
-    systemCountEl.textContent = systemCount;
+    // 重置观测系统集合与全部卫星视图（换源/重连都要整体重建）
+    lastStatsGeneration = null;
+    resetSatelliteView();
     
     // 请求运行配置（/api/load_config 返回 JSON；/config 返回的是 HTML 页面）
     fetch('/api/load_config', { headers: { 'Accept': 'application/json' } })
@@ -756,6 +759,14 @@ function initWebSocket() {
       // 隐藏加载指示器
       if (loadingIndicator && !loadingIndicator.classList.contains('hidden')) {
         loadingIndicator.classList.add('hidden');
+      }
+
+      // 换源/重连：后端清空统计时把代数 +1。先整体重建视图，再处理本帧数据，
+      // 这样新星座能在干净的字典里重新计数，不会继承上一路的键。
+      if (typeof data.stats_generation === 'number' &&
+          data.stats_generation !== lastStatsGeneration) {
+        lastStatsGeneration = data.stats_generation;
+        resetSatelliteView();
       }
 
       // 更新基站信息
@@ -817,6 +828,12 @@ function initWebSocket() {
         if (rtcmTypeListEl && Date.now() - lastRtcmTypeAt > 15000) {
           rtcmTypeListEl.textContent = '--';
         }
+        // 星座卡片与卫星计数同理：没人再推 cell_data 就该回到空态，
+        // 而不是一直挂着"最后看到的那 31 颗星 / 6 个星座"。
+        if (Date.now() - lastSatelliteAt > 15000 &&
+            (observedSystems.size || Object.keys(allSatellites).length)) {
+          resetSatelliteView();
+        }
         updateRunStatus(data.run_status);
       }
 
@@ -841,6 +858,7 @@ function initWebSocket() {
 
       // 如果是 MSM 数据才更新图表
       if (!data.cell_data || !data.gnss) return;
+      lastSatelliteAt = Date.now();
 
       // 使用 gnssAbbrMap 来获取标准化的 GNSS 名称
       const rawGnss = data.gnss || "UNKNOWN";
@@ -1258,8 +1276,30 @@ function updateTimeDisplay() {
   updateTimeEl.textContent = `${I18N.t('ws.last_update')}: ${now.toLocaleString()}`;
 }
 
+// 整体重建卫星视图：丢掉上一路的星座集合、卫星数据、计数和动态卡片。
+// 什么时候调用：① 后端统计代数变化（换源/重连清统计）；② WebSocket 重连。
+// 不清 allSatellites 是"星座数量一直是 0"的根因——计数只在"字典里还没有这个
+// 星座"时才 +1，键留着就永远不加，而列表是重新攒的，于是列表有 6 个、数量 0。
+function resetSatelliteView() {
+  observedSystems.clear();
+  Object.keys(allSatellites).forEach(k => delete allSatellites[k]);
+  satelliteCount = 0;
+  strongSignalCount = 0;
+  satelliteCountEl.textContent = satelliteCount;
+  strongSignalCountEl.textContent = strongSignalCount;
+  // 星座卡片是按 gnss 动态建的，换了源已消失的星座必须拆掉，
+  // 否则页面会继续挂着上一路才有的星座（例如中继 MSM7 换回串口 MSM4）。
+  if (container) {
+    container.querySelectorAll('[id^="block_"]').forEach(el => el.remove());
+  }
+  updateObservedSystemsDisplay();
+}
+
 // 更新观测星座显示
 function updateObservedSystemsDisplay() {
+  // 数量直接取集合大小：两个字段同源，就不会再出现"列表 6 个、数量 0"的矛盾
+  systemCountEl.textContent = observedSystems.size;
+
   if (observedSystems.size === 0) {
     observedSystemsEl.textContent = I18N.t('sat.no_data');
     return;
@@ -1280,12 +1320,9 @@ function updateObservedSystemsDisplay() {
 
 // 更新统计信息
 function updateStatistics(gnss, cellData) {
-  // 仅在新系统首次出现时增加计数
-  if (!allSatellites[gnss]) {
-    systemCount++;
-    systemCountEl.textContent = systemCount;
-  }
-
+  // 星座数量不再在这里累加：由 updateObservedSystemsDisplay() 按集合大小统一给值。
+  // 原先这里只在"字典里还没有这个星座"时 +1，一旦字典没被清（重连后就是这样），
+  // 计数就会永远停在 0，而列表照常填充，两个字段互相矛盾。
   allSatellites[gnss] = cellData;
 
   // 卫星总数按 (星座, PRN) 去重

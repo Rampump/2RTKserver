@@ -123,6 +123,10 @@ def reset_stats():
     state.msg_types_seen.clear()
     state.msg_types_recent.clear()
     state.station_info.clear()
+    _msm_last_sent.clear()
+    # 代数 +1 并随广播下发：前端据此丢掉上一路的星座卡片与计数。
+    # 只清后端是不够的——前端字典里的 gnss 键还在，"星座数量"就再也不会加。
+    state.stats_generation += 1
     if had:
         # 只在"确实清掉了东西"时留痕：换源时现场能看到这一行，
         # 启动时（本来就没有数据）不刷日志。
@@ -156,7 +160,8 @@ def _broadcast_msm(gnss: str, header: dict, cells) -> bool:
         "cell_data": slim_cells,
         "station_info": state.station_info,
         "msg_types": sorted(list(state.msg_types_seen)),
-        "msg_type_frequency": frequency_tracker.get_all_frequencies()
+        "msg_type_frequency": frequency_tracker.get_all_frequencies(),
+        "stats_generation": state.stats_generation
     })
     return True
 
@@ -227,14 +232,16 @@ def process_rtcm_buffer():
                                     state.broadcast({
                                         "antenna_info": antenna_info,
                                         "msg_types": sorted(list(state.msg_types_seen)),
-                                        "msg_type_frequency": frequency_tracker.get_all_frequencies()
+                                        "msg_type_frequency": frequency_tracker.get_all_frequencies(),
+                                        "stats_generation": state.stats_generation
                                     })
 
                                 if device_info:
                                     state.broadcast({
                                         "device_info": device_info,
                                         "msg_types": sorted(list(state.msg_types_seen)),
-                                        "msg_type_frequency": frequency_tracker.get_all_frequencies()
+                                        "msg_type_frequency": frequency_tracker.get_all_frequencies(),
+                                        "stats_generation": state.stats_generation
                                     })
 
                             msm_array = parse_msm(parsed_data)
@@ -276,7 +283,8 @@ def process_station_message(parsed_data, msg_type):
             state.broadcast({
                 "station_info": state.station_info,
                 "msg_types": sorted(list(state.msg_types_seen)),
-                "msg_type_frequency": frequency_tracker.get_all_frequencies()
+                "msg_type_frequency": frequency_tracker.get_all_frequencies(),
+                "stats_generation": state.stats_generation
             })
     except Exception as e:
         logging.error(f"处理1005/1006消息时出错: {e}")
